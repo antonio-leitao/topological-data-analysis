@@ -1,5 +1,5 @@
 use crate::vecops;
-// use hashbrown::HashMap;
+use hashbrown::HashMap;
 use human_repr::HumanDuration;
 use rayon::prelude::*;
 use std::time::{Duration, Instant};
@@ -79,6 +79,23 @@ fn read_adjacency_matrix(adjacency_matrix: Vec<Vec<usize>>) -> (Vec<u64>, usize,
         matrix.extend(vecops::bitvec_from_slice(&row, chunk_size));
     }
     (matrix, chunk_size, cliques)
+}
+
+fn index_simplices(dimension_n1: &[u64], dimension_n: Vec<u64>, chunk_size: usize) {
+    dimension_n
+        .into_chunks_exact()
+        .enumerate()
+        .fold(HashMap::new(), |mut map, (index, value)| {
+            map.insert(value, index);
+            map
+        });
+    dimension_n
+        .into_iter()
+        .enumerate()
+        .fold(HashMap::new(), |mut map, (index, value)| {
+            map.insert(value, index);
+            map
+        });
 }
 
 pub fn enumerate_cliques(adjacency_matrix: Vec<Vec<usize>>) -> String {

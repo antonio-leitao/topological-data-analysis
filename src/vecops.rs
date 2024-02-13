@@ -87,3 +87,32 @@ pub fn bitvec_from_slice(slice: &[usize], n_chunks: usize) -> Vec<u64> {
     }
     vertices
 }
+
+pub fn faces_of(input: &[u64]) -> Vec<Vec<u64>> {
+    let mut result = Vec::new();
+
+    for i in 0..input.len() {
+        let variations = remove_single_set_bit(input[i]);
+
+        for &variation in &variations {
+            let mut clone = input.to_vec();
+            clone[i] = variation;
+            result.push(clone);
+        }
+    }
+    result
+}
+
+fn remove_single_set_bit(input: u64) -> Vec<u64> {
+    let mut result = Vec::new();
+    let mut x = input;
+
+    while x != 0 {
+        let bit = x.trailing_zeros();
+        let mask = 1 << bit;
+        result.push(input & !mask);
+        x &= x - 1; // Clear the lowest set bit
+    }
+
+    result
+}

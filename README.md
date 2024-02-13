@@ -36,7 +36,6 @@ maturin develop --release
 - [x] Custom Simplicial Complexes
 - [x] Clique Complexes
 - [x] Betti Numbers
-- [ ] Nth Betti Number
 - [ ] Chunky Homology
 - [ ] Homology representatives
 - [ ] Optimal Homology representatives
