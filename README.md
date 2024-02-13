@@ -3,12 +3,13 @@
 ### Contents
 - [Installation](#installation)
   - [Compiling from source](#compilation-from-source)  
+- [Roadmap](#roadmap)
 
 TDA is a python package for topological data analysis written in Rust.
 
 ## Installation
 
-Pre-built packages currently only for MacOS, Windos and most Linux distributions in [PyPI](https://pypi.org/project/tda/) and can be installed with:
+Pre-built packages for MacOS, Windos and most Linux distributions in [PyPI](https://pypi.org/project/tda/) and can be installed with:
 
 ```sh
 pip install tda
@@ -30,3 +31,13 @@ cd topological-data-analysis
 maturin develop --release
 ```
 
+## Roadmap
+
+- [x] Custom Simplicial Complexes
+- [x] Clique Complexes
+- [x] Betti Numbers
+- [ ] Nth Betti Number
+- [ ] Chunky Homology
+- [ ] Homology representatives
+- [ ] Optimal Homology representatives
+- [ ] Persistent Homology

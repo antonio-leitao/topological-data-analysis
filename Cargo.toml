@@ -9,4 +9,7 @@ name = "tda"
 crate-type = ["cdylib"]
 
 [dependencies]
+hashbrown = "0.14.3"
+human-repr = "1.1.0"
 pyo3 = "0.18.1"
+rayon = "1.8.1"

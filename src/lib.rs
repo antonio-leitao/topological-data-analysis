@@ -1,4 +1,6 @@
 use pyo3::prelude::*;
+mod clique;
+mod vecops;
 
 // ROOT
 #[pymodule]
@@ -16,10 +18,17 @@ fn tda(py: Python, m: &PyModule) -> PyResult<()> {
 #[pymodule]
 fn homology(_py: Python, m: &PyModule) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(betti_numbers, m)?)?;
+    m.add_function(wrap_pyfunction!(enumerate_all_cliques, m)?)?;
     Ok(())
 }
 
 #[pyfunction]
-fn betti_numbers(a: usize, b: usize) -> PyResult<String> {
-    Ok((a + b).to_string())
+fn betti_numbers(adjacency_matrix: Vec<Vec<usize>>) -> PyResult<String> {
+    let elapsed = clique::enumerate_cliques(adjacency_matrix);
+    Ok(elapsed)
+}
+
+#[pyfunction]
+fn enumerate_all_cliques(adjacency_matrix: Vec<Vec<usize>>) -> PyResult<Vec<Vec<usize>>> {
+    Ok(clique::enumerate_cliques_list(adjacency_matrix))
 }
