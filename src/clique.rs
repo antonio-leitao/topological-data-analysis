@@ -1,3 +1,5 @@
+use crate::homology;
+use crate::linalg;
 use crate::vecops;
 use hashbrown::HashMap;
 use human_repr::HumanDuration;
@@ -69,41 +71,76 @@ fn next_cliques(
     new_cliques.into_iter().flatten().collect()
 }
 
-fn read_adjacency_matrix(adjacency_matrix: Vec<Vec<usize>>) -> (Vec<u64>, usize, Vec<u64>) {
+//// HOMOLOGY
+fn make_boundary_map(
+    dimension_n1: &[u64],
+    dimension_n: &[u64],
+    chunk_size: usize,
+) -> (Vec<Vec<usize>>, usize) {
+    let mut index_map: Vec<Vec<usize>> = vec![vec![]; dimension_n1.len()];
+    let mut dimension_n_map = HashMap::with_capacity(dimension_n.len());
+    for (index, chunk) in dimension_n.chunks_exact(chunk_size).enumerate() {
+        dimension_n_map.insert(chunk.to_vec(), index);
+    }
+    for (index, simplex) in dimension_n1.chunks_exact(chunk_size).enumerate() {
+        let mut indices: Vec<usize> = Vec::with_capacity(simplex.len() + 1);
+        for face in vecops::faces_of(simplex) {
+            let new_idx = dimension_n_map.len();
+            let idx = dimension_n_map.entry(face).or_insert(new_idx);
+            indices.push(*idx);
+        }
+        index_map[index] = indices;
+    }
+    (index_map, dimension_n.len())
+}
+
+pub fn betti(adjacency_matrix: Vec<Vec<usize>>) -> Vec<usize> {
+    //read data
+    let (mut matrix, chunk_size, mut cliques, degrees) = read_adjacency_matrix(adjacency_matrix);
+    let mut betti_numbers: Vec<usize> = Vec::new();
+    let mut prev_rank: usize = 0;
+    //add maxdim?
+    loop {
+        //get them cliques
+        let new_cliques = next_cliques(&mut matrix, &degrees, &cliques, chunk_size);
+        if new_cliques.is_empty() {
+            break;
+        }
+        //homology loop
+        let (boundary_map, n_cols) = make_boundary_map(&new_cliques, &cliques, chunk_size);
+        let mut boundary_matrix = homology::boundary_matrix(boundary_map, n_cols); // not chunk size
+        linalg::gaussian_elimination(&mut boundary_matrix, n_cols);
+        let rank = linalg::rank(&boundary_matrix, n_cols);
+        betti_numbers.push(new_cliques.len() - prev_rank - rank);
+        //reset
+        prev_rank = rank;
+        cliques = new_cliques; // Reassign the updated value to the outer variable
+    }
+    betti_numbers
+}
+
+/// USER API
+
+// REVISE THIS!!!!!!
+fn read_adjacency_matrix(
+    adjacency_matrix: Vec<Vec<usize>>,
+) -> (Vec<u64>, usize, Vec<u64>, Vec<usize>) {
     let n_vertices = adjacency_matrix.len();
     let chunk_size = (n_vertices + 64) / 64;
     let mut cliques: Vec<u64> = Vec::with_capacity(n_vertices * chunk_size);
     let mut matrix: Vec<u64> = Vec::with_capacity(n_vertices * chunk_size);
+    let mut degrees: Vec<usize> = Vec::with_capacity(n_vertices * chunk_size);
     for (i, row) in adjacency_matrix.into_iter().enumerate() {
         cliques.extend(vecops::bitvec_from_slice(&vec![i], chunk_size));
         matrix.extend(vecops::bitvec_from_slice(&row, chunk_size));
+        degrees.push(row.len());
     }
-    (matrix, chunk_size, cliques)
+    (matrix, chunk_size, cliques, degrees)
 }
 
-fn index_simplices(dimension_n1: &[u64], dimension_n: Vec<u64>, chunk_size: usize) {
-    dimension_n
-        .into_chunks_exact()
-        .enumerate()
-        .fold(HashMap::new(), |mut map, (index, value)| {
-            map.insert(value, index);
-            map
-        });
-    dimension_n
-        .into_iter()
-        .enumerate()
-        .fold(HashMap::new(), |mut map, (index, value)| {
-            map.insert(value, index);
-            map
-        });
-}
-
+/// TESTING
 pub fn enumerate_cliques(adjacency_matrix: Vec<Vec<usize>>) -> String {
-    let (mut matrix, chunk_size, mut cliques) = read_adjacency_matrix(adjacency_matrix);
-    let degrees: Vec<usize> = matrix
-        .chunks_exact(chunk_size)
-        .map(|row| vecops::n_elements(row))
-        .collect();
+    let (mut matrix, chunk_size, mut cliques, degrees) = read_adjacency_matrix(adjacency_matrix);
 
     println!("{}", degrees.len());
     let instant = Instant::now();
@@ -119,11 +156,8 @@ pub fn enumerate_cliques(adjacency_matrix: Vec<Vec<usize>>) -> String {
 
 //DO NOT USE, ONLY FOR TESTING
 pub fn enumerate_cliques_list(adjacency_matrix: Vec<Vec<usize>>) -> Vec<Vec<usize>> {
-    let (mut matrix, chunk_size, mut cliques) = read_adjacency_matrix(adjacency_matrix);
-    let degrees: Vec<usize> = matrix
-        .chunks_exact(chunk_size)
-        .map(|row| vecops::n_elements(row))
-        .collect();
+    let (mut matrix, chunk_size, mut cliques, mut degrees) =
+        read_adjacency_matrix(adjacency_matrix);
     let mut all_cliques: Vec<Vec<usize>> = Vec::new();
     all_cliques.extend(
         cliques

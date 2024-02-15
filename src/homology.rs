@@ -50,7 +50,7 @@ fn discombobulate_faces(
     (index_map, dimension_n.len())
 }
 
-fn boundary_matrix(index_map: Vec<Vec<usize>>, n_cols: usize) -> Vec<u64> {
+pub fn boundary_matrix(index_map: Vec<Vec<usize>>, n_cols: usize) -> Vec<u64> {
     let n_chunks = (n_cols + 63) / 64;
     let mut matrix = Vec::with_capacity(index_map.len() * n_chunks);
 

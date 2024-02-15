@@ -1,5 +1,7 @@
 use rayon::prelude::*;
 
+use crate::vecops;
+
 fn xor_slices(slice1: &mut [u64], slice2: &[u64]) {
     for (a, b) in slice1.iter_mut().zip(slice2.iter()) {
         *a ^= *b;
@@ -26,6 +28,19 @@ fn chunk_contains(slice: &[u64], index: usize) -> bool {
         // Out-of-bounds index is considered not contained
         false
     }
+}
+
+pub fn rank(matrix: &[u64], n_cols: usize) -> usize {
+    let row_size = (n_cols + 64) / 64;
+    let n_rows = matrix.len();
+    let mut count = n_rows;
+    for row in matrix.chunks_exact(row_size) {
+        if vecops::is_null(row) {
+            count -= 1;
+        }
+    }
+
+    count
 }
 
 //pivot goes on bits

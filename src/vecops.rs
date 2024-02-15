@@ -3,9 +3,7 @@ pub fn batch_intersect(matrix: &[u64], indexes: &[usize], chunk_size: usize) -> 
     // Calculate adjusted indexes
     let mut acc = matrix[indexes[0] * chunk_size..(indexes[0] + 1) * chunk_size].to_vec();
     for i in indexes.iter().skip(1) {
-        //change with is_null
         if is_null(&acc) {
-            // If all zeros, no need to continue, return early
             return acc;
         }
         and_slices(&mut acc, &matrix[i * chunk_size..(i + 1) * chunk_size])

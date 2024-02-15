@@ -2,8 +2,8 @@ use pyo3::prelude::*;
 mod clique;
 mod homology;
 mod linalg;
-mod vecops;
 mod simplex;
+mod vecops;
 
 // // ROOT
 // #[pymodule]
@@ -34,9 +34,13 @@ fn tda(_py: Python, m: &PyModule) -> PyResult<()> {
 
 #[pyfunction]
 #[pyo3(signature = (data, adjacency_matrix=true, maxdim=-1))]
-fn betti(data: Vec<Vec<usize>>, adjacency_matrix: bool, maxdim: i32) -> PyResult<String> {
-    let elapsed = clique::enumerate_cliques(data);
-    Ok(elapsed)
+fn betti(data: Vec<Vec<usize>>, adjacency_matrix: bool, maxdim: i32) -> PyResult<Vec<usize>> {
+    let betti = match adjacency_matrix {
+        true => clique::betti(data),
+        false => clique::betti(data),
+    };
+    // let elapsed = clique::enumerate_cliques(data);
+    Ok(betti)
 }
 
 #[pyfunction]
