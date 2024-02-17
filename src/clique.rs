@@ -6,6 +6,16 @@ use human_repr::HumanDuration;
 use rayon::prelude::*;
 use std::time::{Duration, Instant};
 
+macro_rules! timeit {
+    ($name:expr, $func:expr) => {{
+        let start = Instant::now();
+        let result = $func;
+        let duration = start.elapsed();
+        println!("{}: {:?}", $name, fmt(duration));
+        result
+    }};
+}
+
 fn fmt(duration: Duration) -> String {
     duration.human_duration().to_string()
 }
@@ -102,14 +112,27 @@ pub fn betti(adjacency_matrix: Vec<Vec<usize>>) -> Vec<usize> {
     //add maxdim?
     loop {
         //get them cliques
-        let new_cliques = next_cliques(&mut matrix, &degrees, &cliques, chunk_size);
+        let new_cliques = timeit!(
+            "next cliques:",
+            next_cliques(&mut matrix, &degrees, &cliques, chunk_size)
+        );
+        println!("{}", new_cliques.len() / chunk_size);
         if new_cliques.is_empty() {
             break;
         }
         //homology loop
-        let (boundary_map, n_cols) = make_boundary_map(&new_cliques, &cliques, chunk_size);
-        let mut boundary_matrix = homology::boundary_matrix(boundary_map, n_cols); // not chunk size
-        linalg::gaussian_elimination(&mut boundary_matrix, n_cols);
+        let (boundary_map, n_cols) = timeit!(
+            "boundary_map:",
+            make_boundary_map(&new_cliques, &cliques, chunk_size)
+        );
+        let mut boundary_matrix = timeit!(
+            "boundary_matrix:",
+            homology::boundary_matrix(boundary_map, n_cols)
+        );
+        timeit!(
+            "gaussian elemination:",
+            linalg::gaussian_elimination(&mut boundary_matrix, n_cols)
+        );
         let rank = linalg::rank(&boundary_matrix, n_cols);
         betti_numbers.push(new_cliques.len() - prev_rank - rank);
         //reset

@@ -3,9 +3,11 @@ use rayon::prelude::*;
 use crate::vecops;
 
 fn xor_slices(slice1: &mut [u64], slice2: &[u64]) {
-    for (a, b) in slice1.iter_mut().zip(slice2.iter()) {
-        *a ^= *b;
-    }
+    slice1.iter_mut().zip(slice2.iter()).for_each(|(a, b)| {
+        if *a != 0 || *b != 0 {
+            *a ^= *b;
+        }
+    });
 }
 
 fn swap_chunks<T>(slice: &mut [T], n_chunks: usize, i: usize, j: usize) {
@@ -32,8 +34,8 @@ fn chunk_contains(slice: &[u64], index: usize) -> bool {
 
 pub fn rank(matrix: &[u64], n_cols: usize) -> usize {
     let row_size = (n_cols + 64) / 64;
-    let n_rows = matrix.len();
-    let mut count = n_rows;
+    let n_rows = matrix.len() / row_size;
+    let mut count = (n_cols).min(n_rows);
     for row in matrix.chunks_exact(row_size) {
         if vecops::is_null(row) {
             count -= 1;
@@ -45,8 +47,9 @@ pub fn rank(matrix: &[u64], n_cols: usize) -> usize {
 
 //pivot goes on bits
 pub fn gaussian_elimination(matrix: &mut [u64], n_cols: usize) {
-    let max_rank = (n_cols).min(matrix.len());
     let row_size = (n_cols + 64) / 64;
+    let n_rows = matrix.len() / row_size;
+    let max_rank = (n_cols).min(n_rows);
     for pivot_idx in 0..max_rank {
         let mut last_row_idx = pivot_idx;
 
@@ -58,6 +61,7 @@ pub fn gaussian_elimination(matrix: &mut [u64], n_cols: usize) {
         }
         swap_chunks(matrix, row_size, pivot_idx, last_row_idx);
         let (upper, lower) = matrix.split_at_mut(pivot_idx * row_size + row_size);
+
         let pivot = &upper[pivot_idx * row_size..];
         lower.par_chunks_exact_mut(row_size).for_each(|row| {
             if chunk_contains(row, pivot_idx) {
