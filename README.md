@@ -1,4 +1,18 @@
-# Topological Data Analysis (TDA)
+<p align="center">
+  <img src='assets/logo.svg' width='200px' align="center"></img>
+</p>
+
+<div align="center">
+<h3 max-width='200px' align="center">Topological Data Analysis</h3>
+  <p><i>Not limited to just H0 and H1<br/>
+  Bringing topological data analysis to python ecosystem<br/>
+  Built with Rust</i><br/></p>
+  <p>
+<img alt="Pepy Total Downlods" src="https://img.shields.io/pepy/dt/tda?style=for-the-badge&logo=python&labelColor=white&color=blue">
+  </p>
+</div>
+
+#
 
 ### Contents
 - [Installation](#installation)
@@ -8,6 +22,9 @@
 TDA is a python package for topological data analysis written in Rust.
 
 ## Installation
+
+> [!CAUTION]
+> TDA is in very early stages of development.
 
 Pre-built packages for MacOS, Windos and most Linux distributions in [PyPI](https://pypi.org/project/tda/) and can be installed with:
 
