@@ -1,0 +1,23 @@
+[package]
+name = "tda"
+version.workspace = true
+edition.workspace = true
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+[lib]
+name = "tda"
+
+[dependencies]
+thiserror = "2.0.18"
+
+[dev-dependencies]
+criterion = "0.8.2"
+
+[[bench]]
+name = "persistent_homology"
+harness = false
+
+# [profile.release]
+# debug = "full"          # or `2`, same thing
+# split-debuginfo = "packed"  # macOS: faster samply load
+# strip = false
