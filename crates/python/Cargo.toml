@@ -1,5 +1,5 @@
 [package]
-name = "tda-python"
+name = "tda_python"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -12,4 +12,4 @@ crate-type = ["cdylib"]
 [dependencies]
 numpy = "0.28.0"
 pyo3 = "0.28.0"
-tda = { path = "../core" }
+tda_core = { path = "../core" }

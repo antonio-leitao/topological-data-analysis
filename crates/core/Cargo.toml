@@ -1,5 +1,5 @@
 [package]
-name = "tda"
+name = "tda_core"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -12,7 +12,7 @@ categories.workspace = true
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 [lib]
-name = "tda"
+name = "tda_core"
 
 [dependencies]
 thiserror = "2.0.18"

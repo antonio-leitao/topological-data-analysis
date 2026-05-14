@@ -70,9 +70,9 @@ pub fn persistent_homology<'py>(
     let result = py
         .detach(|| {
             if distance_matrix {
-                tda::persistent_homology_from_distances(slice, n, max_dim, threshold)
+                tda_core::persistent_homology_from_distances(slice, n, max_dim, threshold)
             } else {
-                tda::persistent_homology(slice, n, cols, max_dim, threshold)
+                tda_core::persistent_homology(slice, n, cols, max_dim, threshold)
             }
         })
         .map_err(error::into_py)?;

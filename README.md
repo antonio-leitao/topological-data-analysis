@@ -101,13 +101,13 @@ The core crate is also published as `tda`. Add it to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-tda = "0.2"
+tda_core = "0.2"
 ```
 
 Point cloud — pass a flat row-major `(n, d)` slice:
 
 ```rust
-use tda::persistent_homology;
+use tda_core::persistent_homology;
 
 let points: Vec<f32> = vec![
     0.0, 0.0,
@@ -131,7 +131,7 @@ for (dim, intervals) in barcode.intervals.iter().enumerate() {
 Precomputed distance matrix — pass a flat row-major `(n, n)` slice:
 
 ```rust
-use tda::persistent_homology_from_distances;
+use tda_core::persistent_homology_from_distances;
 
 let distances: Vec<f32> = vec![
     0.0, 1.0, 2.0,
