@@ -5,3 +5,10 @@ resolver = "2"
 [workspace.package]
 version = "0.2.1"
 edition = "2021"
+license = "MIT"
+description = "Topological Data Analysis in Rust. Not limited to H0 and H1."
+repository = "https://github.com/antonio-leitao/topological-data-analysis"
+authors = ["António Leitão <aleitao@novaims.unl.pt>"]
+readme = "README.md"
+keywords = ["topology", "homology", "tda", "persistent-homology", "ripser"]
+categories = ["mathematics", "science"]
