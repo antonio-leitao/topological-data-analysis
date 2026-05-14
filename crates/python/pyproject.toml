@@ -36,4 +36,3 @@ dev = ["maturin", "ripser", "numpy", "pandas"]
 features = ["pyo3/extension-module"]
 python-source = "python"
 module-name = "tda._core"
-include = [{ path = "../../README.md", format = "sdist" }]

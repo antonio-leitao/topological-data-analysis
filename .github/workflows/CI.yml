@@ -82,27 +82,11 @@ jobs:
           name: wheels-macos-${{ matrix.target }}
           path: crates/python/dist
 
-  sdist:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - name: Build sdist
-        uses: PyO3/maturin-action@v1
-        with:
-          working-directory: crates/python
-          command: sdist
-          args: --out dist
-      - name: Upload sdist
-        uses: actions/upload-artifact@v4
-        with:
-          name: wheels-sdist
-          path: crates/python/dist
-
   release:
     name: Release
     runs-on: ubuntu-latest
     if: startsWith(github.ref, 'refs/tags/')
-    needs: [linux, windows, macos, sdist]
+    needs: [linux, windows, macos]
     steps:
       - uses: actions/download-artifact@v4
         with:
