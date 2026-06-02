@@ -1,97 +1,124 @@
-mod error;
+//! Python bindings for the `tda` core crate.
+//!
+//! Two endpoints, mirroring the core API but collapsing the point-cloud /
+//! distance-matrix split into a single `distance_matrix` flag (the 2-D NumPy
+//! array already carries the shape):
+//!
+//!   * `persistent_homology(data, max_dim=1, threshold=None,
+//!                          distance_matrix=False, quotient=False, peel=False)`
+//!       → list of `(k, 2)` float32 arrays `[[birth, death], …]`, one per
+//!         homology dimension `0..=max_dim` (Ripser-compatible `dgms` layout;
+//!         essential classes carry `death = inf`).
+//!
+//!   * `filtration_size(data, max_dim=1, threshold=None, distance_matrix=False)`
+//!       → int, the simplex count of the filtered complex (dimension ≤ max_dim).
+//!
+//! Cargo.toml (this crate is separate from the core; e.g. `crates/python`):
+//!
+//! ```toml
+//! [lib]
+//! name = "tda"
+//! crate-type = ["cdylib"]
+//!
+//! [dependencies]
+//! # Point `package` at the core crate's actual name if it isn't `tda`.
+//! tda_core = { path = "../core", package = "tda" }
+//! pyo3 = { version = "0.22", features = ["extension-module"] }
+//! numpy = "0.22"
+//! ```
 
-use numpy::{PyArray1, PyArray2, PyArrayMethods, PyReadonlyArray2};
+use numpy::{IntoPyArray, PyArray2, PyArrayMethods, PyReadonlyArray2};
+use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
-use pyo3::types::PyList;
 
-/// Compute Vietoris–Rips persistent homology of a point cloud or distance matrix.
-///
-/// Parameters
-/// ----------
-/// data : np.ndarray
-///     Float32 array. Shape ``(n, d)`` for a point cloud, or ``(n, n)`` for a
-///     distance matrix (set ``distance_matrix=True``). C-contiguous input is
-///     zero-copy; non-contiguous input is copied internally.
-/// max_dim : int, default=1
-///     Highest homology dimension to compute. Intervals are returned for every
-///     dimension ``0..=max_dim``. Capped at 4.
-/// threshold : float or None, default=None
-///     Maximum filtration value. If ``None``, the enclosing radius of the data
-///     is used. If given, the effective threshold is ``min(threshold, enclosing_radius)``.
-/// distance_matrix : bool, default=False
-///     If ``True``, ``data`` is interpreted as a precomputed square distance
-///     matrix. Symmetry, zero diagonal, and non-negativity are assumed and
-///     not validated. Entries ``>= f32::MAX`` are treated as "no edge".
-///
-/// Returns
-/// -------
-/// list of np.ndarray
-///     One array per dimension, where ``result[d]`` has shape ``(k_d, 2)`` and
-///     each row is a ``[birth, death]`` pair. ``death == inf`` marks essential
-///     features.
-///
-/// Examples
-/// --------
-/// >>> import numpy as np, tda
-/// >>> X = np.random.rand(100, 3).astype(np.float32)
-/// >>> bars = tda.persistent_homology(X, max_dim=2)
-/// >>> bars[1].shape  # H1 intervals
-/// (k, 2)
-#[pyfunction(name = "persistent_homology")]
-#[pyo3(signature = (data, max_dim=1, threshold=None, distance_matrix=false))]
-pub fn persistent_homology<'py>(
+/// Flatten a 2-D array into a row-major `Vec<f32>` plus its `(rows, cols)`.
+/// `ndarray`'s logical iteration is row-major regardless of the underlying
+/// memory layout, so this is correct for non-contiguous / transposed views too.
+fn flatten(data: &PyReadonlyArray2<'_, f32>) -> (Vec<f32>, usize, usize) {
+    let arr = data.as_array();
+    let (rows, cols) = (arr.shape()[0], arr.shape()[1]);
+    let flat: Vec<f32> = arr.iter().copied().collect();
+    (flat, rows, cols)
+}
+
+#[inline]
+fn require_square(rows: usize, cols: usize) -> PyResult<()> {
+    if rows != cols {
+        return Err(PyValueError::new_err(format!(
+            "distance_matrix=True expects a square (n, n) array, got ({rows}, {cols})"
+        )));
+    }
+    Ok(())
+}
+
+#[inline]
+fn to_py_err(e: tda_core::Error) -> PyErr {
+    PyValueError::new_err(e.to_string())
+}
+
+/// Vietoris–Rips persistent homology.
+#[pyfunction]
+#[pyo3(signature = (data, max_dim=1, threshold=None, distance_matrix=false, quotient=false, peel=false))]
+fn persistent_homology<'py>(
     py: Python<'py>,
     data: PyReadonlyArray2<'py, f32>,
     max_dim: usize,
     threshold: Option<f32>,
     distance_matrix: bool,
-) -> PyResult<Bound<'py, PyList>> {
-    let view = data.as_array();
-    let n = view.nrows();
-    let cols = view.ncols();
+    quotient: bool,
+    peel: bool,
+) -> PyResult<Vec<Bound<'py, PyArray2<f32>>>> {
+    let (flat, rows, cols) = flatten(&data);
 
-    // The only Python-layer-specific check: square shape for matrix mode.
-    if distance_matrix && n != cols {
-        return Err(pyo3::exceptions::PyValueError::new_err(format!(
-            "distance matrix must be square, got shape ({}, {})",
-            n, cols
-        )));
+    let barcode = if distance_matrix {
+        require_square(rows, cols)?;
+        tda_core::persistent_homology_from_distances(
+            &flat, rows, max_dim, threshold, quotient, peel,
+        )
+    } else {
+        tda_core::persistent_homology(&flat, rows, cols, max_dim, threshold, quotient, peel)
     }
+    .map_err(to_py_err)?;
 
-    let owned_storage: Vec<f32>;
-    let slice: &[f32] = match view.as_slice() {
-        Some(s) => s,
-        None => {
-            owned_storage = view.iter().copied().collect();
-            &owned_storage
-        }
-    };
-
-    let result = py
-        .detach(|| {
-            if distance_matrix {
-                tda_core::persistent_homology_from_distances(slice, n, max_dim, threshold)
-            } else {
-                tda_core::persistent_homology(slice, n, cols, max_dim, threshold)
-            }
-        })
-        .map_err(error::into_py)?;
-
-    let arrays: Vec<Bound<'py, PyArray2<f32>>> = result
-        .into_flat_intervals()
-        .into_iter()
-        .map(|(rows, flat)| {
-            PyArray1::from_vec(py, flat)
-                .reshape([rows, 2])
-                .expect("(rows, 2) reshape on a vec of len rows*2 is infallible")
-        })
-        .collect();
-
-    PyList::new(py, arrays)
+    // One (k, 2) array per dimension. `into_flat_intervals` hands back the
+    // intervals already laid out as [b0, d0, b1, d1, …], so each dimension is a
+    // single zero-copy reshape.
+    let mut dgms = Vec::with_capacity(barcode.intervals.len());
+    for (k, flat) in barcode.into_flat_intervals() {
+        let arr = flat
+            .into_pyarray(py)
+            .reshape((k, 2))
+            .map_err(|e| PyValueError::new_err(e.to_string()))?;
+        dgms.push(arr);
+    }
+    Ok(dgms)
 }
 
-#[pymodule(gil_used = false)]
+/// Truncated Vietoris–Rips filtration size (simplices of dimension ≤ max_dim).
+#[pyfunction]
+#[pyo3(signature = (data, max_dim=1, threshold=None, distance_matrix=false, quotient=false,peel=false))]
+fn filtration_size(
+    data: PyReadonlyArray2<'_, f32>,
+    max_dim: usize,
+    threshold: Option<f32>,
+    distance_matrix: bool,
+    quotient: bool,
+    peel: bool,
+) -> PyResult<usize> {
+    let (flat, rows, cols) = flatten(&data);
+
+    if distance_matrix {
+        require_square(rows, cols)?;
+        tda_core::filtration_size_from_distances(&flat, rows, max_dim, threshold, quotient, peel)
+    } else {
+        tda_core::filtration_size(&flat, rows, cols, max_dim, threshold, quotient, peel)
+    }
+    .map_err(to_py_err)
+}
+
+#[pymodule]
 fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(persistent_homology, m)?)?;
+    m.add_function(wrap_pyfunction!(filtration_size, m)?)?;
     Ok(())
 }

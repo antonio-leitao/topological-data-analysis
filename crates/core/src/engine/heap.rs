@@ -1,51 +1,10 @@
-// ═══════════════════════════════════════════════════════════════════════════════
-// FastHeap — 4-ary max-heap (eager sift-up, drop-in for the 2-ary version)
-// ═══════════════════════════════════════════════════════════════════════════════
-//
-// Replace the entire `pub struct FastHeap { ... }` and `impl FastHeap { ... }`
-// in reduction.rs with this section. Existing call sites compile unchanged:
-//
-//     new, with_capacity, clear, len, is_empty,
-//     peek (&self), push, pop, pop_pivot, get_pivot
-//
-// SEMANTICS ARE EAGER. Every `push` restores the heap invariant before
-// returning. There is no dirty flag, no lazy heapify. This is the part the
-// previous lazy-heapify version got wrong: in compute_pairs, each V-column
-// add is followed by exactly one `get_pivot`, and a typical V-column add is
-// a small handful of pushes. Lazy heapify paid O(N) per read regardless of
-// batch size — catastrophic when batches are small and N grows into the
-// thousands. Eager sift-up costs O(log N) per push, log N per pop.
-//
-// WHY 4-ARY OVER 2-ARY
-// ────────────────────
-// For node i:
-//   - parent      = (i - 1) / 4
-//   - children    = 4i + 1, 4i + 2, 4i + 3, 4i + 4
-//
-// Tree depth is ⌈log₄(N)⌉ ≈ ½ × ⌈log₂(N)⌉. The push loop runs ½ as many
-// iterations on average — the same loop currently showing 277k samples on
-// `mov x9, x23` (the loop-back) and 148k on `add x13, x8, x23, lsl #4`.
-//
-// Pop costs more per level (max-of-4 vs max-of-2) but pop is rare relative
-// to push in this workload. The four child slots are contiguous (4·16 = 64
-// bytes = one cache line on AArch64), so the 4-way max is a single cache
-// fill, not four scattered loads.
-//
-// TUNING NOTE
-// ───────────
-// If after profiling 4-ary push is still hot, the next move is *not*
-// lazy heapify. It's:
-//   1) optimization #5 from the earlier analysis: track the running max
-//      during the init-phase pushes in `init_coboundary_and_get_pivot`
-//      and return it directly — no heap read needed at all for init.
-//      That's a separate change in reduction.rs, not in FastHeap.
-//   2) inline-attribute audit: confirm `Simplex128`'s `Ord` impl is being
-//      inlined into the sift-up. Check with `cargo asm`. If you see a
-//      `bl` to a comparison helper, slap `#[inline(always)]` on the impl.
+// FastHeap: eager N-ary max-heap over Simplex128 (N = ARITY). Drop-in for the
+// 2-ary version; every push restores the invariant (no lazy heapify — small,
+// frequent batches made lazy heapify pay O(N) per read). Pop is O(log_N).
+// append_raw + heapify is the bulk-load path (Floyd build, used by the
+// reduction's coboundary init).
 
 use crate::engine::simplex::Simplex128;
-
-/// Branching factor. 4 is a good default; increase to 8 only after measuring.
 const ARITY: usize = 8;
 
 pub struct FastHeap {
@@ -79,12 +38,6 @@ impl FastHeap {
     pub fn peek(&self) -> Option<&Simplex128> {
         self.data.first()
     }
-
-    // ── Push: append + sift up (4-ary) ─────────────────────────────────────
-    //
-    // Hot path. Same loop shape as the previous 2-ary version — the only
-    // change is `parent = (pos - 1) / ARITY`. With ARITY = 4 the tree is
-    // half as deep so the loop runs half as many iterations on average.
 
     #[inline(always)]
     pub fn push(&mut self, item: Simplex128) {
@@ -120,16 +73,11 @@ impl FastHeap {
         self.data.push(item);
     }
 
-    /// Restore the heap invariant over the entire buffer in O(N) using
-    /// bottom-up sift-down (Floyd's algorithm, 4-ary variant).
     pub fn heapify(&mut self) {
         let n = self.data.len();
         if n <= 1 {
             return;
         }
-        // Last node with at least one child: parent of the last leaf.
-        // For 4-ary: parent(i) = (i - 1) / 4, so the largest internal
-        // node index is (n - 2) / 4.
         let last_internal = (n - 2) / ARITY;
         // SAFETY: indices in [0, last_internal] are all < n; sift_down_4ary
         // only accesses [0, n). Simplex128 is Copy, so the temporary `item`
@@ -139,7 +87,7 @@ impl FastHeap {
             let mut pos = last_internal as isize;
             while pos >= 0 {
                 let item = *ptr.add(pos as usize);
-                sift_down_4ary(ptr, pos as usize, n, item);
+                sift_down(ptr, pos as usize, n, item);
                 pos -= 1;
             }
         }
@@ -163,7 +111,7 @@ impl FastHeap {
             }
             let last = *ptr.add(n - 1);
             self.data.set_len(n - 1);
-            sift_down_4ary(ptr, 0, n - 1, last);
+            sift_down(ptr, 0, n - 1, last);
             Some(result)
         }
     }
@@ -196,90 +144,8 @@ impl Default for FastHeap {
     }
 }
 
-// ── 4-ary sift-down ────────────────────────────────────────────────────────
-//
-// Walks `pos` downward toward the leaves while `item` would violate the
-// heap invariant against the largest of pos's up-to-4 children. The four
-// child slots are contiguous in memory (4·16 = 64 bytes = one cache line),
-// so the four loads happen on a single cache fill.
-//
-// SAFETY: caller guarantees `pos < end ≤ data length` and that ptr is
-// valid for at least `end` elements. The function only accesses indices
-// in [0, end).
-// #[inline(always)]
-// unsafe fn sift_down_4ary(ptr: *mut Simplex128, mut pos: usize, end: usize, item: Simplex128) {
-//     loop {
-//         let first = ARITY * pos + 1;
-//         if first >= end {
-//             break;
-//         }
-//         // Find the index of the largest among up to 4 children.
-//         // Unrolled because the iteration count is fixed and small.
-//         let last_excl = (first + ARITY).min(end);
-//         let mut best = first;
-//         let mut best_val = *ptr.add(first);
-//
-//         if first + 1 < last_excl {
-//             let v = *ptr.add(first + 1);
-//             if v > best_val {
-//                 best = first + 1;
-//                 best_val = v;
-//             }
-//         }
-//         if first + 2 < last_excl {
-//             let v = *ptr.add(first + 2);
-//             if v > best_val {
-//                 best = first + 2;
-//                 best_val = v;
-//             }
-//         }
-//         if first + 3 < last_excl {
-//             let v = *ptr.add(first + 3);
-//             if v > best_val {
-//                 best = first + 3;
-//                 best_val = v;
-//             }
-//         }
-//         //ONLY IF ARITY ABOVE 4!!
-//         if first + 4 < last_excl {
-//             let v = *ptr.add(first + 4);
-//             if v > best_val {
-//                 best = first + 4;
-//                 best_val = v;
-//             }
-//         }
-//         if first + 5 < last_excl {
-//             let v = *ptr.add(first + 5);
-//             if v > best_val {
-//                 best = first + 5;
-//                 best_val = v;
-//             }
-//         }
-//         if first + 6 < last_excl {
-//             let v = *ptr.add(first + 6);
-//             if v > best_val {
-//                 best = first + 6;
-//                 best_val = v;
-//             }
-//         }
-//         if first + 7 < last_excl {
-//             let v = *ptr.add(first + 7);
-//             if v > best_val {
-//                 best = first + 7;
-//                 best_val = v;
-//             }
-//         }
-//
-//         if item >= best_val {
-//             break;
-//         }
-//         *ptr.add(pos) = best_val;
-//         pos = best;
-//     }
-//     *ptr.add(pos) = item;
-// }
 #[inline(always)]
-unsafe fn sift_down_4ary(ptr: *mut Simplex128, mut pos: usize, end: usize, item: Simplex128) {
+unsafe fn sift_down(ptr: *mut Simplex128, mut pos: usize, end: usize, item: Simplex128) {
     loop {
         let first = ARITY * pos + 1;
         if first >= end {

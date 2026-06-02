@@ -1,6 +1,7 @@
-// ═══════════════════════════════════════════════════════════════════════════════
-// reduction.rs — Implicit cohomological matrix reduction over Z/2
-// ═══════════════════════════════════════════════════════════════════════════════
+// Implicit cohomological matrix reduction over Z/2. CompressedSparseMatrix
+// stores V; columns are reduced left-to-right with the emergent-pair shortcut
+// (init_coboundary_and_get_pivot) and the apparent-pair shortcut (add the
+// apparent facet's coboundary instead of a stored column).
 
 use crate::engine::distance::DistanceMatrix;
 use crate::engine::heap::FastHeap;

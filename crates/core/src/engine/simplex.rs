@@ -1,41 +1,18 @@
-// ═══════════════════════════════════════════════════════════════════════════════
-// simplex.rs — Packed simplex representation, cofacet/facet iterators, hashing
-// ═══════════════════════════════════════════════════════════════════════════════
+// Packed 128-bit simplex + cofacet/facet iterators + apparent-pair primitives.
 //
-// ORDERING CONVENTION (Ripser-compatible)
-// ═══════════════════════════════════════
+// LAYOUT  high 32 bits: encode_filtration(diam) = !diam.to_bits()
+//         low  96 bits: 6 vertex slots, largest vertex first, each stored as id+1 (0 = empty)
 //
-// Simplex128 implements Ord as Ripser's `greater_diameter_or_smaller_index`:
-//
-//     a < b   ⟺  a is YOUNGER (processed first in cohomological reduction)
-//                = (filt(a) > filt(b))
-//                  OR (filt(a) == filt(b) AND vertex_tuple(a) < vertex_tuple(b))
-//
-//     a > b   ⟺  a is OLDER (heap pivot in cohomological reduction)
-//
-// Filtration is encoded in the high 32 bits and vertex tuples (largest vertex
-// first) in the low 96 bits, so vertex_tuple comparison on the masked u128
-// IS combinatorial index comparison.
-//
-// This makes:
-//   - `sort_unstable()`             → YOUNGEST-first iteration order
-//   - `BinaryHeap<Simplex128>::pop` → returns OLDEST = the cohomological pivot
-//
-// CONSEQUENCE FOR ITERATORS
-// ─────────────────────────
-// CofacetIter (j = n−1 downto 0) and FacetIter (k = 0 upto vc−1) iterate
-// in fixed orders driven by the raw vertex values, NOT by Simplex128's Ord.
-// Their iteration sequences match Ripser's reverse-lex / forward-lex order
-// regardless of how Simplex128 is compared, so apparent-pair detection is
-// unchanged by the Ord convention.
-//
-// (σ, τ) is a zero-persistence apparent pair iff
-//   - τ is the lex-max same-diameter cofacet of σ      (= first in CofacetIter)
-//   - σ is the lex-min same-diameter facet of τ        (= first in FacetIter)
-//
-// The apparent-pair primitives at the bottom of this file compose these two
-// iterators to check the condition in O(dim) distance lookups — cheaper than
-// a single hashmap probe and allocation-free.
+// ORDERING  Simplex128 derives Ord, i.e. comparison IS raw u128 lexicographic
+//   comparison. encode_filtration inverts the float bits ON PURPOSE: it lets us
+//   keep the derived (and therefore trivially inlinable) Ord in the heap's hot
+//   sift loop while still ordering a LARGER diameter as a SMALLER u128. So:
+//     larger u128  ==  smaller diameter, or (equal diameter) larger vertex set.
+//   The heap is a max-heap; the pivot is the max u128. CofacetIter yields the
+//   max-u128 same-diameter cofacet first; FacetIter the min-u128 same-diameter
+//   facet first. The exact pivot semantics are pinned by the tests
+//   `pivot_primitives_match_ripser_first_yielded` and
+//   `zero_apparent_facet_matches_bruteforce_on_tetrahedra` — trust those, not prose.
 
 use std::hash::{BuildHasherDefault, Hasher};
 
@@ -43,32 +20,11 @@ use crate::engine::distance::{
     cofacet_diameter, cofacet_diameter_v_larger, facet_diameter, DistanceMatrix,
 };
 
-// ═══════════════════════════════════════════════════════════════════════════════
-// Filtration encoding: f32 → u32, order-preserving for non-negative floats
-// ═══════════════════════════════════════════════════════════════════════════════
-
-/// Encode a non-negative f32 as a u32 preserving comparison order.
-///
-/// For non-negative IEEE 754 floats, `to_bits()` is monotonically increasing:
-///   0.0 → 0x0000_0000, f32::INFINITY → 0x7F80_0000.
-/// This lets us store filtration values in the top 32 bits of Simplex128's u128,
-/// making natural u128 comparison equivalent to filtration-first ordering.
-// #[inline(always)]
-// pub fn encode_filtration(f: f32) -> u32 {
-//     debug_assert!(f >= 0.0, "Distances must be non-negative");
-//     f.to_bits()
-// }
-
 #[inline(always)]
 pub fn encode_filtration(f: f32) -> u32 {
     debug_assert!(f >= 0.0, "Distances must be non-negative");
     !f.to_bits() // flip
 }
-/// Decode a u32 back to f32.
-// #[inline(always)]
-// pub fn decode_filtration(u: u32) -> f32 {
-//     f32::from_bits(u)
-// }
 
 #[inline(always)]
 pub fn decode_filtration(u: u32) -> f32 {
@@ -81,58 +37,13 @@ pub fn decode_filtration(u: u32) -> f32 {
 /// Mask for the vertex payload (bits 0–95).
 const VERTEX_MASK: u128 = (1u128 << 96) - 1;
 
-/// A simplex packed into 128 bits with order-preserving layout.
-///
-/// Bit layout:
-/// ```text
-///   [127..96]  Filtration value (32 bits, encoded u32 via encode_filtration)
-///   [95..80]   Vertex slot 0 — largest vertex  (stored as vertex_id + 1; 0 = empty)
-///   [79..64]   Vertex slot 1
-///   [63..48]   Vertex slot 2
-///   [47..32]   Vertex slot 3
-///   [31..16]   Vertex slot 4
-///   [15..0]    Vertex slot 5 — smallest vertex (stored as vertex_id + 1; 0 = empty)
-/// ```
-///
-/// Supports up to 6 vertices (dimension ≤ 5) and vertex IDs up to 65534.
-/// The +1 encoding reserves 0 as the "empty slot" sentinel.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 #[repr(C, align(16))]
 pub struct Simplex128(pub u128);
 
-// // Manual Ord/PartialOrd: a < b iff a is YOUNGER under Ripser's convention
-// // (larger filtration, OR same filtration and smaller vertex tuple).
-// impl Ord for Simplex128 {
-//     #[inline(always)]
-//     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-//         use std::cmp::Ordering;
-//         let a_f = self.filtration_encoded();
-//         let b_f = other.filtration_encoded();
-//         match a_f.cmp(&b_f) {
-//             Ordering::Greater => Ordering::Less, // larger filt = younger = "less"
-//             Ordering::Less => Ordering::Greater, // smaller filt = older   = "greater"
-//             Ordering::Equal => {
-//                 // Same filtration: smaller vertex tuple = younger = "less".
-//                 let a_v = self.0 & VERTEX_MASK;
-//                 let b_v = other.0 & VERTEX_MASK;
-//                 a_v.cmp(&b_v)
-//             }
-//         }
-//     }
-// }
-//
-// impl PartialOrd for Simplex128 {
-//     #[inline(always)]
-//     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-//         Some(self.cmp(other))
-//     }
-// }
-
 impl Simplex128 {
     /// Sentinel for "no simplex" / invalid.
     pub const INVALID: Simplex128 = Simplex128(0);
-
-    // ── Constructors ────────────────────────────────────────────────────────
 
     /// Create from a filtration value (f32) and an unsorted vertex slice.
     /// Vertices are sorted descending internally.
@@ -172,8 +83,6 @@ impl Simplex128 {
         }
         Simplex128(p)
     }
-
-    // ── Accessors ───────────────────────────────────────────────────────────
 
     /// Encoded filtration value (u32).
     #[inline(always)]

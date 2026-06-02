@@ -40,7 +40,7 @@ fn bench_persistent_homology(c: &mut Criterion) {
     for (name, path) in datasets {
         let (points, n, d) = load_points(path);
         c.bench_function(&format!("{name}"), |b| {
-            b.iter(|| persistent_homology(&points, n, d, 1, None));
+            b.iter(|| persistent_homology(&points, n, d, 1, None, false, false));
         });
     }
 }

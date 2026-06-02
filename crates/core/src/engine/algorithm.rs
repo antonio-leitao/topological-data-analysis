@@ -132,17 +132,96 @@ fn compute_h0(
 ///        reduction (its column is therefore zero by construction);
 ///      - apparent-pair filtering: τ is already the cofacet side of an
 ///        apparent pair (paired with its oldest same-diam facet).
+// fn assemble_candidates(
+//     simplices: &mut Vec<Simplex128>,
+//     dist: &DistanceMatrix,
+//     threshold: f32,
+//     cleared_pivots: &FxHashMap<Simplex128, ()>,
+// ) -> Vec<Simplex128> {
+//     if simplices.is_empty() {
+//         return Vec::new();
+//     }
+//
+//     let mut next_simplices: Vec<Simplex128> = Vec::with_capacity(simplices.len() * 2);
+//     let mut columns_to_reduce: Vec<Simplex128> = Vec::with_capacity(simplices.len());
+//
+//     let mut gen: u64 = 0;
+//     let mut rej_cleared: u64 = 0;
+//     let mut rej_app_cofacet: u64 = 0;
+//     let mut rej_app_facet: u64 = 0;
+//     let mut kept: u64 = 0;
+//
+//     let mut iter = CofacetIter::new(simplices[0], dist, false, threshold);
+//     for (i, &sigma) in simplices.iter().enumerate() {
+//         if i > 0 {
+//             iter.reset(sigma, false);
+//         }
+//         iter.for_each(|tau| {
+//             gen += 1;
+//             next_simplices.push(tau);
+//
+//             if cleared_pivots.contains_key(&tau) {
+//                 rej_cleared += 1;
+//                 return true;
+//             }
+//             if is_apparent_cofacet(tau, dist, threshold) {
+//                 rej_app_cofacet += 1;
+//                 return true;
+//             }
+//             if zero_apparent_facet(tau, dist, threshold).is_some() {
+//                 rej_app_facet += 1;
+//                 return true;
+//             }
+//             if zero_apparent_cofacet(tau, dist, threshold).is_some() {
+//                 // τ is FACET-side
+//                 return true;
+//             }
+//             kept += 1;
+//             columns_to_reduce.push(tau);
+//             true
+//         });
+//     }
+//
+//     // let mut iter = CofacetIter::new(simplices[0], dist, false, threshold);
+//     // for (i, &sigma) in simplices.iter().enumerate() {
+//     //     if i > 0 {
+//     //         iter.reset(sigma, false);
+//     //     }
+//     //     iter.for_each(|tau| {
+//     //         next_simplices.push(tau);
+//     //         // if !cleared_pivots.contains_key(&tau) && !is_apparent_cofacet(tau, dist, threshold) {
+//     //         if !cleared_pivots.contains_key(&tau)
+//     //             && !is_apparent_cofacet(tau, dist, threshold)
+//     //             && zero_apparent_facet(tau, dist, threshold).is_none()
+//     //         {
+//     //             columns_to_reduce.push(tau);
+//     //         }
+//     //         true
+//     //     });
+//     // }
+//
+//     columns_to_reduce.sort_unstable();
+//     *simplices = next_simplices;
+//     columns_to_reduce
+// }
+
 fn assemble_candidates(
     simplices: &mut Vec<Simplex128>,
     dist: &DistanceMatrix,
     threshold: f32,
     cleared_pivots: &FxHashMap<Simplex128, ()>,
+    build_pool: bool,
 ) -> Vec<Simplex128> {
     if simplices.is_empty() {
         return Vec::new();
     }
 
-    let mut next_simplices: Vec<Simplex128> = Vec::with_capacity(simplices.len() * 2);
+    // Only allocate the next-dimension pool if a later assemble will read it.
+    let mut next_simplices: Vec<Simplex128> = if build_pool {
+        Vec::with_capacity(simplices.len() * 2)
+    } else {
+        Vec::new()
+    };
     let mut columns_to_reduce: Vec<Simplex128> = Vec::with_capacity(simplices.len());
 
     let mut iter = CofacetIter::new(simplices[0], dist, false, threshold);
@@ -151,16 +230,33 @@ fn assemble_candidates(
             iter.reset(sigma, false);
         }
         iter.for_each(|tau| {
-            next_simplices.push(tau);
-            if !cleared_pivots.contains_key(&tau) && !is_apparent_cofacet(tau, dist, threshold) {
-                columns_to_reduce.push(tau);
+            if build_pool {
+                next_simplices.push(tau);
             }
+
+            // Filters in increasing cost / decreasing hit rate:
+            //   cleared       — cheap hashmap probe
+            //   facet-side    — catches ~99% of cofacets (zero-persistence apparent pairs)
+            //   cofacet-side  — rare
+            if cleared_pivots.contains_key(&tau) {
+                return true;
+            }
+            if zero_apparent_cofacet(tau, dist, threshold).is_some() {
+                return true;
+            }
+            if is_apparent_cofacet(tau, dist, threshold) {
+                return true;
+            }
+
+            columns_to_reduce.push(tau);
             true
         });
     }
 
     columns_to_reduce.sort_unstable();
-    *simplices = next_simplices;
+    if build_pool {
+        *simplices = next_simplices;
+    }
     columns_to_reduce
 }
 
@@ -199,8 +295,9 @@ pub fn compute(dist: &DistanceMatrix, threshold: f32, max_dim: usize) -> Barcode
         intervals.push(dim_intervals);
 
         if dim < max_dim {
+            let build_pool = dim + 1 < max_dim;
             columns_to_reduce =
-                assemble_candidates(&mut simplices, dist, threshold, &cleared_pivots);
+                assemble_candidates(&mut simplices, dist, threshold, &cleared_pivots, build_pool);
         }
     }
 
