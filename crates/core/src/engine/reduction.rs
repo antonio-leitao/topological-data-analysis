@@ -1,11 +1,10 @@
-// Implicit cohomological matrix reduction over Z/2. CompressedSparseMatrix
-// stores V; columns are reduced left-to-right with the emergent-pair shortcut
-// (init_coboundary_and_get_pivot) and the apparent-pair shortcut (add the
-// apparent facet's coboundary instead of a stored column).
+// ═══════════════════════════════════════════════════════════════════════════════
+// reduction.rs — Implicit cohomological matrix reduction over Z/2
+// ═══════════════════════════════════════════════════════════════════════════════
 
-use crate::engine::distance::DistanceMatrix;
+use crate::engine::filtration::Filtration;
 use crate::engine::heap::FastHeap;
-use crate::engine::simplex::{zero_apparent_facet, CofacetIter, FxHashMap, Simplex128};
+use crate::engine::simplex::{FxHashMap, Simplex128};
 use crate::types::PersistenceInterval;
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -57,38 +56,40 @@ impl CompressedSparseMatrix {
 
 //hottest loop accounts for 55% of runtime
 #[inline]
-fn add_simplex_coboundary(
+fn add_simplex_coboundary<F: Filtration>(
     simplex: Simplex128,
-    cofacet_iter: &mut CofacetIter,
+    filt: &F,
+    threshold: f32,
     working_v: &mut Vec<Simplex128>,
     working_coboundary: &mut FastHeap,
 ) {
     working_v.push(simplex);
-    cofacet_iter.reset(simplex, true);
-    cofacet_iter.for_each(|cofacet| {
+    filt.for_each_cofacet(simplex, true, threshold, |cofacet| {
         working_coboundary.push(cofacet);
         true
     });
 }
 
 #[inline]
-fn add_coboundary(
+fn add_coboundary<F: Filtration>(
     v_matrix: &CompressedSparseMatrix,
     columns: &[Simplex128],
     column_index: usize,
-    cofacet_iter: &mut CofacetIter,
+    filt: &F,
+    threshold: f32,
     working_v: &mut Vec<Simplex128>,
     working_coboundary: &mut FastHeap,
 ) {
     add_simplex_coboundary(
         columns[column_index],
-        cofacet_iter,
+        filt,
+        threshold,
         working_v,
         working_coboundary,
     );
 
     for &simplex in v_matrix.column(column_index) {
-        add_simplex_coboundary(simplex, cofacet_iter, working_v, working_coboundary);
+        add_simplex_coboundary(simplex, filt, threshold, working_v, working_coboundary);
     }
 }
 
@@ -96,11 +97,10 @@ fn add_coboundary(
 // Initial pivot search with emergent-pair shortcut
 // ═══════════════════════════════════════════════════════════════════════════════
 
-fn init_coboundary_and_get_pivot(
+fn init_coboundary_and_get_pivot<F: Filtration>(
     sigma: Simplex128,
-    dist: &DistanceMatrix,
+    filt: &F,
     threshold: f32,
-    cofacet_iter: &mut CofacetIter,
     pivot_column_index: &FxHashMap<Simplex128, usize>,
     working_coboundary: &mut FastHeap,
 ) -> Option<Simplex128> {
@@ -108,11 +108,10 @@ fn init_coboundary_and_get_pivot(
     let mut check_for_emergent_pair = true;
     let mut emergent: Option<Simplex128> = None;
 
-    cofacet_iter.reset(sigma, true);
-    cofacet_iter.for_each(|cofacet| {
+    filt.for_each_cofacet(sigma, true, threshold, |cofacet| {
         if check_for_emergent_pair && cofacet.filtration_encoded() == sigma_filt {
             if !pivot_column_index.contains_key(&cofacet)
-                && zero_apparent_facet(cofacet, dist, threshold).is_none()
+                && filt.zero_apparent_facet(cofacet, threshold).is_none()
             {
                 working_coboundary.clear(); // discard pollution
                 emergent = Some(cofacet);
@@ -136,9 +135,9 @@ fn init_coboundary_and_get_pivot(
 // compute_pairs — the main reduction loop
 // ═══════════════════════════════════════════════════════════════════════════════
 
-pub fn compute_pairs(
+pub fn compute_pairs<F: Filtration>(
     columns: &[Simplex128],
-    dist: &DistanceMatrix,
+    filt: &F,
     threshold: f32,
     dim_intervals: &mut Vec<PersistenceInterval>,
     cleared_pivots: &mut FxHashMap<Simplex128, ()>,
@@ -151,8 +150,6 @@ pub fn compute_pairs(
     let mut pivot_column_index: FxHashMap<Simplex128, usize> =
         FxHashMap::with_capacity_and_hasher(columns.len(), Default::default());
 
-    let mut cofacet_iter = CofacetIter::new(columns[0], dist, true, threshold);
-
     let cap = (columns.len() * 4).max(1024);
     let mut working_v: Vec<Simplex128> = Vec::with_capacity(cap);
     let mut working_coboundary = FastHeap::with_capacity(cap);
@@ -164,9 +161,8 @@ pub fn compute_pairs(
 
         let mut pivot = init_coboundary_and_get_pivot(
             sigma,
-            dist,
+            filt,
             threshold,
-            &mut cofacet_iter,
             &pivot_column_index,
             &mut working_coboundary,
         );
@@ -205,7 +201,8 @@ pub fn compute_pairs(
                             &v_matrix,
                             columns,
                             k,
-                            &mut cofacet_iter,
+                            filt,
+                            threshold,
                             &mut working_v,
                             &mut working_coboundary,
                         );
@@ -213,10 +210,11 @@ pub fn compute_pairs(
                         continue;
                     }
 
-                    if let Some(phi) = zero_apparent_facet(tau, dist, threshold) {
+                    if let Some(phi) = filt.zero_apparent_facet(tau, threshold) {
                         add_simplex_coboundary(
                             phi,
-                            &mut cofacet_iter,
+                            filt,
+                            threshold,
                             &mut working_v,
                             &mut working_coboundary,
                         );

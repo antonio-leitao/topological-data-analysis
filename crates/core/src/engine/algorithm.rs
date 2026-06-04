@@ -1,10 +1,8 @@
 use std::collections::HashMap;
 
-use crate::engine::distance::DistanceMatrix;
+use crate::engine::filtration::Filtration;
 use crate::engine::reduction::compute_pairs;
-use crate::engine::simplex::{
-    is_apparent_cofacet, zero_apparent_cofacet, CofacetIter, FxBuildHasher, FxHashMap, Simplex128,
-};
+use crate::engine::simplex::{FxBuildHasher, FxHashMap, Simplex128};
 use crate::types::{BarcodeResult, PersistenceInterval};
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -56,22 +54,18 @@ impl UnionFind {
 // H0: enumerate edges, Kruskal, split into simplices + columns_to_reduce
 // ═══════════════════════════════════════════════════════════════════════════════
 
-fn compute_h0(
-    dist: &DistanceMatrix,
+fn compute_h0<F: Filtration>(
+    dist: &F,
     threshold: f32,
     intervals: &mut Vec<PersistenceInterval>,
 ) -> (Vec<Simplex128>, Vec<Simplex128>) {
     let n = dist.n();
 
     let mut edges: Vec<Simplex128> = Vec::new();
-    for i in 1..n {
-        for j in 0..i {
-            let d = dist.get(i, j);
-            if d <= threshold {
-                edges.push(Simplex128::from_sorted_desc(d, &[i as u16, j as u16]));
-            }
-        }
-    }
+    dist.for_each_edge(threshold, |edge| {
+        edges.push(edge);
+        true
+    });
 
     // Kruskal needs SMALLEST DIAMETER FIRST (= oldest-first). Under the
     // Ripser-compatible Ord, oldest is "greater", so descending sort gives
@@ -98,7 +92,7 @@ fn compute_h0(
             // Filter: if the edge is already the cofacet side of an apparent pair
             // with one of its endpoints, it's guaranteed to be paired in the H1
             // reduction and we can skip it here (Ripser, compute_dim_0_pairs).
-            if zero_apparent_cofacet(edge, dist, threshold).is_none() {
+            if dist.zero_apparent_cofacet(edge, threshold).is_none() {
                 columns_to_reduce.push(edge);
             }
         }
@@ -132,82 +126,9 @@ fn compute_h0(
 ///        reduction (its column is therefore zero by construction);
 ///      - apparent-pair filtering: τ is already the cofacet side of an
 ///        apparent pair (paired with its oldest same-diam facet).
-// fn assemble_candidates(
-//     simplices: &mut Vec<Simplex128>,
-//     dist: &DistanceMatrix,
-//     threshold: f32,
-//     cleared_pivots: &FxHashMap<Simplex128, ()>,
-// ) -> Vec<Simplex128> {
-//     if simplices.is_empty() {
-//         return Vec::new();
-//     }
-//
-//     let mut next_simplices: Vec<Simplex128> = Vec::with_capacity(simplices.len() * 2);
-//     let mut columns_to_reduce: Vec<Simplex128> = Vec::with_capacity(simplices.len());
-//
-//     let mut gen: u64 = 0;
-//     let mut rej_cleared: u64 = 0;
-//     let mut rej_app_cofacet: u64 = 0;
-//     let mut rej_app_facet: u64 = 0;
-//     let mut kept: u64 = 0;
-//
-//     let mut iter = CofacetIter::new(simplices[0], dist, false, threshold);
-//     for (i, &sigma) in simplices.iter().enumerate() {
-//         if i > 0 {
-//             iter.reset(sigma, false);
-//         }
-//         iter.for_each(|tau| {
-//             gen += 1;
-//             next_simplices.push(tau);
-//
-//             if cleared_pivots.contains_key(&tau) {
-//                 rej_cleared += 1;
-//                 return true;
-//             }
-//             if is_apparent_cofacet(tau, dist, threshold) {
-//                 rej_app_cofacet += 1;
-//                 return true;
-//             }
-//             if zero_apparent_facet(tau, dist, threshold).is_some() {
-//                 rej_app_facet += 1;
-//                 return true;
-//             }
-//             if zero_apparent_cofacet(tau, dist, threshold).is_some() {
-//                 // τ is FACET-side
-//                 return true;
-//             }
-//             kept += 1;
-//             columns_to_reduce.push(tau);
-//             true
-//         });
-//     }
-//
-//     // let mut iter = CofacetIter::new(simplices[0], dist, false, threshold);
-//     // for (i, &sigma) in simplices.iter().enumerate() {
-//     //     if i > 0 {
-//     //         iter.reset(sigma, false);
-//     //     }
-//     //     iter.for_each(|tau| {
-//     //         next_simplices.push(tau);
-//     //         // if !cleared_pivots.contains_key(&tau) && !is_apparent_cofacet(tau, dist, threshold) {
-//     //         if !cleared_pivots.contains_key(&tau)
-//     //             && !is_apparent_cofacet(tau, dist, threshold)
-//     //             && zero_apparent_facet(tau, dist, threshold).is_none()
-//     //         {
-//     //             columns_to_reduce.push(tau);
-//     //         }
-//     //         true
-//     //     });
-//     // }
-//
-//     columns_to_reduce.sort_unstable();
-//     *simplices = next_simplices;
-//     columns_to_reduce
-// }
-
-fn assemble_candidates(
+fn assemble_candidates<F: Filtration>(
     simplices: &mut Vec<Simplex128>,
-    dist: &DistanceMatrix,
+    dist: &F,
     threshold: f32,
     cleared_pivots: &FxHashMap<Simplex128, ()>,
     build_pool: bool,
@@ -224,31 +145,17 @@ fn assemble_candidates(
     };
     let mut columns_to_reduce: Vec<Simplex128> = Vec::with_capacity(simplices.len());
 
-    let mut iter = CofacetIter::new(simplices[0], dist, false, threshold);
-    for (i, &sigma) in simplices.iter().enumerate() {
-        if i > 0 {
-            iter.reset(sigma, false);
-        }
-        iter.for_each(|tau| {
+    for &sigma in simplices.iter() {
+        dist.for_each_cofacet(sigma, false, threshold, |tau| {
             if build_pool {
                 next_simplices.push(tau);
             }
-
-            // Filters in increasing cost / decreasing hit rate:
-            //   cleared       — cheap hashmap probe
-            //   facet-side    — catches ~99% of cofacets (zero-persistence apparent pairs)
-            //   cofacet-side  — rare
-            if cleared_pivots.contains_key(&tau) {
-                return true;
+            if !cleared_pivots.contains_key(&tau)
+                && dist.zero_apparent_cofacet(tau, threshold).is_none()
+                && !dist.is_apparent_cofacet(tau, threshold)
+            {
+                columns_to_reduce.push(tau);
             }
-            if zero_apparent_cofacet(tau, dist, threshold).is_some() {
-                return true;
-            }
-            if is_apparent_cofacet(tau, dist, threshold) {
-                return true;
-            }
-
-            columns_to_reduce.push(tau);
             true
         });
     }
@@ -264,7 +171,7 @@ fn assemble_candidates(
 // Main loop
 // ═══════════════════════════════════════════════════════════════════════════════
 
-pub fn compute(dist: &DistanceMatrix, threshold: f32, max_dim: usize) -> BarcodeResult {
+pub fn compute<F: Filtration>(dist: &F, threshold: f32, max_dim: usize) -> BarcodeResult {
     let mut intervals: Vec<Vec<PersistenceInterval>> = Vec::with_capacity(max_dim + 1);
 
     // H0: union-find. No clearing input needed (no previous dim).
@@ -311,6 +218,7 @@ pub fn compute(dist: &DistanceMatrix, threshold: f32, max_dim: usize) -> Barcode
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::engine::distance::DistanceMatrix;
 
     fn approx_eq(a: f32, b: f32, tol: f32) -> bool {
         (a - b).abs() < tol

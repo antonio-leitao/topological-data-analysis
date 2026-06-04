@@ -61,6 +61,31 @@ pub fn persistent_homology_from_distances(
     ))
 }
 
+/// Vietoris–Rips persistent homology from a row-major `(n, n)` distance matrix,
+/// computed through the sparse (CSR) backend. Symmetry, zero diagonal, and
+/// non-negativity are documented preconditions, not enforced invariants.
+///
+/// Builds a CSR filtration keeping only within-threshold edges, then runs the
+/// same reduction the dense path uses. The dense matrix is materialised
+/// transiently to feed the builder, so the win is in the engine, not the build:
+/// this pays off when the resolved threshold sits well below the data's
+/// diameter (low average degree).
+pub fn persistent_homology_from_distances_csr(
+    points: &[f32],
+    n: usize,
+    d: usize,
+    max_dim: usize,
+    threshold: Option<f32>,
+) -> Result<BarcodeResult> {
+    // THIS VERY INNEFICIENT!!!
+    validate_params(n, max_dim, threshold)?;
+    let (lt, _c_star, minimax) = condense_points(points, n, d)?;
+    let dist = DistanceMatrix::from_lower_triangular(n, lt);
+    let threshold = resolve_threshold(threshold, minimax);
+    let (csr, r_cheb) = engine::csr_from_distance_matrix(&dist, threshold);
+    Ok(engine::algorithm::compute(&csr, r_cheb, max_dim))
+}
+
 // ═══════════════════════════════════════════════════════════════════════════════
 // Shared pipeline
 // ═══════════════════════════════════════════════════════════════════════════════
