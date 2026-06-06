@@ -367,15 +367,15 @@ impl CsrDistanceMatrix {
     /// order), if one exists within `threshold`.
     #[inline]
     fn zero_pivot_cofacet(&self, sigma: Simplex128, threshold: f32) -> Option<Simplex128> {
-        let target = sigma.filtration_encoded();
+        let same_diam = sigma.filtration();
+        if same_diam > threshold {
+            return None;
+        }
         let mut result = None;
-        self.cofacets(sigma, true, threshold, |cof| {
-            if cof.filtration_encoded() == target {
-                result = Some(cof);
-                false
-            } else {
-                true
-            }
+        self.cofacets(sigma, true, same_diam, |cof| {
+            debug_assert_eq!(cof.filtration_encoded(), sigma.filtration_encoded());
+            result = Some(cof);
+            false
         });
         result
     }
