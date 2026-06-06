@@ -55,6 +55,28 @@ pub struct CsrDistanceMatrix {
 }
 
 impl CsrDistanceMatrix {
+    /// Assemble from raw CSR parts produced by `pdist_csr`. Caller guarantees
+    /// `row_ptr.len() == n + 1`, `col`/`val` parallel, and each row descending
+    /// by id (checked in debug).
+    pub(crate) fn from_csr_parts(
+        n: usize,
+        row_ptr: Vec<usize>,
+        col: Vec<u16>,
+        val: Vec<f32>,
+    ) -> Self {
+        debug_assert_eq!(row_ptr.len(), n + 1);
+        debug_assert_eq!(col.len(), val.len());
+        debug_assert_eq!(*row_ptr.last().unwrap_or(&0), col.len());
+        debug_assert!((0..n).all(|v| col[row_ptr[v]..row_ptr[v + 1]]
+            .windows(2)
+            .all(|w| w[0] > w[1])));
+        CsrDistanceMatrix {
+            n,
+            row_ptr,
+            col,
+            val,
+        }
+    }
     /// Number of vertices.
     #[inline(always)]
     pub fn n(&self) -> usize {
@@ -261,39 +283,46 @@ impl CsrDistanceMatrix {
         }
         let verts = sigma.vertices();
         let base = sigma.filtration();
-        let payload = sigma.vertex_key(); // pub accessor; avoids needing VERTEX_MASK here
         let floor: i32 = if all_cofacets {
             -1
         } else {
             sigma.largest_vertex() as i32
         };
 
-        // Insertion-rank cache (rank = #vertices > w). Refreshed only when vi
-        // changes — at most vc times per simplex, not per cofacet.
-        let mut vi: usize = 0;
-        let mut payload_upper: u128 = 0; // rank 0
+        // Rank-cached cofacet construction (port of dense CofacetIter).
+        // `vi` = #sigma-verts > w = insertion rank; monotone non-decreasing.
+        // Refresh masks only when it advances — ≤ vc times per simplex, not per emit.
+        let payload = sigma.vertex_key();
+        let mut vi = 0usize;
+        let mut payload_upper: u128 = 0; // rank-0: payload & (!0<<96) == 0
         let mut payload_lower_shifted: u128 = payload >> 16;
-        let mut insert_shift: u32 = 80;
+        let mut insert_shift: u32 = 80; // 96 - 0*16 - 16
 
         self.for_each_common_neighbor(&verts, vc, floor, |w, extra| {
-            let diam = if extra > base { extra } else { base };
-            if diam > threshold {
-                return true;
-            }
+            let old_vi = vi;
             while vi < vc && verts[vi] > w {
                 vi += 1;
+            }
+            if vi != old_vi {
                 let split = 96 - (vi as u32) * 16;
                 let upper_mask = (!0u128) << split;
                 payload_upper = payload & upper_mask;
                 payload_lower_shifted = (payload & !upper_mask) >> 16;
                 insert_shift = split - 16;
             }
-            let v_ins = (w as u128) + 1;
-            let result = ((encode_filtration(diam) as u128) << 96)
-                | payload_upper
-                | (v_ins << insert_shift)
-                | payload_lower_shifted;
-            f(Simplex128(result))
+
+            let diam = if extra > base { extra } else { base };
+            if diam > threshold {
+                return true;
+            }
+            let w_ins = (w as u128) + 1;
+            let cof = Simplex128(
+                ((encode_filtration(diam) as u128) << 96)
+                    | payload_upper
+                    | (w_ins << insert_shift)
+                    | payload_lower_shifted,
+            );
+            f(cof)
         });
     }
     /// Diameter of the facet of `verts[0..vc]` obtained by removing slot `skip`
@@ -334,7 +363,6 @@ impl CsrDistanceMatrix {
         }
         None
     }
-
     /// Youngest same-diameter cofacet of `sigma` (first in descending cofacet
     /// order), if one exists within `threshold`.
     #[inline]

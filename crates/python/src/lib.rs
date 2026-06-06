@@ -56,6 +56,21 @@ fn to_py_err(e: tda_core::Error) -> PyErr {
     PyValueError::new_err(e.to_string())
 }
 
+fn barcode_to_py<'py>(
+    py: Python<'py>,
+    barcode: tda_core::BarcodeResult,
+) -> PyResult<Vec<Bound<'py, PyArray2<f32>>>> {
+    let mut dgms = Vec::with_capacity(barcode.intervals.len());
+    for (k, flat) in barcode.into_flat_intervals() {
+        let arr = flat
+            .into_pyarray(py)
+            .reshape((k, 2))
+            .map_err(|e| PyValueError::new_err(e.to_string()))?;
+        dgms.push(arr);
+    }
+    Ok(dgms)
+}
+
 /// Vietoris–Rips persistent homology.
 #[pyfunction]
 #[pyo3(signature = (data, max_dim=1, threshold=None, distance_matrix=false, quotient=false, peel=false))]
@@ -80,18 +95,22 @@ fn persistent_homology<'py>(
     }
     .map_err(to_py_err)?;
 
-    // One (k, 2) array per dimension. `into_flat_intervals` hands back the
-    // intervals already laid out as [b0, d0, b1, d1, …], so each dimension is a
-    // single zero-copy reshape.
-    let mut dgms = Vec::with_capacity(barcode.intervals.len());
-    for (k, flat) in barcode.into_flat_intervals() {
-        let arr = flat
-            .into_pyarray(py)
-            .reshape((k, 2))
-            .map_err(|e| PyValueError::new_err(e.to_string()))?;
-        dgms.push(arr);
-    }
-    Ok(dgms)
+    barcode_to_py(py, barcode)
+}
+
+/// Test-only sparse entry point. Not re-exported from `tda.__init__`.
+#[pyfunction(name = "_persistent_homology_sparse")]
+#[pyo3(signature = (data, max_dim=1, threshold=None))]
+fn persistent_homology_sparse<'py>(
+    py: Python<'py>,
+    data: PyReadonlyArray2<'py, f32>,
+    max_dim: usize,
+    threshold: Option<f32>,
+) -> PyResult<Vec<Bound<'py, PyArray2<f32>>>> {
+    let (flat, rows, cols) = flatten(&data);
+    let barcode = tda_core::persistent_homology_sparse(&flat, rows, cols, max_dim, threshold)
+        .map_err(to_py_err)?;
+    barcode_to_py(py, barcode)
 }
 
 /// Truncated Vietoris–Rips filtration size (simplices of dimension ≤ max_dim).
@@ -119,6 +138,7 @@ fn filtration_size(
 #[pymodule]
 fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(persistent_homology, m)?)?;
+    m.add_function(wrap_pyfunction!(persistent_homology_sparse, m)?)?;
     m.add_function(wrap_pyfunction!(filtration_size, m)?)?;
     Ok(())
 }

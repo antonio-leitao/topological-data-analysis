@@ -1,9 +1,48 @@
 use criterion::{criterion_group, criterion_main, Criterion};
+use std::env;
 use std::fs;
-use tda_core::persistent_homology;
+use std::hint::black_box;
+use std::path::PathBuf;
+use tda_core::{persistent_homology, persistent_homology_sparse};
 
-fn load_points(path: &str) -> (Vec<f32>, usize, usize) {
-    let text = fs::read_to_string(path).expect("failed to read file");
+const H2_LAST_DATASET: &str = "dragon_2000.txt";
+
+fn data_dir() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../data")
+}
+
+fn max_dim() -> usize {
+    match env::var("TDA_MAX_DIM").ok().as_deref() {
+        None | Some("") | Some("1") => 1,
+        Some("2") => 2,
+        Some(other) => panic!("TDA_MAX_DIM must be 1 or 2, got {other}"),
+    }
+}
+
+fn dataset_files(max_dim: usize) -> Vec<String> {
+    let mut files: Vec<String> = fs::read_to_string(data_dir().join("datasets.txt"))
+        .expect("failed to read data/datasets.txt")
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+        .map(str::to_owned)
+        .collect();
+    if max_dim == 2 {
+        let end = files
+            .iter()
+            .position(|file| file == H2_LAST_DATASET)
+            .expect("H2 cutoff dataset is missing from data/datasets.txt");
+        files.truncate(end + 1);
+    }
+    files
+}
+
+fn dataset_name(file: &str) -> String {
+    file.strip_suffix(".txt").unwrap_or(file).to_owned()
+}
+
+fn load_points(file: &str) -> (Vec<f32>, usize, usize) {
+    let text = fs::read_to_string(data_dir().join(file)).expect("failed to read file");
     let mut n = 0usize;
     let mut d = 0usize;
     let flat: Vec<f32> = text
@@ -23,27 +62,53 @@ fn load_points(path: &str) -> (Vec<f32>, usize, usize) {
     (flat, n, d)
 }
 
-fn bench_persistent_homology(c: &mut Criterion) {
-    let datasets = [
-        ("celegans", "benches/data/celegans.txt"),
-        ("vicsek", "benches/data/vicsek_300_of_300.txt"),
-        ("klein_400", "benches/data/klein_400.txt"),
-        ("klein_900", "benches/data/klein_900.txt"),
-        ("dragon_1k", "benches/data/dragon_1000.txt"),
-        ("dragon_2k", "benches/data/dragon_2000.txt"),
-        ("hiv1", "benches/data/hiv1.txt"),
-        ("o3_1k", "benches/data/o3_1024.txt"),
-        ("o3_2k", "benches/data/o3_2048.txt"),
-        ("pbmc_3k", "benches/data/pbmc3k_pca50.txt"),
-    ];
-
-    for (name, path) in datasets {
-        let (points, n, d) = load_points(path);
-        c.bench_function(&format!("{name}"), |b| {
-            b.iter(|| persistent_homology(&points, n, d, 1, None, false, false));
+fn bench_dense(c: &mut Criterion) {
+    let max_dim = max_dim();
+    let mut group = c.benchmark_group(format!("dense_h{max_dim}"));
+    for file in dataset_files(max_dim) {
+        let name = dataset_name(&file);
+        let (points, n, d) = load_points(&file);
+        group.bench_function(name, |b| {
+            b.iter(|| {
+                black_box(persistent_homology(
+                    black_box(&points),
+                    black_box(n),
+                    black_box(d),
+                    black_box(max_dim),
+                    None,
+                    false,
+                    false,
+                ))
+            });
         });
     }
+    group.finish();
 }
 
-criterion_group!(benches, bench_persistent_homology);
+fn bench_sparse(c: &mut Criterion) {
+    let max_dim = max_dim();
+    let mut group = c.benchmark_group(format!("sparse_h{max_dim}"));
+    for file in dataset_files(max_dim) {
+        let name = dataset_name(&file);
+        let (points, n, d) = load_points(&file);
+        group.bench_function(name, |b| {
+            b.iter(|| {
+                black_box(persistent_homology_sparse(
+                    black_box(&points),
+                    black_box(n),
+                    black_box(d),
+                    black_box(max_dim),
+                    None,
+                ))
+            });
+        });
+    }
+    group.finish();
+}
+
+criterion_group! {
+    name = benches;
+    config = Criterion::default().sample_size(10);
+    targets = bench_dense, bench_sparse
+}
 criterion_main!(benches);

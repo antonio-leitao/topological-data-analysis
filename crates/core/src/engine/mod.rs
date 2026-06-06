@@ -6,5 +6,5 @@ mod heap;
 mod reduction;
 pub mod simplex;
 
-pub use csr::csr_from_distance_matrix;
+pub use csr::CsrDistanceMatrix;
 pub use distance::DistanceMatrix;

@@ -226,3 +226,211 @@ pub fn pdist_tiled_v3(data: &[f32], n: usize, d: usize) -> (Vec<f32>, usize, f32
 
     (out, c_star, r_cheb)
 }
+
+// CSR PART
+/// Surviving half-edges (i>j) plus per-row eccentricities, filled during the
+/// single tiled pass. `threshold` is the *user* threshold; R_cheb is not yet
+/// known here, so we buffer the superset `d ≤ threshold` and tighten in finalize.
+struct CooSink {
+    src: Vec<u16>,
+    dst: Vec<u16>,
+    w: Vec<f32>,
+    max_dist: Vec<f32>,
+    threshold: f32,
+}
+
+#[inline(always)]
+fn store_tile_full_sparse(
+    tile: &[[f32; NR]; MR],
+    coo: &mut CooSink,
+    i_base: usize,
+    j_base: usize,
+    mr_eff: usize,
+    nr_eff: usize,
+) {
+    for m in 0..mr_eff {
+        let i = i_base + m;
+        let mut row_max = coo.max_dist[i];
+        for n in 0..nr_eff {
+            let j = j_base + n;
+            let dist = ((tile[m][n] as f64).sqrt()) as f32; // matches store_tile_full
+            if dist > row_max {
+                row_max = dist;
+            }
+            if dist > coo.max_dist[j] {
+                coo.max_dist[j] = dist;
+            }
+            if dist <= coo.threshold {
+                coo.src.push(i as u16);
+                coo.dst.push(j as u16);
+                coo.w.push(dist);
+            }
+        }
+        coo.max_dist[i] = row_max;
+    }
+}
+
+#[inline(always)]
+fn store_tile_partial_sparse(
+    tile: &[[f32; NR]; MR],
+    coo: &mut CooSink,
+    i_base: usize,
+    j_base: usize,
+    mr_eff: usize,
+    nr_eff: usize,
+) {
+    for m in 0..mr_eff {
+        let i = i_base + m;
+        let mut row_max = coo.max_dist[i];
+        for n in 0..nr_eff {
+            let j = j_base + n;
+            if i > j {
+                let dist = tile[m][n].sqrt(); // matches store_tile_partial (f32)
+                if dist > row_max {
+                    row_max = dist;
+                }
+                if dist > coo.max_dist[j] {
+                    coo.max_dist[j] = dist;
+                }
+                if dist <= coo.threshold {
+                    coo.src.push(i as u16);
+                    coo.dst.push(j as u16);
+                    coo.w.push(dist);
+                }
+            }
+        }
+        coo.max_dist[i] = row_max;
+    }
+}
+
+/// Fused point-cloud → CSR + minimax radius, in a single distance-kernel pass.
+///
+/// Returns `(row_ptr, col, val, r_cheb)`, with `col`/`val` DESCENDING within each
+/// row (the `Filtration` ordering contract). `threshold` is the user threshold
+/// (`f32::INFINITY` if none); edges with `d ≤ min(threshold, r_cheb)` are kept.
+/// `r_cheb` is the threshold-free minimax over all pairs, identical to
+/// `pdist_tiled_v3`, so the caller resolves the engine threshold the same way.
+pub fn pdist_csr(
+    data: &[f32],
+    n: usize,
+    d: usize,
+    threshold: f32,
+) -> (Vec<usize>, Vec<u16>, Vec<f32>, f32) {
+    debug_assert_eq!(data.len(), n * d);
+    if n < 2 {
+        return (vec![0usize; n + 1], Vec::new(), Vec::new(), 0.0);
+    }
+
+    let mut coo = CooSink {
+        src: Vec::new(),
+        dst: Vec::new(),
+        w: Vec::new(),
+        max_dist: vec![0.0f32; n],
+        threshold,
+    };
+    // If you can estimate degree, `coo.{src,dst,w}.reserve(n * est_degree)` keeps
+    // the hot-path pushes off the realloc path.
+
+    let a_buf_len = ((MC + MR - 1) / MR) * MR * d;
+    let b_buf_len = ((NC + NR - 1) / NR) * NR * d;
+    let mut a_packed = vec![0.0f32; a_buf_len];
+    let mut b_packed = vec![0.0f32; b_buf_len];
+
+    let mut jc = 0;
+    while jc < n {
+        let nc = (n - jc).min(NC);
+        pack_panel(data, d, jc, nc, NR, &mut b_packed);
+        let mut ic = jc;
+        while ic < n {
+            let mc = (n - ic).min(MC);
+            pack_panel(data, d, ic, mc, MR, &mut a_packed);
+            let mut ir = 0;
+            while ir < mc {
+                let mr_eff = (mc - ir).min(MR);
+                let a_off = (ir / MR) * MR * d;
+                let mut jr = 0;
+                while jr < nc {
+                    let nr_eff = (nc - jr).min(NR);
+                    let b_off = (jr / NR) * NR * d;
+                    let i_min = ic + ir;
+                    let i_max = i_min + mr_eff - 1;
+                    let j_min = jc + jr;
+                    let j_max = j_min + nr_eff - 1;
+                    if i_max <= j_min {
+                        jr += NR;
+                        continue;
+                    }
+                    let tile = micro_kernel(&a_packed[a_off..], &b_packed[b_off..], d);
+                    if i_min > j_max {
+                        store_tile_full_sparse(&tile, &mut coo, i_min, j_min, mr_eff, nr_eff);
+                    } else {
+                        store_tile_partial_sparse(&tile, &mut coo, i_min, j_min, mr_eff, nr_eff);
+                    }
+                    jr += NR;
+                }
+                ir += MR;
+            }
+            ic += MC;
+        }
+        jc += NC;
+    }
+
+    // R_cheb: min of per-row maxima — same reduction as pdist_tiled_v3.
+    let mut r_cheb = coo.max_dist[0];
+    for i in 1..n {
+        if coo.max_dist[i] < r_cheb {
+            r_cheb = coo.max_dist[i];
+        }
+    }
+    let eff = threshold.min(r_cheb);
+
+    // Finalize: count degrees at eff → prefix-sum row_ptr → scatter both
+    // directions. (COO holds `≤ threshold`; the `≤ eff` filter drops the
+    // (eff, threshold] tail that R_cheb truncation removes.)
+    let mut row_ptr = vec![0usize; n + 1];
+    for k in 0..coo.w.len() {
+        if coo.w[k] <= eff {
+            row_ptr[coo.src[k] as usize + 1] += 1;
+            row_ptr[coo.dst[k] as usize + 1] += 1;
+        }
+    }
+    for v in 0..n {
+        row_ptr[v + 1] += row_ptr[v];
+    }
+    let nnz = row_ptr[n];
+    let mut col = vec![0u16; nnz];
+    let mut val = vec![0.0f32; nnz];
+    let mut cur = row_ptr[..n].to_vec();
+    for k in 0..coo.w.len() {
+        let dd = coo.w[k];
+        if dd <= eff {
+            let (i, j) = (coo.src[k] as usize, coo.dst[k] as usize);
+            let ci = cur[i];
+            col[ci] = j as u16;
+            val[ci] = dd;
+            cur[i] = ci + 1;
+            let cj = cur[j];
+            col[cj] = i as u16;
+            val[cj] = dd;
+            cur[j] = cj + 1;
+        }
+    }
+
+    // The tiled pass does not emit row-major, so the dense builder's
+    // "reverse a single slice" trick does not apply. Sort each (short) row
+    // descending — exactly what reference ripser does to its neighbour lists.
+    let mut scratch: Vec<(u16, f32)> = Vec::new();
+    for v in 0..n {
+        let s = row_ptr[v];
+        let e = row_ptr[v + 1];
+        scratch.clear();
+        scratch.extend(col[s..e].iter().copied().zip(val[s..e].iter().copied()));
+        scratch.sort_unstable_by(|a, b| b.0.cmp(&a.0));
+        for (k, &(id, dv)) in scratch.iter().enumerate() {
+            col[s + k] = id;
+            val[s + k] = dv;
+        }
+    }
+
+    (row_ptr, col, val, r_cheb)
+}

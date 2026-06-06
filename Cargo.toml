@@ -12,3 +12,8 @@ authors = ["António Leitão <aleitao@novaims.unl.pt>"]
 readme = "README.md"
 keywords = ["topology", "homology", "tda", "persistent-homology", "ripser"]
 categories = ["mathematics", "science"]
+
+[profile.bench]
+debug = "line-tables-only"
+split-debuginfo = "packed"
+strip = false

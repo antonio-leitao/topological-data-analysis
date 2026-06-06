@@ -1,0 +1,110 @@
+# Rust
+/target
+**/*.rs.bk
+*.pdb
+Cargo.lock
+crates/core/profile.json.gz
+crates/core/profile.json
+crates/python/tests/results/
+crates/core/examples/
+# Build artifacts / project-specific
+/tests
+notebooks/
+external/
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+.Spotlight-V100
+.Trashes
+Icon?
+
+# Editor / IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.fleet/
+.zed/
+
+# Python — bytecode
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+
+# Python — packaging & distribution
+.Python
+.venv/
+env/
+venv/
+ENV/
+bin/
+build/
+develop-eggs/
+dist/
+eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+include/
+man/
+*.egg-info/
+.installed.cfg
+*.egg
+.eggs/
+
+# Python — tools & caches
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.dmypy.json
+.pytype/
+.pyre/
+.cache/
+.tox/
+.python-version
+
+# Python — test / coverage reports
+htmlcov/
+.coverage
+.coverage.*
+coverage.xml
+nosetests.xml
+
+# Python — installer logs
+pip-log.txt
+pip-delete-this-directory.txt
+pip-selfcheck.json
+
+# uv / maturin
+uv.lock
+.uv/
+.uv.lock
+
+# Jupyter
+.ipynb_checkpoints/
+
+# C extensions
+*.so
+
+# Translations / i18n
+*.mo
+*.pot
+
+# Logs
+*.log
+
+# Sphinx documentation
+docs/_build/
+
+# Misc legacy Python project files
+.mr.developer.cfg
+.project
+.pydevproject
+.ropeproject
