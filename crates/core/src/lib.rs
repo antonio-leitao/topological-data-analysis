@@ -87,8 +87,8 @@ pub fn persistent_homology_sparse(
     let user_t = threshold.unwrap_or(f32::INFINITY);
     let (row_ptr, col, val, r_cheb) = preprocess::pdist::pdist_csr(points, n, d, user_t);
     let eff = user_t.min(r_cheb);
-    let csr = engine::CsrDistanceMatrix::from_csr_parts(n, row_ptr, col, val);
-    Ok(engine::algorithm::compute(&csr, eff, max_dim))
+    let csr = engine::CsrDistanceMatrix::from_csr_parts(n, eff, row_ptr, col, val);
+    Ok(engine::algorithm::compute_sparse(&csr, eff, max_dim))
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════

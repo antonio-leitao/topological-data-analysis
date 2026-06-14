@@ -1,4 +1,4 @@
-.PHONY: help install build-py build-rust test test-core test-python-dense test-python-sparse bench bench-save profile publish-py publish-rust clean
+.PHONY: help install build-py build-rust test test-core test-python-dense test-python-sparse bench bench-save profile profile-build publish-py publish-rust clean
 .DEFAULT_GOAL := help
 
 # ── Colors ────────────────────────────────────────────────────────────────
@@ -16,7 +16,11 @@ MATURIN     := crates/python/.venv/bin/maturin
 BENCH_FILTER ?=
 MAX_DIM ?= 1
 PROFILE_TIME ?= 20
-PROFILE_FILTER ?= sparse
+PROFILE_MAX_DIM ?= 2
+PROFILE_FILTER ?= sparse_h2
+PROFILE_OUT ?= crates/core/profile.json.gz
+PROFILE_RATE ?= 1000
+SAMPLY ?= samply
 
 help: ## Show this help message
 	@echo "$(CYAN)Available commands:$(RESET)"
@@ -76,9 +80,26 @@ bench: ## Compare current code against a chosen saved baseline (does not save)
 	echo "$(CYAN)📊 Comparing against baseline '$$BASELINE'...$(RESET)"; \
 	TDA_MAX_DIM=$(MAX_DIM) cargo bench -p $(BENCH_CRATE) --bench $(BENCH_NAME) -- --baseline $$BASELINE $(BENCH_FILTER)
 
-profile: ## Profile the benchmarks with samply
-	@echo "$(CYAN)📊 Profiling benchmarks...$(RESET)"
-	@TDA_MAX_DIM=$(MAX_DIM) samply record -- cargo bench -p $(BENCH_CRATE) --bench $(BENCH_NAME) -- --profile-time $(PROFILE_TIME) $(PROFILE_FILTER)
+profile-build: ## Build the Criterion bench binary for profiling
+	@echo "$(CYAN)📦 Building benchmark binary for profiling...$(RESET)"
+	@TDA_MAX_DIM=$(PROFILE_MAX_DIM) cargo bench -p $(BENCH_CRATE) --bench $(BENCH_NAME) --no-run
+
+profile: profile-build ## Profile the sparse H2 Criterion benchmark group with samply
+	@mkdir -p "$$(dirname "$(PROFILE_OUT)")"
+	@BENCH_BIN=$$(find target/release/deps -maxdepth 1 -type f -perm -111 -name '$(BENCH_NAME)-*' | sort | tail -n 1); \
+	if [ -z "$$BENCH_BIN" ]; then \
+		echo "$(RED)Could not find target/release/deps/$(BENCH_NAME)-* bench executable.$(RESET)"; \
+		exit 1; \
+	fi; \
+	echo "$(CYAN)📊 Profiling $(PROFILE_FILTER) via $$BENCH_BIN...$(RESET)"; \
+	TDA_MAX_DIM=$(PROFILE_MAX_DIM) $(SAMPLY) record \
+		--save-only \
+		--unstable-presymbolicate \
+		--main-thread-only \
+		--rate $(PROFILE_RATE) \
+		-o "$(PROFILE_OUT)" \
+		-- "$$BENCH_BIN" "$(PROFILE_FILTER)" --profile-time $(PROFILE_TIME) --noplot; \
+	echo "$(GREEN)✅ Profile written to $(PROFILE_OUT).$(RESET)"
 
 # ── Publish ───────────────────────────────────────────────────────────────
 

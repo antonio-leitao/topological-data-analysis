@@ -33,7 +33,7 @@
 
 use crate::engine::distance::DistanceMatrix;
 use crate::engine::filtration::Filtration;
-use crate::engine::simplex::{encode_filtration, Simplex128};
+use crate::engine::simplex::{encode_filtration, FxHashMap, Simplex128};
 
 /// Entries `>= NO_EDGE` are "no edge" and are excluded from the enclosing-radius
 /// reduction, mirroring `distance.rs`. Catches both `f32::INFINITY` and `f32::MAX`.
@@ -45,6 +45,8 @@ const NO_EDGE: f32 = f32::MAX;
 /// appears in both row i and row j.
 pub struct CsrDistanceMatrix {
     n: usize,
+    /// Largest edge diameter admitted when this CSR was built.
+    threshold: f32,
     /// Row offsets, length `n + 1`. `usize` (not `u32`) so `nnz` up to
     /// `n(n-1)` can never overflow the offsets even at `n = u16::MAX`.
     row_ptr: Vec<usize>,
@@ -60,6 +62,7 @@ impl CsrDistanceMatrix {
     /// by id (checked in debug).
     pub(crate) fn from_csr_parts(
         n: usize,
+        threshold: f32,
         row_ptr: Vec<usize>,
         col: Vec<u16>,
         val: Vec<f32>,
@@ -72,6 +75,7 @@ impl CsrDistanceMatrix {
             .all(|w| w[0] > w[1])));
         CsrDistanceMatrix {
             n,
+            threshold,
             row_ptr,
             col,
             val,
@@ -124,6 +128,27 @@ impl CsrDistanceMatrix {
         val[pos]
     }
 
+    /// Raw distance bits for a present edge. This is the apparent-pair fast path:
+    /// compare directly with `!filtration_encoded` and avoid decode/re-encode.
+    #[inline(always)]
+    fn edge_dist_bits(&self, a: u16, b: u16) -> u32 {
+        let (ra, rb) = (a as usize, b as usize);
+        let (host, target) =
+            if self.row_ptr[ra + 1] - self.row_ptr[ra] <= self.row_ptr[rb + 1] - self.row_ptr[rb] {
+                (ra, b)
+            } else {
+                (rb, a)
+            };
+        let s = self.row_ptr[host];
+        let e = self.row_ptr[host + 1];
+        let pos = advance_le(&self.col[s..e], target);
+        debug_assert!(
+            pos < e - s && self.col[s + pos] == target,
+            "edge_dist_bits on a missing edge ({a}, {b})"
+        );
+        unsafe { self.val.get_unchecked(s + pos).to_bits() }
+    }
+
     /// Walk the common neighbours of `verts[0..vc]` in DESCENDING id order,
     /// invoking `g(w, extra)` for each, where `extra = maxᵢ d(w, vᵢ)` — the
     /// distances at the matched positions of the parallel `val` arrays. Stops
@@ -144,9 +169,15 @@ impl CsrDistanceMatrix {
         g: impl FnMut(u16, f32) -> bool,
     ) {
         if vc == 2 {
-            self.common_2way(verts[0], verts[1], floor, g);
+            if floor < 0 {
+                self.common_2way_all(verts[0], verts[1], g);
+            } else {
+                self.common_2way_bounded(verts[0], verts[1], floor, g);
+            }
+        } else if floor < 0 {
+            self.common_kway_all(verts, vc, g);
         } else {
-            self.common_kway(verts, vc, floor, g);
+            self.common_kway_bounded(verts, vc, floor, g);
         }
     }
 
@@ -154,7 +185,40 @@ impl CsrDistanceMatrix {
     /// state stays in locals; the rows are read through `get_unchecked` behind
     /// `a < la` / `b < lb` guards.
     #[inline]
-    fn common_2way(&self, v0: u16, v1: u16, floor: i32, mut g: impl FnMut(u16, f32) -> bool) {
+    fn common_2way_all(&self, v0: u16, v1: u16, mut g: impl FnMut(u16, f32) -> bool) {
+        let (ca, va) = self.neighbors(v0 as usize);
+        let (cb, vb) = self.neighbors(v1 as usize);
+        let (la, lb) = (ca.len(), cb.len());
+        let mut a = 0usize;
+        let mut b = 0usize;
+        unsafe {
+            while a < la && b < lb {
+                let xa = *ca.get_unchecked(a);
+                let xb = *cb.get_unchecked(b);
+                if xa == xb {
+                    let extra = (*va.get_unchecked(a)).max(*vb.get_unchecked(b));
+                    if !g(xa, extra) {
+                        return;
+                    }
+                    a += 1;
+                    b += 1;
+                } else if xa > xb {
+                    a += advance_le(ca.get_unchecked(a..), xb);
+                } else {
+                    b += advance_le(cb.get_unchecked(b..), xa);
+                }
+            }
+        }
+    }
+
+    #[inline]
+    fn common_2way_bounded(
+        &self,
+        v0: u16,
+        v1: u16,
+        floor: i32,
+        mut g: impl FnMut(u16, f32) -> bool,
+    ) {
         let (ca, va) = self.neighbors(v0 as usize);
         let (cb, vb) = self.neighbors(v1 as usize);
         let (la, lb) = (ca.len(), cb.len());
@@ -185,12 +249,205 @@ impl CsrDistanceMatrix {
         }
     }
 
+    #[inline]
+    fn common_2way_bounded_edges(
+        &self,
+        v0: u16,
+        v1: u16,
+        floor: i32,
+        mut g: impl FnMut(u16, f32, f32) -> bool,
+    ) {
+        let (ca, va) = self.neighbors(v0 as usize);
+        let (cb, vb) = self.neighbors(v1 as usize);
+        let (la, lb) = (ca.len(), cb.len());
+        let mut a = 0usize;
+        let mut b = 0usize;
+        unsafe {
+            while a < la && b < lb {
+                let xa = *ca.get_unchecked(a);
+                let xb = *cb.get_unchecked(b);
+                if (xa as i32) <= floor || (xb as i32) <= floor {
+                    return;
+                }
+                if xa == xb {
+                    if !g(xa, *va.get_unchecked(a), *vb.get_unchecked(b)) {
+                        return;
+                    }
+                    a += 1;
+                    b += 1;
+                } else if xa > xb {
+                    a += advance_le(ca.get_unchecked(a..), xb);
+                } else {
+                    b += advance_le(cb.get_unchecked(b..), xa);
+                }
+            }
+        }
+    }
+
+    #[inline]
+    fn first_common_2way_le(&self, v0: u16, v1: u16, max_extra: f32) -> Option<u16> {
+        let (ca, va) = self.neighbors(v0 as usize);
+        let (cb, vb) = self.neighbors(v1 as usize);
+        let (la, lb) = (ca.len(), cb.len());
+        let mut a = 0usize;
+        let mut b = 0usize;
+        unsafe {
+            while a < la && b < lb {
+                let xa = *ca.get_unchecked(a);
+                let xb = *cb.get_unchecked(b);
+                if xa == xb {
+                    let extra = (*va.get_unchecked(a)).max(*vb.get_unchecked(b));
+                    if extra <= max_extra {
+                        return Some(xa);
+                    }
+                    a += 1;
+                    b += 1;
+                } else if xa > xb {
+                    a += advance_le(ca.get_unchecked(a..), xb);
+                } else {
+                    b += advance_le(cb.get_unchecked(b..), xa);
+                }
+            }
+        }
+        None
+    }
+
+    #[inline]
+    fn first_common_3way_le(&self, v0: u16, v1: u16, v2: u16, max_extra: f32) -> Option<u16> {
+        let (ca, va) = self.neighbors(v0 as usize);
+        let (cb, vb) = self.neighbors(v1 as usize);
+        let (cc, vc) = self.neighbors(v2 as usize);
+        let (la, lb, lc) = (ca.len(), cb.len(), cc.len());
+        let mut a = 0usize;
+        let mut b = 0usize;
+        let mut c = 0usize;
+        unsafe {
+            while a < la && b < lb && c < lc {
+                let xa = *ca.get_unchecked(a);
+                let xb = *cb.get_unchecked(b);
+                let xc = *cc.get_unchecked(c);
+                let target = xa.min(xb).min(xc);
+
+                if xa != target {
+                    a += advance_le(ca.get_unchecked(a..), target);
+                    continue;
+                }
+                if xb != target {
+                    b += advance_le(cb.get_unchecked(b..), target);
+                    continue;
+                }
+                if xc != target {
+                    c += advance_le(cc.get_unchecked(c..), target);
+                    continue;
+                }
+
+                let extra = (*va.get_unchecked(a))
+                    .max(*vb.get_unchecked(b))
+                    .max(*vc.get_unchecked(c));
+                if extra <= max_extra {
+                    return Some(target);
+                }
+                a += 1;
+                b += 1;
+                c += 1;
+            }
+        }
+        None
+    }
+
+    #[inline]
+    fn first_common_neighbor_le(&self, verts: &[u16; 6], vc: usize, max_extra: f32) -> Option<u16> {
+        match vc {
+            2 => self.first_common_2way_le(verts[0], verts[1], max_extra),
+            3 => self.first_common_3way_le(verts[0], verts[1], verts[2], max_extra),
+            _ => {
+                let mut result = None;
+                self.for_each_common_neighbor(verts, vc, -1, |w, extra| {
+                    if extra <= max_extra {
+                        result = Some(w);
+                        false
+                    } else {
+                        true
+                    }
+                });
+                result
+            }
+        }
+    }
+
     /// General k-way leapfrog intersection (`vc ≠ 2`), descending. The shortest
     /// row drives (it bounds the candidate count); each follower skips down to
     /// the candidate via `advance_le`, and a follower that overshoots re-anchors
     /// the driver and restarts.
     #[inline]
-    fn common_kway(
+    fn common_kway_all(&self, verts: &[u16; 6], vc: usize, mut g: impl FnMut(u16, f32) -> bool) {
+        let mut hi = [0usize; 6];
+        let mut idx = [0usize; 6];
+        for i in 0..vc {
+            let v = verts[i] as usize;
+            let s = self.row_ptr[v];
+            let e = self.row_ptr[v + 1];
+            if s == e {
+                return; // a vertex with no neighbours ⇒ empty intersection
+            }
+            idx[i] = s;
+            hi[i] = e;
+        }
+        let mut driver = 0usize;
+        for i in 1..vc {
+            if (hi[i] - idx[i]) < (hi[driver] - idx[driver]) {
+                driver = i;
+            }
+        }
+
+        let col = &self.col;
+        let val = &self.val;
+        unsafe {
+            loop {
+                if idx[driver] >= hi[driver] {
+                    return;
+                }
+                let cand = *col.get_unchecked(idx[driver]);
+
+                let mut all_match = true;
+                for i in 0..vc {
+                    if i == driver {
+                        continue;
+                    }
+                    idx[i] += advance_le(col.get_unchecked(idx[i]..hi[i]), cand);
+                    if idx[i] >= hi[i] {
+                        return;
+                    }
+                    let head = *col.get_unchecked(idx[i]);
+                    if head < cand {
+                        // cand absent here; head is a new, smaller upper bound.
+                        idx[driver] += advance_le(col.get_unchecked(idx[driver]..hi[driver]), head);
+                        all_match = false;
+                        break;
+                    }
+                }
+
+                if all_match {
+                    let mut extra = 0.0f32;
+                    for i in 0..vc {
+                        let d = *val.get_unchecked(idx[i]);
+                        if d > extra {
+                            extra = d;
+                        }
+                    }
+                    if !g(cand, extra) {
+                        return;
+                    }
+                    for i in 0..vc {
+                        idx[i] += 1; // advance every row past cand
+                    }
+                }
+            }
+        }
+    }
+
+    #[inline]
+    fn common_kway_bounded(
         &self,
         verts: &[u16; 6],
         vc: usize,
@@ -204,7 +461,7 @@ impl CsrDistanceMatrix {
             let s = self.row_ptr[v];
             let e = self.row_ptr[v + 1];
             if s == e {
-                return; // a vertex with no neighbours ⇒ empty intersection
+                return;
             }
             idx[i] = s;
             hi[i] = e;
@@ -239,7 +496,6 @@ impl CsrDistanceMatrix {
                     }
                     let head = *col.get_unchecked(idx[i]);
                     if head < cand {
-                        // cand absent here; head is a new, smaller upper bound.
                         idx[driver] += advance_le(col.get_unchecked(idx[driver]..hi[driver]), head);
                         all_match = false;
                         break;
@@ -258,7 +514,7 @@ impl CsrDistanceMatrix {
                         return;
                     }
                     for i in 0..vc {
-                        idx[i] += 1; // advance every row past cand
+                        idx[i] += 1;
                     }
                 }
             }
@@ -298,32 +554,58 @@ impl CsrDistanceMatrix {
         let mut payload_lower_shifted: u128 = payload >> 16;
         let mut insert_shift: u32 = 80; // 96 - 0*16 - 16
 
-        self.for_each_common_neighbor(&verts, vc, floor, |w, extra| {
-            let old_vi = vi;
-            while vi < vc && verts[vi] > w {
-                vi += 1;
-            }
-            if vi != old_vi {
-                let split = 96 - (vi as u32) * 16;
-                let upper_mask = (!0u128) << split;
-                payload_upper = payload & upper_mask;
-                payload_lower_shifted = (payload & !upper_mask) >> 16;
-                insert_shift = split - 16;
-            }
+        if threshold < self.threshold {
+            self.for_each_common_neighbor(&verts, vc, floor, |w, extra| {
+                let old_vi = vi;
+                while vi < vc && verts[vi] > w {
+                    vi += 1;
+                }
+                if vi != old_vi {
+                    let split = 96 - (vi as u32) * 16;
+                    let upper_mask = (!0u128) << split;
+                    payload_upper = payload & upper_mask;
+                    payload_lower_shifted = (payload & !upper_mask) >> 16;
+                    insert_shift = split - 16;
+                }
 
-            let diam = if extra > base { extra } else { base };
-            if diam > threshold {
-                return true;
-            }
-            let w_ins = (w as u128) + 1;
-            let cof = Simplex128(
-                ((encode_filtration(diam) as u128) << 96)
-                    | payload_upper
-                    | (w_ins << insert_shift)
-                    | payload_lower_shifted,
-            );
-            f(cof)
-        });
+                let diam = if extra > base { extra } else { base };
+                if diam > threshold {
+                    return true;
+                }
+                let w_ins = (w as u128) + 1;
+                let cof = Simplex128(
+                    ((encode_filtration(diam) as u128) << 96)
+                        | payload_upper
+                        | (w_ins << insert_shift)
+                        | payload_lower_shifted,
+                );
+                f(cof)
+            });
+        } else {
+            self.for_each_common_neighbor(&verts, vc, floor, |w, extra| {
+                let old_vi = vi;
+                while vi < vc && verts[vi] > w {
+                    vi += 1;
+                }
+                if vi != old_vi {
+                    let split = 96 - (vi as u32) * 16;
+                    let upper_mask = (!0u128) << split;
+                    payload_upper = payload & upper_mask;
+                    payload_lower_shifted = (payload & !upper_mask) >> 16;
+                    insert_shift = split - 16;
+                }
+
+                let diam = if extra > base { extra } else { base };
+                let w_ins = (w as u128) + 1;
+                let cof = Simplex128(
+                    ((encode_filtration(diam) as u128) << 96)
+                        | payload_upper
+                        | (w_ins << insert_shift)
+                        | payload_lower_shifted,
+                );
+                f(cof)
+            });
+        }
     }
     /// Diameter of the facet of `verts[0..vc]` obtained by removing slot `skip`
     /// (max pairwise distance over the remaining vertices). Mirrors the dense
@@ -355,6 +637,51 @@ impl CsrDistanceMatrix {
         let target = tau.filtration_encoded();
         let verts = tau.vertices();
         let vc = tau.vertex_count();
+        let target_bits = !target;
+        match vc {
+            3 => {
+                if self.edge_dist_bits(verts[1], verts[2]) == target_bits {
+                    return Some(tau.remove_vertex_at(0, target));
+                }
+                if self.edge_dist_bits(verts[0], verts[2]) == target_bits {
+                    return Some(tau.remove_vertex_at(1, target));
+                }
+                if self.edge_dist_bits(verts[0], verts[1]) == target_bits {
+                    return Some(tau.remove_vertex_at(2, target));
+                }
+                return None;
+            }
+            4 => {
+                let e12 = self.edge_dist_bits(verts[1], verts[2]) == target_bits;
+                if e12 {
+                    return Some(tau.remove_vertex_at(0, target));
+                }
+                let e13 = self.edge_dist_bits(verts[1], verts[3]) == target_bits;
+                if e13 {
+                    return Some(tau.remove_vertex_at(0, target));
+                }
+                let e23 = self.edge_dist_bits(verts[2], verts[3]) == target_bits;
+                if e23 {
+                    return Some(tau.remove_vertex_at(0, target));
+                }
+
+                let e02 = self.edge_dist_bits(verts[0], verts[2]) == target_bits;
+                if e02 {
+                    return Some(tau.remove_vertex_at(1, target));
+                }
+                let e03 = self.edge_dist_bits(verts[0], verts[3]) == target_bits;
+                if e03 {
+                    return Some(tau.remove_vertex_at(1, target));
+                }
+
+                let e01 = self.edge_dist_bits(verts[0], verts[1]) == target_bits;
+                if e01 {
+                    return Some(tau.remove_vertex_at(2, target));
+                }
+                return None;
+            }
+            _ => {}
+        }
         for k in 0..vc {
             let diam = self.facet_diameter(&verts, vc, k);
             if encode_filtration(diam) == target {
@@ -371,14 +698,278 @@ impl CsrDistanceMatrix {
         if same_diam > threshold {
             return None;
         }
-        let mut result = None;
-        self.cofacets(sigma, true, same_diam, |cof| {
-            debug_assert_eq!(cof.filtration_encoded(), sigma.filtration_encoded());
-            result = Some(cof);
-            false
-        });
-        result
+        let vc = sigma.vertex_count();
+        if vc == 0 {
+            return None;
+        }
+        let verts = sigma.vertices();
+        let w = self.first_common_neighbor_le(&verts, vc, same_diam)?;
+        Some(sigma.cofacet(w, sigma.filtration_encoded()))
     }
+
+    pub(crate) fn assemble_candidates(
+        &self,
+        simplices: &mut Vec<Simplex128>,
+        threshold: f32,
+        cleared_pivots: &FxHashMap<Simplex128, ()>,
+        build_pool: bool,
+    ) -> Vec<Simplex128> {
+        if simplices.is_empty() {
+            return Vec::new();
+        }
+
+        let mut next_simplices: Vec<Simplex128> = if build_pool {
+            Vec::with_capacity(simplices.len() * 2)
+        } else {
+            Vec::new()
+        };
+        let mut columns_to_reduce: Vec<Simplex128> = Vec::with_capacity(simplices.len());
+
+        for &sigma in simplices.iter() {
+            if sigma.vertex_count() == 2 {
+                self.assemble_edge_candidates(
+                    sigma,
+                    threshold,
+                    cleared_pivots,
+                    build_pool,
+                    &mut next_simplices,
+                    &mut columns_to_reduce,
+                );
+            } else {
+                self.assemble_generic_candidates(
+                    sigma,
+                    threshold,
+                    cleared_pivots,
+                    build_pool,
+                    &mut next_simplices,
+                    &mut columns_to_reduce,
+                );
+            }
+        }
+
+        columns_to_reduce.sort_unstable();
+        if build_pool {
+            *simplices = next_simplices;
+        }
+        columns_to_reduce
+    }
+
+    #[inline]
+    fn assemble_edge_candidates(
+        &self,
+        sigma: Simplex128,
+        threshold: f32,
+        cleared_pivots: &FxHashMap<Simplex128, ()>,
+        build_pool: bool,
+        next_simplices: &mut Vec<Simplex128>,
+        columns_to_reduce: &mut Vec<Simplex128>,
+    ) {
+        let verts = sigma.vertices();
+        let v0 = verts[0];
+        let v1 = verts[1];
+        let base = sigma.filtration();
+        let base_bits = !sigma.filtration_encoded();
+        let floor = sigma.largest_vertex() as i32;
+
+        self.common_2way_bounded_edges(v0, v1, floor, |w, d0, d1| {
+            let extra = d0.max(d1);
+            let diam = base.max(extra);
+            if diam > threshold {
+                return true;
+            }
+
+            let tau = Simplex128::from_sorted_desc(diam, &[w, v0, v1]);
+            if build_pool {
+                next_simplices.push(tau);
+            }
+
+            if !cleared_pivots.contains_key(&tau) {
+                let diam_bits = diam.to_bits();
+                let mut diam_edges = 0u64;
+                if d0.to_bits() == diam_bits {
+                    diam_edges |= edge_bit(0, 1);
+                }
+                if d1.to_bits() == diam_bits {
+                    diam_edges |= edge_bit(0, 2);
+                }
+                if base_bits == diam_bits {
+                    diam_edges |= edge_bit(1, 2);
+                }
+                let tau_verts = [w, v0, v1, 0, 0, 0];
+                if self.keep_fused_candidate(tau, &tau_verts, 3, diam_edges, threshold) {
+                    columns_to_reduce.push(tau);
+                }
+            }
+            true
+        });
+    }
+
+    #[inline]
+    fn assemble_generic_candidates(
+        &self,
+        sigma: Simplex128,
+        threshold: f32,
+        cleared_pivots: &FxHashMap<Simplex128, ()>,
+        build_pool: bool,
+        next_simplices: &mut Vec<Simplex128>,
+        columns_to_reduce: &mut Vec<Simplex128>,
+    ) {
+        self.cofacets(sigma, false, threshold, |tau| {
+            if build_pool {
+                next_simplices.push(tau);
+            }
+            if !cleared_pivots.contains_key(&tau) {
+                let vc = tau.vertex_count();
+                let verts = tau.vertices();
+                let diam_edges = self.diameter_edge_mask(&verts, vc, !tau.filtration_encoded());
+                if self.keep_fused_candidate(tau, &verts, vc, diam_edges, threshold) {
+                    columns_to_reduce.push(tau);
+                }
+            }
+            true
+        });
+    }
+
+    #[inline]
+    fn keep_fused_candidate(
+        &self,
+        tau: Simplex128,
+        tau_verts: &[u16; 6],
+        vc: usize,
+        diam_edges: u64,
+        threshold: f32,
+    ) -> bool {
+        !self.is_zero_apparent_facet_side(tau, tau_verts, vc, diam_edges, threshold)
+            && !self.is_zero_apparent_cofacet_side(tau, tau_verts, vc, diam_edges)
+    }
+
+    #[inline]
+    fn diameter_edge_mask(&self, verts: &[u16; 6], vc: usize, diam_bits: u32) -> u64 {
+        let mut mask = 0u64;
+        for i in 0..vc {
+            for j in (i + 1)..vc {
+                if self.edge_dist_bits(verts[i], verts[j]) == diam_bits {
+                    mask |= edge_bit(i, j);
+                }
+            }
+        }
+        mask
+    }
+
+    #[inline]
+    fn is_zero_apparent_cofacet_side(
+        &self,
+        tau: Simplex128,
+        tau_verts: &[u16; 6],
+        vc: usize,
+        diam_edges: u64,
+    ) -> bool {
+        let Some(skip) = oldest_same_diam_facet_slot(vc, diam_edges) else {
+            return false;
+        };
+
+        let mut facet_verts = [0u16; 6];
+        let mut out = 0usize;
+        for i in 0..vc {
+            if i != skip {
+                facet_verts[out] = tau_verts[i];
+                out += 1;
+            }
+        }
+
+        self.first_common_neighbor_le(&facet_verts, vc - 1, tau.filtration())
+            == Some(tau_verts[skip])
+    }
+
+    #[inline]
+    fn is_zero_apparent_facet_side(
+        &self,
+        tau: Simplex128,
+        tau_verts: &[u16; 6],
+        vc: usize,
+        diam_edges: u64,
+        threshold: f32,
+    ) -> bool {
+        if vc >= 6 || tau.filtration() > threshold {
+            return false;
+        }
+
+        let Some(w) = self.first_common_neighbor_le(tau_verts, vc, tau.filtration()) else {
+            return false;
+        };
+
+        let (_rho_verts, rank) = insert_vertex_desc(tau_verts, vc, w);
+        let mut rho_edges = remap_edge_mask_after_insert(diam_edges, vc, rank);
+        let diam_bits = !tau.filtration_encoded();
+        for i in 0..vc {
+            if self.edge_dist_bits(w, tau_verts[i]) == diam_bits {
+                let j = if i >= rank { i + 1 } else { i };
+                let (a, b) = if rank < j { (rank, j) } else { (j, rank) };
+                rho_edges |= edge_bit(a, b);
+            }
+        }
+
+        oldest_same_diam_facet_slot(vc + 1, rho_edges) == Some(rank)
+    }
+}
+
+#[inline(always)]
+fn edge_bit(i: usize, j: usize) -> u64 {
+    debug_assert!(i < j && j < 6);
+    1u64 << (i * 6 + j)
+}
+
+#[inline]
+fn oldest_same_diam_facet_slot(vc: usize, diam_edges: u64) -> Option<usize> {
+    if vc < 3 || diam_edges == 0 {
+        return None;
+    }
+    for skip in 0..vc {
+        for i in 0..vc {
+            if i == skip {
+                continue;
+            }
+            for j in (i + 1)..vc {
+                if j != skip && (diam_edges & edge_bit(i, j)) != 0 {
+                    return Some(skip);
+                }
+            }
+        }
+    }
+    None
+}
+
+#[inline]
+fn insert_vertex_desc(verts: &[u16; 6], vc: usize, w: u16) -> ([u16; 6], usize) {
+    let mut out = [0u16; 6];
+    let mut i = 0usize;
+    while i < vc && verts[i] > w {
+        out[i] = verts[i];
+        i += 1;
+    }
+    let rank = i;
+    out[rank] = w;
+    while i < vc {
+        out[i + 1] = verts[i];
+        i += 1;
+    }
+    (out, rank)
+}
+
+#[inline]
+fn remap_edge_mask_after_insert(mask: u64, vc: usize, rank: usize) -> u64 {
+    let mut out = 0u64;
+    for i in 0..vc {
+        for j in (i + 1)..vc {
+            if (mask & edge_bit(i, j)) == 0 {
+                continue;
+            }
+            let ni = if i >= rank { i + 1 } else { i };
+            let nj = if j >= rank { j + 1 } else { j };
+            out |= edge_bit(ni, nj);
+        }
+    }
+    out
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -404,6 +995,7 @@ pub fn csr_from_distance_matrix(dist: &DistanceMatrix, threshold: f32) -> (CsrDi
         return (
             CsrDistanceMatrix {
                 n,
+                threshold: f32::INFINITY,
                 row_ptr: vec![0; n + 1],
                 col: Vec::new(),
                 val: Vec::new(),
@@ -506,6 +1098,7 @@ pub fn csr_from_distance_matrix(dist: &DistanceMatrix, threshold: f32) -> (CsrDi
     (
         CsrDistanceMatrix {
             n,
+            threshold: eff,
             row_ptr,
             col,
             val,
@@ -739,7 +1332,7 @@ mod tests {
     // where a wrong cofacet/facet emission order would silently corrupt
     // apparent-pair detection.
 
-    use crate::engine::algorithm::compute;
+    use crate::engine::algorithm::{compute, compute_sparse};
     use crate::types::BarcodeResult;
 
     fn barcodes_equal(a: &BarcodeResult, b: &BarcodeResult) -> bool {
@@ -772,7 +1365,7 @@ mod tests {
         let (csr, r_cheb) = csr_from_distance_matrix(dist, threshold);
         let eff = threshold.min(r_cheb);
         let dense = compute(dist, eff, max_dim);
-        let sparse = compute(&csr, eff, max_dim);
+        let sparse = compute_sparse(&csr, eff, max_dim);
         assert!(
             barcodes_equal(&dense, &sparse),
             "barcode mismatch (n={}, eff={eff}, max_dim={max_dim})\n dense={:?}\nsparse={:?}",

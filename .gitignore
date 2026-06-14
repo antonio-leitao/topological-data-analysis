@@ -4,6 +4,7 @@
 *.pdb
 Cargo.lock
 crates/core/profile.json.gz
+crates/core/profile.json.syms.json
 crates/core/profile.json
 crates/python/tests/results/
 crates/core/examples/
