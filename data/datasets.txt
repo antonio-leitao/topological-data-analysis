@@ -1,5 +1,5 @@
 celegans.txt
-vicsek_300_of_300.txt
+vicsek.txt
 klein_400.txt
 klein_900.txt
 dragon_1000.txt

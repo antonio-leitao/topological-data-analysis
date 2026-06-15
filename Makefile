@@ -1,4 +1,4 @@
-.PHONY: help install build-py build-rust test test-core test-python-dense test-python-sparse bench bench-save profile profile-build publish-py publish-rust clean
+.PHONY: help install build-py build-rust test test-core test-dense test-sparse bench bench-dense bench-sparse bench-save profile profile-build profile-dense profile-sparse profile-dense-all profile-sparse-all publish-py publish-rust clean
 .DEFAULT_GOAL := help
 
 # ── Colors ────────────────────────────────────────────────────────────────
@@ -14,12 +14,12 @@ BENCH_NAME  := persistent_homology
 PYTHON      := crates/python/.venv/bin/python
 MATURIN     := crates/python/.venv/bin/maturin
 BENCH_FILTER ?=
-MAX_DIM ?= 1
-PROFILE_TIME ?= 20
-PROFILE_MAX_DIM ?= 2
-PROFILE_FILTER ?= sparse_h2
-PROFILE_OUT ?= crates/core/profile.json.gz
+MAX_DIM ?= 2
 PROFILE_RATE ?= 1000
+PROFILE_DIR ?= target/profiles
+PROFILE_H2_LAST_DATASET ?= hiv1.txt
+PROFILE_REPEATS ?= 1
+DATASET ?=
 SAMPLY ?= samply
 
 help: ## Show this help message
@@ -46,60 +46,113 @@ test-core: ## Run Rust core tests
 	@echo "$(CYAN)🧪 Running Rust core tests...$(RESET)"
 	@cargo test -p $(BENCH_CRATE)
 
-test-python-dense: install ## Run Python dense correctness test
+test-dense: install ## Run Python dense correctness test
 	@echo "$(CYAN)🧪 Running Python dense correctness...$(RESET)"
 	@$(PYTHON) crates/python/tests/correctness.py dense $(MAX_DIM)
 
-test-python-sparse: install ## Run Python sparse correctness test
+test-sparse: install ## Run Python sparse correctness test
 	@echo "$(CYAN)🧪 Running Python sparse correctness...$(RESET)"
 	@$(PYTHON) crates/python/tests/correctness.py sparse $(MAX_DIM)
 
-test: test-core test-python-dense test-python-sparse ## Run all correctness tests
+test: test-core test-dense test-sparse ## Run all correctness tests
 	@echo "$(GREEN)✅ Tests passed!$(RESET)"
 
 # ── Bench ─────────────────────────────────────────────────────────────────
 
-bench-save: ## Run benchmarks, save baseline as current branch, compare against previous run of same branch
-	@BRANCH=$$(git rev-parse --abbrev-ref HEAD); \
-	echo "$(CYAN)📊 Running benchmarks, saving baseline '$$BRANCH'...$(RESET)"; \
-	TDA_MAX_DIM=$(MAX_DIM) cargo bench -p $(BENCH_CRATE) --bench $(BENCH_NAME) -- --save-baseline $$BRANCH $(BENCH_FILTER); \
-	echo "$(GREEN)✅ Baseline '$$BRANCH' saved.$(RESET)"
+bench-dense: ## Run dense Rust core benchmarks
+	@echo "$(CYAN)📊 Running dense Rust core benchmarks...$(RESET)"
+	@TDA_MAX_DIM=$(MAX_DIM) TDA_BENCH_MODE=dense cargo bench -p $(BENCH_CRATE) --bench $(BENCH_NAME)
 
-bench: ## Compare current code against a chosen saved baseline (does not save)
-	@BASELINES=$$(find target/criterion -type f -name estimates.json 2>/dev/null \
-		| xargs -n1 dirname 2>/dev/null \
-		| xargs -n1 basename 2>/dev/null \
-		| sort -u \
-		| grep -vE '^(new|change|base|report)$$'); \
-	if [ -z "$$BASELINES" ]; then \
-		echo "$(RED)No saved baselines found. Run 'make bench-save' first.$(RESET)"; \
+bench-sparse: ## Run sparse Rust core benchmarks
+	@echo "$(CYAN)📊 Running sparse Rust core benchmarks...$(RESET)"
+	@TDA_MAX_DIM=$(MAX_DIM) TDA_BENCH_MODE=sparse cargo bench -p $(BENCH_CRATE) --bench $(BENCH_NAME)
+
+bench: ## Run dense and sparse Rust core benchmarks
+	@echo "$(CYAN)📊 Running dense and sparse Rust core benchmarks...$(RESET)"
+	@TDA_MAX_DIM=$(MAX_DIM) TDA_BENCH_MODE=both cargo bench -p $(BENCH_CRATE) --bench $(BENCH_NAME)
+
+profile-build: ## Build the single-run profiling runner
+	@echo "$(CYAN)📦 Building profiling runner...$(RESET)"
+	@cargo build --release -p $(BENCH_CRATE) --example profile_runner
+
+profile-dense: profile-build ## Profile one dense dataset with samply (DATASET=dragon_2000.txt)
+	@if [ -z "$(DATASET)" ]; then \
+		echo "$(RED)Usage: make profile-dense DATASET=dragon_2000.txt$(RESET)"; \
 		exit 1; \
-	fi; \
-	BASELINE=$$(echo "$$BASELINES" | gum choose --header "Select baseline to compare against:"); \
-	if [ -z "$$BASELINE" ]; then exit 0; fi; \
-	echo "$(CYAN)📊 Comparing against baseline '$$BASELINE'...$(RESET)"; \
-	TDA_MAX_DIM=$(MAX_DIM) cargo bench -p $(BENCH_CRATE) --bench $(BENCH_NAME) -- --baseline $$BASELINE $(BENCH_FILTER)
-
-profile-build: ## Build the Criterion bench binary for profiling
-	@echo "$(CYAN)📦 Building benchmark binary for profiling...$(RESET)"
-	@TDA_MAX_DIM=$(PROFILE_MAX_DIM) cargo bench -p $(BENCH_CRATE) --bench $(BENCH_NAME) --no-run
-
-profile: profile-build ## Profile the sparse H2 Criterion benchmark group with samply
-	@mkdir -p "$$(dirname "$(PROFILE_OUT)")"
-	@BENCH_BIN=$$(find target/release/deps -maxdepth 1 -type f -perm -111 -name '$(BENCH_NAME)-*' | sort | tail -n 1); \
-	if [ -z "$$BENCH_BIN" ]; then \
-		echo "$(RED)Could not find target/release/deps/$(BENCH_NAME)-* bench executable.$(RESET)"; \
-		exit 1; \
-	fi; \
-	echo "$(CYAN)📊 Profiling $(PROFILE_FILTER) via $$BENCH_BIN...$(RESET)"; \
-	TDA_MAX_DIM=$(PROFILE_MAX_DIM) $(SAMPLY) record \
+	fi
+	@file="$(DATASET)"; \
+	name=$$(basename "$$file" .txt); \
+	OUT_DIR="$(PROFILE_DIR)/dense_h$(MAX_DIM)"; \
+	mkdir -p "$$OUT_DIR"; \
+	out="$$OUT_DIR/$$name.json.gz"; \
+	echo "$(CYAN)📊 Profiling dense_h$(MAX_DIM)/$$name...$(RESET)"; \
+	$(SAMPLY) record \
 		--save-only \
 		--unstable-presymbolicate \
 		--main-thread-only \
 		--rate $(PROFILE_RATE) \
-		-o "$(PROFILE_OUT)" \
-		-- "$$BENCH_BIN" "$(PROFILE_FILTER)" --profile-time $(PROFILE_TIME) --noplot; \
-	echo "$(GREEN)✅ Profile written to $(PROFILE_OUT).$(RESET)"
+		-o "$$out" \
+		-- target/release/examples/profile_runner dense "$(MAX_DIM)" "$$file" "$(PROFILE_REPEATS)"; \
+	echo "$(GREEN)✅ Dense profile written to $$out.$(RESET)"
+
+profile-sparse: profile-build ## Profile one sparse dataset with samply (DATASET=dragon_2000.txt)
+	@if [ -z "$(DATASET)" ]; then \
+		echo "$(RED)Usage: make profile-sparse DATASET=dragon_2000.txt$(RESET)"; \
+		exit 1; \
+	fi
+	@file="$(DATASET)"; \
+	name=$$(basename "$$file" .txt); \
+	OUT_DIR="$(PROFILE_DIR)/sparse_h$(MAX_DIM)"; \
+	mkdir -p "$$OUT_DIR"; \
+	out="$$OUT_DIR/$$name.json.gz"; \
+	echo "$(CYAN)📊 Profiling sparse_h$(MAX_DIM)/$$name...$(RESET)"; \
+	$(SAMPLY) record \
+		--save-only \
+		--unstable-presymbolicate \
+		--main-thread-only \
+		--rate $(PROFILE_RATE) \
+		-o "$$out" \
+		-- target/release/examples/profile_runner sparse "$(MAX_DIM)" "$$file" "$(PROFILE_REPEATS)"; \
+	echo "$(GREEN)✅ Sparse profile written to $$out.$(RESET)"
+
+profile-dense-all: profile-build ## Profile every dense dataset with samply
+	@OUT_DIR="$(PROFILE_DIR)/dense_h$(MAX_DIM)"; \
+	mkdir -p "$$OUT_DIR"; \
+	DATASETS=$$(awk -v max_dim="$(MAX_DIM)" -v cutoff="$(PROFILE_H2_LAST_DATASET)" 'NF && $$1 !~ /^#/ { print $$1; if (max_dim == 2 && $$1 == cutoff) exit }' data/datasets.txt); \
+	for file in $$DATASETS; do \
+		name=$${file%.txt}; \
+		out="$$OUT_DIR/$$name.json.gz"; \
+		echo "$(CYAN)📊 Profiling dense_h$(MAX_DIM)/$$name...$(RESET)"; \
+		$(SAMPLY) record \
+			--save-only \
+			--unstable-presymbolicate \
+			--main-thread-only \
+			--rate $(PROFILE_RATE) \
+			-o "$$out" \
+			-- target/release/examples/profile_runner dense "$(MAX_DIM)" "$$file" "$(PROFILE_REPEATS)"; \
+	done; \
+	echo "$(GREEN)✅ Dense profiles written to $$OUT_DIR.$(RESET)"
+
+profile-sparse-all: profile-build ## Profile every sparse dataset with samply
+	@OUT_DIR="$(PROFILE_DIR)/sparse_h$(MAX_DIM)"; \
+	mkdir -p "$$OUT_DIR"; \
+	DATASETS=$$(awk -v max_dim="$(MAX_DIM)" -v cutoff="$(PROFILE_H2_LAST_DATASET)" 'NF && $$1 !~ /^#/ { print $$1; if (max_dim == 2 && $$1 == cutoff) exit }' data/datasets.txt); \
+	for file in $$DATASETS; do \
+		name=$${file%.txt}; \
+		out="$$OUT_DIR/$$name.json.gz"; \
+		echo "$(CYAN)📊 Profiling sparse_h$(MAX_DIM)/$$name...$(RESET)"; \
+		$(SAMPLY) record \
+			--save-only \
+			--unstable-presymbolicate \
+			--main-thread-only \
+			--rate $(PROFILE_RATE) \
+			-o "$$out" \
+			-- target/release/examples/profile_runner sparse "$(MAX_DIM)" "$$file" "$(PROFILE_REPEATS)"; \
+	done; \
+	echo "$(GREEN)✅ Sparse profiles written to $$OUT_DIR.$(RESET)"
+
+profile: profile-dense-all profile-sparse-all ## Profile dense and sparse Rust core benchmarks with samply
+	@echo "$(GREEN)✅ Profiles complete.$(RESET)"
 
 # ── Publish ───────────────────────────────────────────────────────────────
 
