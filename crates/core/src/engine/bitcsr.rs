@@ -278,39 +278,48 @@ impl BitCsrDistanceMatrix {
     fn intersection_word(&self, row_start: &[usize; 6], vc: usize, block: usize) -> u64 {
         let words = &self.words;
         unsafe {
-            match vc {
-                1 => *words.get_unchecked(row_start[0] + block),
-                2 => {
-                    *words.get_unchecked(row_start[0] + block)
-                        & *words.get_unchecked(row_start[1] + block)
-                }
-                3 => {
-                    *words.get_unchecked(row_start[0] + block)
-                        & *words.get_unchecked(row_start[1] + block)
-                        & *words.get_unchecked(row_start[2] + block)
-                }
-                4 => {
-                    *words.get_unchecked(row_start[0] + block)
-                        & *words.get_unchecked(row_start[1] + block)
-                        & *words.get_unchecked(row_start[2] + block)
-                        & *words.get_unchecked(row_start[3] + block)
-                }
-                5 => {
-                    *words.get_unchecked(row_start[0] + block)
-                        & *words.get_unchecked(row_start[1] + block)
-                        & *words.get_unchecked(row_start[2] + block)
-                        & *words.get_unchecked(row_start[3] + block)
-                        & *words.get_unchecked(row_start[4] + block)
-                }
-                _ => {
-                    *words.get_unchecked(row_start[0] + block)
-                        & *words.get_unchecked(row_start[1] + block)
-                        & *words.get_unchecked(row_start[2] + block)
-                        & *words.get_unchecked(row_start[3] + block)
-                        & *words.get_unchecked(row_start[4] + block)
-                        & *words.get_unchecked(row_start[5] + block)
-                }
+            let w0 = *words.get_unchecked(row_start[0] + block);
+            if vc == 1 {
+                return w0;
             }
+            let w1 = *words.get_unchecked(row_start[1] + block);
+            let mut acc = w0 & w1;
+            if acc == 0 || vc == 2 {
+                return acc;
+            }
+
+            let w2 = *words.get_unchecked(row_start[2] + block);
+            if w2 == 0 {
+                return 0;
+            }
+            acc &= w2;
+            if acc == 0 || vc == 3 {
+                return acc;
+            }
+
+            let w3 = *words.get_unchecked(row_start[3] + block);
+            if w3 == 0 {
+                return 0;
+            }
+            acc &= w3;
+            if acc == 0 || vc == 4 {
+                return acc;
+            }
+
+            let w4 = *words.get_unchecked(row_start[4] + block);
+            if w4 == 0 {
+                return 0;
+            }
+            acc &= w4;
+            if acc == 0 || vc == 5 {
+                return acc;
+            }
+
+            let w5 = *words.get_unchecked(row_start[5] + block);
+            if w5 == 0 {
+                return 0;
+            }
+            acc & w5
         }
     }
 
@@ -706,7 +715,10 @@ impl Filtration for BitCsrDistanceMatrix {
                 continue;
             }
 
-            let floor_block = (v >> 6).min(row_len - 1);
+            let floor_block = v >> 6;
+            if floor_block >= row_len {
+                continue;
+            }
             for block in (floor_block..row_len).rev() {
                 let flat = row_start + block;
                 let mut word = unsafe { *self.words.get_unchecked(flat) };
@@ -875,6 +887,7 @@ mod tests {
     use super::*;
     use crate::engine::algorithm::{compute, compute_bitcsr};
     use crate::engine::csr::csr_from_distance_matrix;
+    use crate::engine::filtration::Filtration;
     use crate::types::BarcodeResult;
 
     fn barcodes_equal(a: &BarcodeResult, b: &BarcodeResult) -> bool {
@@ -925,6 +938,28 @@ mod tests {
             s ^= s << 17;
             s
         }
+    }
+
+    #[test]
+    fn bitcsr_for_each_edge_skips_lower_tail_blocks_above_64() {
+        let n = 70usize;
+        let mut data = vec![f32::MAX; n * (n - 1) / 2];
+        data[65 * 64 / 2 + 50] = 1.0;
+
+        let dist = DistanceMatrix::from_lower_triangular(n, data);
+        let (csr, r_cheb) = csr_from_distance_matrix(&dist, 1.0);
+        let eff = 1.0f32.min(r_cheb);
+        let bitcsr = BitCsrDistanceMatrix::from_csr(&csr, eff);
+
+        let mut edges = Vec::new();
+        bitcsr.for_each_edge(eff, |edge| {
+            edges.push(edge.vertices());
+            true
+        });
+
+        assert_eq!(edges.len(), 1);
+        assert_eq!(edges[0][0], 65);
+        assert_eq!(edges[0][1], 50);
     }
 
     #[test]
