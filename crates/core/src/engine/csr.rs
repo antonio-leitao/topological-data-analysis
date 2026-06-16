@@ -31,6 +31,8 @@
 // neighbour, so keeping `col` dense (2 bytes/entry) maximises the comparison
 // stream's cache density and touches `val` only on hits.
 
+#![allow(dead_code)]
+
 use crate::engine::distance::DistanceMatrix;
 use crate::engine::filtration::Filtration;
 use crate::engine::simplex::{encode_filtration, FxHashMap, Simplex128};

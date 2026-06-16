@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 
 use tda_core::{persistent_homology, persistent_homology_sparse, BarcodeResult};
 
-const H2_LAST_DATASET: &str = "dragon_2000.txt";
+const H2_LAST_DATASET: &str = "hiv1.txt";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Mode {
