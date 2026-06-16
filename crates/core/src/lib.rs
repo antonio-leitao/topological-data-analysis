@@ -66,12 +66,17 @@ pub fn persistent_homology_from_distances(
 ///
 /// Builds a CSR filtration keeping only within-threshold edges, then runs the
 /// same reduction the dense path uses.
+///
+/// `parallel` enables rayon-parallel candidate assembly (the dominant cost). It
+/// produces an identical barcode; turn it off for deterministic single-thread
+/// profiling or when running many computations concurrently.
 pub fn persistent_homology_sparse(
     points: &[f32],
     n: usize,
     d: usize,
     max_dim: usize,
     threshold: Option<f32>,
+    parallel: bool,
 ) -> Result<BarcodeResult> {
     validate_params(n, max_dim, threshold)?;
     if d == 0 {
@@ -89,7 +94,7 @@ pub fn persistent_homology_sparse(
     let eff = user_t.min(r_cheb);
     let csr = engine::CsrDistanceMatrix::from_csr_parts(n, eff, row_ptr, col, val);
     let bitcsr = engine::BitCsrDistanceMatrix::from_csr(&csr, eff);
-    Ok(engine::algorithm::compute_bitcsr(&bitcsr, eff, max_dim))
+    Ok(engine::algorithm::compute_bitcsr(&bitcsr, eff, max_dim, parallel))
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════

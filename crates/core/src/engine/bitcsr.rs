@@ -13,6 +13,12 @@ use crate::engine::distance::DistanceMatrix;
 use crate::engine::filtration::Filtration;
 use crate::engine::simplex::{encode_filtration, FxHashMap, Simplex128};
 
+/// Minimum number of input simplices before `assemble_candidates` uses rayon.
+/// Below this the per-task overhead and buffer merges outweigh the work, so we
+/// stay on the sequential, single-allocation path (this also covers H1 and
+/// small datasets even when the caller requests `parallel`).
+const PARALLEL_ASSEMBLE_THRESHOLD: usize = 512;
+
 /// Sparse distance matrix as flattened tail-truncated bitsets plus per-bit
 /// distances.
 ///
@@ -512,30 +518,55 @@ impl BitCsrDistanceMatrix {
         threshold: f32,
         cleared_pivots: &FxHashMap<Simplex128, ()>,
         build_pool: bool,
+        parallel: bool,
     ) -> Vec<Simplex128> {
         if simplices.is_empty() {
             return Vec::new();
         }
 
-        let mut next_simplices: Vec<Simplex128> = if build_pool {
-            Vec::with_capacity(simplices.len() * 2)
-        } else {
-            Vec::new()
-        };
-        let mut columns_to_reduce: Vec<Simplex128> = Vec::with_capacity(simplices.len());
+        // Each simplex expands independently: the only inputs are the immutable
+        // matrix and the frozen `cleared_pivots`, and outputs are pure appends.
+        // So the loop parallelises by giving each worker its own buffers and
+        // concatenating; the final sort makes the merge order irrelevant. The
+        // size guard keeps small inputs (and every H1/small-dataset case) on the
+        // allocation-free sequential path where rayon's overhead would dominate.
+        let use_par = parallel && simplices.len() >= PARALLEL_ASSEMBLE_THRESHOLD;
 
-        for &sigma in simplices.iter() {
-            if sigma.vertex_count() == 2 {
-                self.assemble_edge_candidates(
-                    sigma,
-                    threshold,
-                    cleared_pivots,
-                    build_pool,
-                    &mut next_simplices,
-                    &mut columns_to_reduce,
-                );
+        let (next_simplices, mut columns_to_reduce) = if use_par {
+            use rayon::prelude::*;
+            simplices
+                .par_iter()
+                .fold(
+                    || (Vec::new(), Vec::new()),
+                    |(mut next_local, mut cols_local), &sigma| {
+                        self.assemble_one(
+                            sigma,
+                            threshold,
+                            cleared_pivots,
+                            build_pool,
+                            &mut next_local,
+                            &mut cols_local,
+                        );
+                        (next_local, cols_local)
+                    },
+                )
+                .reduce(
+                    || (Vec::new(), Vec::new()),
+                    |(mut na, mut ca), (nb, cb)| {
+                        na.extend(nb);
+                        ca.extend(cb);
+                        (na, ca)
+                    },
+                )
+        } else {
+            let mut next_simplices: Vec<Simplex128> = if build_pool {
+                Vec::with_capacity(simplices.len() * 2)
             } else {
-                self.assemble_generic_candidates(
+                Vec::new()
+            };
+            let mut columns_to_reduce: Vec<Simplex128> = Vec::with_capacity(simplices.len());
+            for &sigma in simplices.iter() {
+                self.assemble_one(
                     sigma,
                     threshold,
                     cleared_pivots,
@@ -544,13 +575,50 @@ impl BitCsrDistanceMatrix {
                     &mut columns_to_reduce,
                 );
             }
-        }
+            (next_simplices, columns_to_reduce)
+        };
 
-        columns_to_reduce.sort_unstable();
+        if use_par {
+            use rayon::prelude::*;
+            columns_to_reduce.par_sort_unstable();
+        } else {
+            columns_to_reduce.sort_unstable();
+        }
         if build_pool {
             *simplices = next_simplices;
         }
         columns_to_reduce
+    }
+
+    #[inline]
+    fn assemble_one(
+        &self,
+        sigma: Simplex128,
+        threshold: f32,
+        cleared_pivots: &FxHashMap<Simplex128, ()>,
+        build_pool: bool,
+        next_simplices: &mut Vec<Simplex128>,
+        columns_to_reduce: &mut Vec<Simplex128>,
+    ) {
+        if sigma.vertex_count() == 2 {
+            self.assemble_edge_candidates(
+                sigma,
+                threshold,
+                cleared_pivots,
+                build_pool,
+                next_simplices,
+                columns_to_reduce,
+            );
+        } else {
+            self.assemble_generic_candidates(
+                sigma,
+                threshold,
+                cleared_pivots,
+                build_pool,
+                next_simplices,
+                columns_to_reduce,
+            );
+        }
     }
 
     #[inline]
@@ -920,13 +988,20 @@ mod tests {
         let eff = threshold.min(r_cheb);
         let bitcsr = BitCsrDistanceMatrix::from_csr(&csr, eff);
         let dense = compute(dist, eff, max_dim);
-        let sparse = compute_bitcsr(&bitcsr, eff, max_dim);
+        let sparse = compute_bitcsr(&bitcsr, eff, max_dim, false);
         assert!(
             barcodes_equal(&dense, &sparse),
             "barcode mismatch (n={}, eff={eff}, max_dim={max_dim})\n dense={:?}\nsparse={:?}",
             dist.n(),
             dense.intervals,
             sparse.intervals,
+        );
+        // The parallel assembly must produce a bit-identical barcode.
+        let sparse_par = compute_bitcsr(&bitcsr, eff, max_dim, true);
+        assert!(
+            barcodes_equal(&dense, &sparse_par),
+            "parallel barcode mismatch (n={}, eff={eff}, max_dim={max_dim})",
+            dist.n(),
         );
     }
 
@@ -991,6 +1066,43 @@ mod tests {
             for &thr in &[0.5f32, 1.0, 1.5, f32::INFINITY] {
                 for max_dim in 1..=3 {
                     diff_check(&dist, thr, max_dim);
+                }
+            }
+        }
+    }
+
+    /// Exercise the rayon path (n large enough to cross
+    /// `PARALLEL_ASSEMBLE_THRESHOLD`) and assert it equals both the sequential
+    /// sparse path and the dense path, with and without diameter ties.
+    #[test]
+    fn bitcsr_parallel_matches_sequential() {
+        for &(n, seed, levels) in &[(80usize, 12345u64, 0u64), (80, 999, 6)] {
+            let mut rng = xorshift(seed);
+            let m = n * (n - 1) / 2;
+            let data: Vec<f32> = (0..m)
+                .map(|_| {
+                    if levels == 0 {
+                        (rng() >> 40) as f32 / 16_777_216.0
+                    } else {
+                        ((rng() % levels) as f32 + 1.0) * 0.5
+                    }
+                })
+                .collect();
+            let dist = DistanceMatrix::from_lower_triangular(n, data);
+            for &thr in &[0.4f32, 0.8, f32::INFINITY] {
+                // max_dim 3 (finite threshold only, to bound cost) exercises the
+                // parallel `build_pool` path that concatenates the next-dimension
+                // simplex pool across workers.
+                let max_dims: &[usize] = if thr.is_finite() { &[1, 2, 3] } else { &[1, 2] };
+                for &max_dim in max_dims {
+                    let (csr, r_cheb) = csr_from_distance_matrix(&dist, thr);
+                    let eff = thr.min(r_cheb);
+                    let bitcsr = BitCsrDistanceMatrix::from_csr(&csr, eff);
+                    let seq = compute_bitcsr(&bitcsr, eff, max_dim, false);
+                    let par = compute_bitcsr(&bitcsr, eff, max_dim, true);
+                    let dense = compute(&dist, eff, max_dim);
+                    assert!(barcodes_equal(&seq, &par), "seq vs par (n={n}, thr={thr}, d={max_dim})");
+                    assert!(barcodes_equal(&dense, &par), "dense vs par (n={n}, thr={thr}, d={max_dim})");
                 }
             }
         }

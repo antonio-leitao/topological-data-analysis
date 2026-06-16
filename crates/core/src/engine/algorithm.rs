@@ -251,6 +251,7 @@ pub fn compute_bitcsr(
     dist: &BitCsrDistanceMatrix,
     threshold: f32,
     max_dim: usize,
+    parallel: bool,
 ) -> BarcodeResult {
     let mut intervals: Vec<Vec<PersistenceInterval>> = Vec::with_capacity(max_dim + 1);
 
@@ -276,8 +277,13 @@ pub fn compute_bitcsr(
 
         if dim < max_dim {
             let build_pool = dim + 1 < max_dim;
-            columns_to_reduce =
-                dist.assemble_candidates(&mut simplices, threshold, &cleared_pivots, build_pool);
+            columns_to_reduce = dist.assemble_candidates(
+                &mut simplices,
+                threshold,
+                &cleared_pivots,
+                build_pool,
+                parallel,
+            );
         }
     }
 

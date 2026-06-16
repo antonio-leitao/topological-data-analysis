@@ -100,16 +100,18 @@ fn persistent_homology<'py>(
 
 /// Test-only sparse entry point. Not re-exported from `tda.__init__`.
 #[pyfunction(name = "_persistent_homology_sparse")]
-#[pyo3(signature = (data, max_dim=1, threshold=None))]
+#[pyo3(signature = (data, max_dim=1, threshold=None, parallel=true))]
 fn persistent_homology_sparse<'py>(
     py: Python<'py>,
     data: PyReadonlyArray2<'py, f32>,
     max_dim: usize,
     threshold: Option<f32>,
+    parallel: bool,
 ) -> PyResult<Vec<Bound<'py, PyArray2<f32>>>> {
     let (flat, rows, cols) = flatten(&data);
-    let barcode = tda_core::persistent_homology_sparse(&flat, rows, cols, max_dim, threshold)
-        .map_err(to_py_err)?;
+    let barcode =
+        tda_core::persistent_homology_sparse(&flat, rows, cols, max_dim, threshold, parallel)
+            .map_err(to_py_err)?;
     barcode_to_py(py, barcode)
 }
 

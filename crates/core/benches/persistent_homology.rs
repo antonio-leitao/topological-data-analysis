@@ -3,7 +3,9 @@ use std::hint::black_box;
 
 mod common;
 
-use common::{dataset_files, load_dataset, max_dim_from_env, run_once, should_bench, Mode};
+use common::{
+    dataset_files, load_dataset, max_dim_from_env, parallel_from_env, run_once, should_bench, Mode,
+};
 
 fn bench_dense(c: &mut Criterion) {
     if !should_bench(Mode::Dense) {
@@ -20,6 +22,7 @@ fn bench_dense(c: &mut Criterion) {
                     black_box(Mode::Dense),
                     black_box(&dataset),
                     black_box(max_dim),
+                    black_box(false),
                 ))
             });
         });
@@ -33,6 +36,7 @@ fn bench_sparse(c: &mut Criterion) {
     }
 
     let max_dim = max_dim_from_env();
+    let parallel = parallel_from_env();
     let mut group = c.benchmark_group(format!("sparse_h{max_dim}"));
     for file in dataset_files(max_dim) {
         let dataset = load_dataset(&file);
@@ -42,6 +46,7 @@ fn bench_sparse(c: &mut Criterion) {
                     black_box(Mode::Sparse),
                     black_box(&dataset),
                     black_box(max_dim),
+                    black_box(parallel),
                 ))
             });
         });

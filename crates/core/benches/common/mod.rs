@@ -136,7 +136,12 @@ pub fn load_dataset(file: &str) -> Dataset {
     }
 }
 
-pub fn run_once(mode: Mode, dataset: &Dataset, max_dim: usize) -> tda_core::Result<BarcodeResult> {
+pub fn run_once(
+    mode: Mode,
+    dataset: &Dataset,
+    max_dim: usize,
+    parallel: bool,
+) -> tda_core::Result<BarcodeResult> {
     match mode {
         Mode::Dense => persistent_homology(
             &dataset.points,
@@ -147,8 +152,22 @@ pub fn run_once(mode: Mode, dataset: &Dataset, max_dim: usize) -> tda_core::Resu
             false,
             false,
         ),
-        Mode::Sparse => {
-            persistent_homology_sparse(&dataset.points, dataset.n, dataset.d, max_dim, None)
-        }
+        Mode::Sparse => persistent_homology_sparse(
+            &dataset.points,
+            dataset.n,
+            dataset.d,
+            max_dim,
+            None,
+            parallel,
+        ),
     }
+}
+
+/// Whether the sparse backend should parallelise. Defaults to `true`; set
+/// `TDA_PARALLEL=0`/`false` to measure or profile the single-thread path.
+pub fn parallel_from_env() -> bool {
+    !matches!(
+        std::env::var("TDA_PARALLEL").ok().as_deref(),
+        Some("0") | Some("false") | Some("no")
+    )
 }
