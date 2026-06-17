@@ -13,12 +13,6 @@
 // reduction columns — those live in the Ripser algorithm layer (`algorithm.rs`),
 // which drives this structure through the `pub(crate)` primitives below.
 
-use crate::engine::distance::DistanceMatrix;
-
-/// Entries `>= NO_EDGE` are "no edge" and are excluded from the enclosing-radius
-/// reduction, mirroring `distance.rs`.
-const NO_EDGE: f32 = f32::MAX;
-
 /// Sparse distance matrix as flattened tail-truncated bitsets plus per-bit
 /// distances.
 ///
@@ -145,103 +139,6 @@ impl BitCsrDistanceMatrix {
             .all(|w| w[0] > w[1])));
 
         Self::from_sorted_rows(n, &row_ptr, &col, &val, threshold)
-    }
-
-    /// Build from a dense lower-triangular distance matrix, keeping only edges
-    /// within the effective threshold. Returns `(matrix, r_cheb)` where `r_cheb`
-    /// is the Chebyshev (minimax) radius; the matrix stores
-    /// `threshold.min(r_cheb)` as its effective threshold. Supports
-    /// distance-matrix inputs and tests.
-    pub(crate) fn from_distance_matrix(dist: &DistanceMatrix, threshold: f32) -> (Self, f32) {
-        let n = dist.n();
-        if n < 2 {
-            let row_ptr = vec![0usize; n + 1];
-            let bitcsr = Self::from_sorted_rows(n, &row_ptr, &[], &[], threshold);
-            return (bitcsr, f32::INFINITY);
-        }
-
-        let raw = dist.raw();
-
-        let mut ecc = vec![f32::NEG_INFINITY; n];
-        {
-            let mut p = 0;
-            for i in 1..n {
-                let mut row_max = ecc[i];
-                for j in 0..i {
-                    let d = raw[p];
-                    p += 1;
-                    if d < NO_EDGE {
-                        if d > row_max {
-                            row_max = d;
-                        }
-                        if d > ecc[j] {
-                            ecc[j] = d;
-                        }
-                    }
-                }
-                ecc[i] = row_max;
-            }
-        }
-        let r_cheb = ecc
-            .iter()
-            .copied()
-            .filter(|&m| m > f32::NEG_INFINITY)
-            .fold(f32::INFINITY, f32::min);
-        let eff = threshold.min(r_cheb);
-
-        let mut row_ptr = vec![0usize; n + 1];
-        {
-            let mut p = 0;
-            for i in 1..n {
-                for j in 0..i {
-                    let d = raw[p];
-                    p += 1;
-                    if d <= eff && d < NO_EDGE {
-                        row_ptr[i + 1] += 1;
-                        row_ptr[j + 1] += 1;
-                    }
-                }
-            }
-            for v in 0..n {
-                row_ptr[v + 1] += row_ptr[v];
-            }
-        }
-
-        let nnz = row_ptr[n];
-        let mut col = vec![0u16; nnz];
-        let mut val = vec![0.0f32; nnz];
-
-        {
-            let mut cur = row_ptr[..n].to_vec();
-            let mut p = 0;
-            for i in 1..n {
-                for j in 0..i {
-                    let d = raw[p];
-                    p += 1;
-                    if d <= eff && d < NO_EDGE {
-                        let ci = cur[i];
-                        col[ci] = j as u16;
-                        val[ci] = d;
-                        cur[i] = ci + 1;
-
-                        let cj = cur[j];
-                        col[cj] = i as u16;
-                        val[cj] = d;
-                        cur[j] = cj + 1;
-                    }
-                }
-            }
-        }
-
-        // BitCSR needs neighbours descending by id.
-        for v in 0..n {
-            let s = row_ptr[v];
-            let e = row_ptr[v + 1];
-            col[s..e].reverse();
-            val[s..e].reverse();
-        }
-
-        (Self::from_sorted_rows(n, &row_ptr, &col, &val, eff), r_cheb)
     }
 
     // ── Accessors ─────────────────────────────────────────────────────────────
@@ -568,6 +465,7 @@ pub(crate) fn bits_above(bit: usize) -> u64 {
 mod tests {
     use super::*;
     use crate::engine::algorithm::{compute, for_each_edge};
+    use crate::preprocess::pdist::{dmat_csr, square_from_lower_tri};
     use crate::types::BarcodeResult;
 
     fn barcodes_equal(a: &BarcodeResult, b: &BarcodeResult) -> bool {
@@ -595,17 +493,27 @@ mod tests {
         true
     }
 
+    /// Build BitCSR from a lower-triangular fixture through the real pdist
+    /// distance-matrix path.
+    fn bitcsr_from_lower_tri(lt: &[f32], n: usize, threshold: f32) -> (BitCsrDistanceMatrix, f32) {
+        let sq = square_from_lower_tri(n, lt);
+        let adj = dmat_csr(&sq, n, threshold);
+        let eff = threshold.min(adj.r_cheb);
+        (
+            BitCsrDistanceMatrix::from_csr_parts(n, adj.row_ptr, adj.col, adj.val, eff),
+            eff,
+        )
+    }
+
     /// The sequential and parallel assembly paths must produce bit-identical
     /// barcodes on the same input.
-    fn seq_par_check(dist: &DistanceMatrix, threshold: f32, max_dim: usize) {
-        let (bitcsr, r_cheb) = BitCsrDistanceMatrix::from_distance_matrix(dist, threshold);
-        let eff = threshold.min(r_cheb);
+    fn seq_par_check(lt: &[f32], n: usize, threshold: f32, max_dim: usize) {
+        let (bitcsr, eff) = bitcsr_from_lower_tri(lt, n, threshold);
         let seq = compute(&bitcsr, eff, max_dim, false);
         let par = compute(&bitcsr, eff, max_dim, true);
         assert!(
             barcodes_equal(&seq, &par),
-            "seq vs par barcode mismatch (n={}, eff={eff}, max_dim={max_dim})\n seq={:?}\n par={:?}",
-            dist.n(),
+            "seq vs par barcode mismatch (n={n}, eff={eff}, max_dim={max_dim})\n seq={:?}\n par={:?}",
             seq.intervals,
             par.intervals,
         );
@@ -627,9 +535,7 @@ mod tests {
         let mut data = vec![f32::MAX; n * (n - 1) / 2];
         data[65 * 64 / 2 + 50] = 1.0;
 
-        let dist = DistanceMatrix::from_lower_triangular(n, data);
-        let (bitcsr, r_cheb) = BitCsrDistanceMatrix::from_distance_matrix(&dist, 1.0);
-        let eff = 1.0f32.min(r_cheb);
+        let (bitcsr, eff) = bitcsr_from_lower_tri(&data, n, 1.0);
 
         let mut edges = Vec::new();
         for_each_edge(&bitcsr, eff, |edge| {
@@ -650,10 +556,9 @@ mod tests {
             let data: Vec<f32> = (0..m)
                 .map(|_| (rng() >> 40) as f32 / 16_777_216.0)
                 .collect();
-            let dist = DistanceMatrix::from_lower_triangular(n, data);
             for &thr in &[0.3f32, 0.6, 0.9, f32::INFINITY] {
                 for max_dim in 1..=3 {
-                    seq_par_check(&dist, thr, max_dim);
+                    seq_par_check(&data, n, thr, max_dim);
                 }
             }
         }
@@ -667,10 +572,9 @@ mod tests {
             let data: Vec<f32> = (0..m)
                 .map(|_| ((rng() % levels) as f32 + 1.0) * 0.5)
                 .collect();
-            let dist = DistanceMatrix::from_lower_triangular(n, data);
             for &thr in &[0.5f32, 1.0, 1.5, f32::INFINITY] {
                 for max_dim in 1..=3 {
-                    seq_par_check(&dist, thr, max_dim);
+                    seq_par_check(&data, n, thr, max_dim);
                 }
             }
         }
@@ -693,14 +597,13 @@ mod tests {
                     }
                 })
                 .collect();
-            let dist = DistanceMatrix::from_lower_triangular(n, data);
             for &thr in &[0.4f32, 0.8, f32::INFINITY] {
                 // max_dim 3 (finite threshold only, to bound cost) exercises the
                 // parallel `build_pool` path that concatenates the next-dimension
                 // simplex pool across workers.
                 let max_dims: &[usize] = if thr.is_finite() { &[1, 2, 3] } else { &[1, 2] };
                 for &max_dim in max_dims {
-                    seq_par_check(&dist, thr, max_dim);
+                    seq_par_check(&data, n, thr, max_dim);
                 }
             }
         }

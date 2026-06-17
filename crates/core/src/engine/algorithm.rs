@@ -778,12 +778,16 @@ pub fn compute(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::engine::distance::DistanceMatrix;
+    use crate::preprocess::pdist::{dmat_csr, square_from_lower_tri};
 
-    /// Build a BitCSR from a dense lower-triangular matrix and run the engine.
-    fn run(dist: &DistanceMatrix, threshold: f32, max_dim: usize) -> BarcodeResult {
-        let (bitcsr, r_cheb) = BitCsrDistanceMatrix::from_distance_matrix(dist, threshold);
-        compute(&bitcsr, threshold.min(r_cheb), max_dim, true)
+    /// Build a BitCSR from a lower-triangular fixture (through the real pdist
+    /// distance-matrix path) and run the engine.
+    fn run(lt: &[f32], n: usize, threshold: f32, max_dim: usize) -> BarcodeResult {
+        let sq = square_from_lower_tri(n, lt);
+        let adj = dmat_csr(&sq, n, threshold);
+        let eff = threshold.min(adj.r_cheb);
+        let bitcsr = BitCsrDistanceMatrix::from_csr_parts(n, adj.row_ptr, adj.col, adj.val, eff);
+        compute(&bitcsr, eff, max_dim, true)
     }
 
     fn approx_eq(a: f32, b: f32, tol: f32) -> bool {
@@ -808,8 +812,7 @@ mod tests {
     /// and one finite class [0, d(0,1)). H1 is empty.
     #[test]
     fn h0_two_points() {
-        let dist = DistanceMatrix::from_lower_triangular(2, vec![1.0]);
-        let bc = run(&dist, f32::INFINITY, 1);
+        let bc = run(&[1.0], 2, f32::INFINITY, 1);
         assert_eq!(bc.intervals.len(), 2);
         // H0: one finite [0,1) and one essential [0, ∞)
         assert_eq!(bc.intervals[0].len(), 2);
@@ -827,15 +830,16 @@ mod tests {
     /// Threshold 1.5: 4-cycle alive, no triangles. Should give 1 essential H1.
     #[test]
     fn unfilled_4cycle_essential_h1() {
-        let dist = DistanceMatrix::from_lower_triangular(
-            4,
-            vec![
+        let bc = run(
+            &[
                 1.0, // (1,0)
                 10.0, 1.0, // (2,0), (2,1)
                 1.0, 10.0, 1.0, // (3,0), (3,1), (3,2)
             ],
+            4,
+            1.5,
+            1,
         );
-        let bc = run(&dist, 1.5, 1);
 
         // H0: 4 components reduce to 1 → 3 finite [0,1) + 1 essential.
         assert_eq!(count_essential_h_d(&bc, 0), 1);
@@ -855,8 +859,7 @@ mod tests {
     fn unit_square_h0_h1() {
         let s = std::f32::consts::SQRT_2;
         // d(1,0)=1, d(2,0)=√2, d(2,1)=1, d(3,0)=1, d(3,1)=√2, d(3,2)=1
-        let dist = DistanceMatrix::from_lower_triangular(4, vec![1.0, s, 1.0, 1.0, s, 1.0]);
-        let bc = run(&dist, f32::INFINITY, 2);
+        let bc = run(&[1.0, s, 1.0, 1.0, s, 1.0], 4, f32::INFINITY, 2);
 
         // H0: exactly 3 finite intervals [0, 1.0) and 1 essential.
         assert_eq!(count_essential_h_d(&bc, 0), 1, "H0 essentials");
@@ -893,8 +896,7 @@ mod tests {
     #[test]
     fn two_components_finite_threshold() {
         // d(1,0)=1, d(2,0)=10, d(2,1)=9, d(3,0)=11, d(3,1)=10, d(3,2)=1
-        let dist = DistanceMatrix::from_lower_triangular(4, vec![1.0, 10.0, 9.0, 11.0, 10.0, 1.0]);
-        let bc = run(&dist, 5.0, 1);
+        let bc = run(&[1.0, 10.0, 9.0, 11.0, 10.0, 1.0], 4, 5.0, 1);
         // With threshold 5, edges of length > 5 don't form. Components: {0,1} and {2,3}.
         // H0: 2 finite [0,1), 2 essentials.
         assert_eq!(count_essential_h_d(&bc, 0), 2);
@@ -919,18 +921,18 @@ mod tests {
         // Indices: 0=(+1,0,0), 1=(-1,0,0), 2=(0,+1,0), 3=(0,-1,0), 4=(0,0,+1), 5=(0,0,-1)
         //   antipodal pairs (0,1), (2,3), (4,5) → 2.0; adjacent pairs → √2
         let s = std::f32::consts::SQRT_2;
-        let dist = DistanceMatrix::from_lower_triangular(
-            6,
-            vec![
+        let bc = run(
+            &[
                 2.0, // (1,0)  antipodal
                 s, s, // (2,0), (2,1)  adjacent
                 s, s, 2.0, // (3,0), (3,1), (3,2)  — (3,2) antipodal
                 s, s, s, s, // (4,0..3) all adjacent
                 s, s, s, s, 2.0, // (5,0..3) adjacent, (5,4) antipodal
             ],
+            6,
+            f32::INFINITY,
+            2,
         );
-
-        let bc = run(&dist, f32::INFINITY, 2);
 
         // H0: 1 essential, 5 finite (all dying at √2 when octahedron connects).
         assert_eq!(count_essential_h_d(&bc, 0), 1);

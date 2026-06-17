@@ -5,7 +5,6 @@ mod preprocess;
 mod types;
 mod utils;
 
-use engine::DistanceMatrix;
 pub use error::{Error, Result};
 pub use types::{BarcodeResult, PersistenceInterval};
 
@@ -68,9 +67,10 @@ pub fn persistent_homology_from_distances(
 
     validate_distance_shape(distances, n)?;
     let user_t = threshold.unwrap_or(f32::INFINITY);
-    let (dist, _) = DistanceMatrix::from_square_matrix(distances, n);
-    let (bitcsr, r_cheb) = engine::BitCsrDistanceMatrix::from_distance_matrix(&dist, user_t);
-    let eff = user_t.min(r_cheb);
+    let adj = preprocess::pdist::dmat_csr(distances, n, user_t);
+    let eff = user_t.min(adj.r_cheb);
+    let bitcsr =
+        engine::BitCsrDistanceMatrix::from_csr_parts(n, adj.row_ptr, adj.col, adj.val, eff);
     Ok(engine::algorithm::compute(&bitcsr, eff, max_dim, true))
 }
 
@@ -84,9 +84,10 @@ fn run_bitcsr_points(
 ) -> Result<BarcodeResult> {
     validate_point_shape(points, n, d)?;
     let user_t = threshold.unwrap_or(f32::INFINITY);
-    let (row_ptr, col, val, r_cheb) = preprocess::pdist::pdist_csr(points, n, d, user_t);
-    let eff = user_t.min(r_cheb);
-    let bitcsr = engine::BitCsrDistanceMatrix::from_csr_parts(n, row_ptr, col, val, eff);
+    let adj = preprocess::pdist::pdist_csr(points, n, d, user_t);
+    let eff = user_t.min(adj.r_cheb);
+    let bitcsr =
+        engine::BitCsrDistanceMatrix::from_csr_parts(n, adj.row_ptr, adj.col, adj.val, eff);
     Ok(engine::algorithm::compute(&bitcsr, eff, max_dim, parallel))
 }
 
@@ -138,7 +139,7 @@ fn condense_points(points: &[f32], n: usize, d: usize) -> Result<(Vec<f32>, usiz
 #[inline]
 fn condense_distances(distances: &[f32], n: usize) -> Result<(Vec<f32>, usize, f32)> {
     validate_distance_shape(distances, n)?;
-    Ok(engine::distance::condense_square_matrix(distances, n))
+    Ok(preprocess::pdist::condense_square_matrix(distances, n))
 }
 
 #[inline]
