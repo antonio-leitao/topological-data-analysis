@@ -68,10 +68,8 @@ pub fn persistent_homology_from_distances(
     validate_distance_shape(distances, n)?;
     let user_t = threshold.unwrap_or(f32::INFINITY);
     let adj = preprocess::pdist::dmat_csr(distances, n, user_t);
-    let eff = user_t.min(adj.r_cheb);
-    let bitcsr =
-        engine::BitCsrDistanceMatrix::from_csr_parts(n, adj.row_ptr, adj.col, adj.val, eff);
-    Ok(engine::algorithm::compute(&bitcsr, eff, max_dim, true))
+    let bitcsr = engine::BitCsrDistanceMatrix::from_csr_parts(n, adj.row_ptr, adj.col, adj.val);
+    Ok(engine::algorithm::compute(&bitcsr, max_dim, true))
 }
 
 fn run_bitcsr_points(
@@ -85,10 +83,8 @@ fn run_bitcsr_points(
     validate_point_shape(points, n, d)?;
     let user_t = threshold.unwrap_or(f32::INFINITY);
     let adj = preprocess::pdist::pdist_csr(points, n, d, user_t);
-    let eff = user_t.min(adj.r_cheb);
-    let bitcsr =
-        engine::BitCsrDistanceMatrix::from_csr_parts(n, adj.row_ptr, adj.col, adj.val, eff);
-    Ok(engine::algorithm::compute(&bitcsr, eff, max_dim, parallel))
+    let bitcsr = engine::BitCsrDistanceMatrix::from_csr_parts(n, adj.row_ptr, adj.col, adj.val);
+    Ok(engine::algorithm::compute(&bitcsr, max_dim, parallel))
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════

@@ -60,12 +60,11 @@ impl CompressedSparseMatrix {
 fn add_simplex_coboundary(
     simplex: Simplex128,
     dist: &BitCsrDistanceMatrix,
-    threshold: f32,
     working_v: &mut Vec<Simplex128>,
     working_coboundary: &mut FastHeap,
 ) {
     working_v.push(simplex);
-    for_each_cofacet(dist, simplex, true, threshold, |cofacet| {
+    for_each_cofacet(dist, simplex, true, |cofacet| {
         working_coboundary.push(cofacet);
         true
     });
@@ -77,20 +76,13 @@ fn add_coboundary(
     columns: &[Simplex128],
     column_index: usize,
     dist: &BitCsrDistanceMatrix,
-    threshold: f32,
     working_v: &mut Vec<Simplex128>,
     working_coboundary: &mut FastHeap,
 ) {
-    add_simplex_coboundary(
-        columns[column_index],
-        dist,
-        threshold,
-        working_v,
-        working_coboundary,
-    );
+    add_simplex_coboundary(columns[column_index], dist, working_v, working_coboundary);
 
     for &simplex in v_matrix.column(column_index) {
-        add_simplex_coboundary(simplex, dist, threshold, working_v, working_coboundary);
+        add_simplex_coboundary(simplex, dist, working_v, working_coboundary);
     }
 }
 
@@ -101,7 +93,6 @@ fn add_coboundary(
 fn init_coboundary_and_get_pivot(
     sigma: Simplex128,
     dist: &BitCsrDistanceMatrix,
-    threshold: f32,
     pivot_column_index: &FxHashMap<Simplex128, usize>,
     working_coboundary: &mut FastHeap,
 ) -> Option<Simplex128> {
@@ -109,10 +100,10 @@ fn init_coboundary_and_get_pivot(
     let mut check_for_emergent_pair = true;
     let mut emergent: Option<Simplex128> = None;
 
-    for_each_cofacet(dist, sigma, true, threshold, |cofacet| {
+    for_each_cofacet(dist, sigma, true, |cofacet| {
         if check_for_emergent_pair && cofacet.filtration_encoded() == sigma_filt {
             if !pivot_column_index.contains_key(&cofacet)
-                && zero_apparent_facet(dist, cofacet, threshold).is_none()
+                && zero_apparent_facet(dist, cofacet).is_none()
             {
                 working_coboundary.clear(); // discard pollution
                 emergent = Some(cofacet);
@@ -139,7 +130,6 @@ fn init_coboundary_and_get_pivot(
 pub fn compute_pairs(
     columns: &[Simplex128],
     dist: &BitCsrDistanceMatrix,
-    threshold: f32,
     dim_intervals: &mut Vec<PersistenceInterval>,
     cleared_pivots: &mut FxHashMap<Simplex128, ()>,
 ) {
@@ -163,7 +153,6 @@ pub fn compute_pairs(
         let mut pivot = init_coboundary_and_get_pivot(
             sigma,
             dist,
-            threshold,
             &pivot_column_index,
             &mut working_coboundary,
         );
@@ -203,7 +192,6 @@ pub fn compute_pairs(
                             columns,
                             k,
                             dist,
-                            threshold,
                             &mut working_v,
                             &mut working_coboundary,
                         );
@@ -211,14 +199,8 @@ pub fn compute_pairs(
                         continue;
                     }
 
-                    if let Some(phi) = zero_apparent_facet(dist, tau, threshold) {
-                        add_simplex_coboundary(
-                            phi,
-                            dist,
-                            threshold,
-                            &mut working_v,
-                            &mut working_coboundary,
-                        );
+                    if let Some(phi) = zero_apparent_facet(dist, tau) {
+                        add_simplex_coboundary(phi, dist, &mut working_v, &mut working_coboundary);
                         pivot = working_coboundary.get_pivot();
                         continue;
                     }

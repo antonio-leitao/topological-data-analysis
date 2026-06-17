@@ -177,6 +177,8 @@ pub struct Adjacency {
     pub row_ptr: Vec<usize>,
     pub col: Vec<u16>,
     pub val: Vec<f32>,
+    /// Retained as preprocessing metadata for optimization paths.
+    #[allow(dead_code)]
     pub r_cheb: f32,
     /// Chebyshev center; part of pdist's contract (radius + center) for the
     /// `opt::peel` path. Currently unread by the vanilla pipeline.

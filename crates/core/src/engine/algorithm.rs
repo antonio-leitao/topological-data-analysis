@@ -74,21 +74,14 @@ impl UnionFind {
 // Edge & cofacet enumeration — build Simplex128 from the BitCSR primitives
 // ═══════════════════════════════════════════════════════════════════════════════
 
-/// Enumerate every 1-simplex (edge) with diameter ≤ `threshold`, each exactly
-/// once (the larger endpoint stored first), with its diameter encoded. Used to
-/// seed H0. Return `false` from `f` to stop early.
-pub(crate) fn for_each_edge(
-    dist: &BitCsrDistanceMatrix,
-    threshold: f32,
-    mut f: impl FnMut(Simplex128) -> bool,
-) {
-    let check_threshold = threshold < dist.threshold();
+/// Enumerate every stored 1-simplex (edge), each exactly once (the larger
+/// endpoint stored first), with its diameter encoded. Used to seed H0. Return
+/// `false` from `f` to stop early.
+pub(crate) fn for_each_edge(dist: &BitCsrDistanceMatrix, mut f: impl FnMut(Simplex128) -> bool) {
     for v in 0..dist.n() {
         let mut stop = false;
         dist.for_each_neighbor_above(v, |w, d| {
-            if (!check_threshold || d <= threshold)
-                && !f(Simplex128::from_sorted_desc(d, &[w, v as u16]))
-            {
+            if !f(Simplex128::from_sorted_desc(d, &[w, v as u16])) {
                 stop = true;
                 return false;
             }
@@ -100,8 +93,9 @@ pub(crate) fn for_each_edge(
     }
 }
 
-/// Enumerate the cofacets of `sigma` with diameter ≤ `threshold`, youngest-first
-/// (descending inserted-vertex order), each carrying its cofacet diameter.
+/// Enumerate the cofacets of `sigma`, youngest-first (descending inserted-vertex
+/// order), each carrying its cofacet diameter. The matrix already contains only
+/// edges admitted by preprocessing.
 ///
 /// - `all_cofacets = true`  → every cofacet (reduction / coboundary).
 /// - `all_cofacets = false` → only cofacets whose inserted vertex exceeds σ's
@@ -114,11 +108,10 @@ pub(crate) fn for_each_cofacet(
     dist: &BitCsrDistanceMatrix,
     sigma: Simplex128,
     all_cofacets: bool,
-    threshold: f32,
     mut f: impl FnMut(Simplex128) -> bool,
 ) {
     let vc = sigma.vertex_count();
-    if vc == 0 || sigma.filtration() > threshold {
+    if vc == 0 {
         return;
     }
 
@@ -129,8 +122,6 @@ pub(crate) fn for_each_cofacet(
     } else {
         sigma.largest_vertex() as i32
     };
-    let check_threshold = threshold < dist.threshold();
-
     // Cache the cofacet-construction masks; they depend only on the insertion
     // rank `vi`, which advances monotonically as the youngest-first neighbour id
     // descends past σ's vertices.
@@ -154,10 +145,6 @@ pub(crate) fn for_each_cofacet(
         }
 
         let diam = if extra > base { extra } else { base };
-        if check_threshold && diam > threshold {
-            return true;
-        }
-
         let w_ins = (w as u128) + 1;
         let cof = Simplex128(
             ((encode_filtration(diam) as u128) << 96)
@@ -263,17 +250,10 @@ fn zero_pivot_facet(dist: &BitCsrDistanceMatrix, tau: Simplex128) -> Option<Simp
     None
 }
 
-/// Youngest same-diameter cofacet of `sigma` within `threshold`, or `None`.
+/// Youngest same-diameter cofacet of `sigma`, or `None`.
 #[inline]
-fn zero_pivot_cofacet(
-    dist: &BitCsrDistanceMatrix,
-    sigma: Simplex128,
-    threshold: f32,
-) -> Option<Simplex128> {
+fn zero_pivot_cofacet(dist: &BitCsrDistanceMatrix, sigma: Simplex128) -> Option<Simplex128> {
     let same_diam = sigma.filtration();
-    if same_diam > threshold {
-        return None;
-    }
     let vc = sigma.vertex_count();
     if vc == 0 {
         return None;
@@ -289,10 +269,9 @@ fn zero_pivot_cofacet(
 pub(crate) fn zero_apparent_facet(
     dist: &BitCsrDistanceMatrix,
     tau: Simplex128,
-    threshold: f32,
 ) -> Option<Simplex128> {
     let phi = zero_pivot_facet(dist, tau)?;
-    let tau_check = zero_pivot_cofacet(dist, phi, threshold)?;
+    let tau_check = zero_pivot_cofacet(dist, phi)?;
     if tau_check == tau {
         Some(phi)
     } else {
@@ -303,12 +282,8 @@ pub(crate) fn zero_apparent_facet(
 /// If `sigma` is the facet side of an apparent pair, return its cofacet partner
 /// τ. Used by H0 to skip already-paired edges.
 #[inline]
-fn zero_apparent_cofacet(
-    dist: &BitCsrDistanceMatrix,
-    sigma: Simplex128,
-    threshold: f32,
-) -> Option<Simplex128> {
-    let tau = zero_pivot_cofacet(dist, sigma, threshold)?;
+fn zero_apparent_cofacet(dist: &BitCsrDistanceMatrix, sigma: Simplex128) -> Option<Simplex128> {
+    let tau = zero_pivot_cofacet(dist, sigma)?;
     let phi = zero_pivot_facet(dist, tau)?;
     if phi == sigma {
         Some(tau)
@@ -323,13 +298,12 @@ fn zero_apparent_cofacet(
 
 fn compute_h0(
     dist: &BitCsrDistanceMatrix,
-    threshold: f32,
     intervals: &mut Vec<PersistenceInterval>,
 ) -> (Vec<Simplex128>, Vec<Simplex128>) {
     let n = dist.n();
 
     let mut edges: Vec<Simplex128> = Vec::new();
-    for_each_edge(dist, threshold, |edge| {
+    for_each_edge(dist, |edge| {
         edges.push(edge);
         true
     });
@@ -359,13 +333,13 @@ fn compute_h0(
             // Filter: if the edge is already the cofacet side of an apparent pair
             // with one of its endpoints, it's guaranteed to be paired in the H1
             // reduction and we can skip it here (Ripser, compute_dim_0_pairs).
-            if zero_apparent_cofacet(dist, edge, threshold).is_none() {
+            if zero_apparent_cofacet(dist, edge).is_none() {
                 columns_to_reduce.push(edge);
             }
         }
     }
 
-    // Number of connected components at threshold = n - num_merges. This is
+    // Number of connected components at the matrix cutoff = n - num_merges. This is
     // always ≥ 1 (the whole space is at least one component). Each component
     // contributes one essential H0 class.
     let num_essential = n - num_merges;
@@ -399,7 +373,6 @@ fn compute_h0(
 pub(crate) fn assemble_candidates(
     dist: &BitCsrDistanceMatrix,
     simplices: &mut Vec<Simplex128>,
-    threshold: f32,
     cleared_pivots: &FxHashMap<Simplex128, ()>,
     build_pool: bool,
     parallel: bool,
@@ -420,7 +393,6 @@ pub(crate) fn assemble_candidates(
                     assemble_one(
                         dist,
                         sigma,
-                        threshold,
                         cleared_pivots,
                         build_pool,
                         &mut next_local,
@@ -448,7 +420,6 @@ pub(crate) fn assemble_candidates(
             assemble_one(
                 dist,
                 sigma,
-                threshold,
                 cleared_pivots,
                 build_pool,
                 &mut next_simplices,
@@ -474,7 +445,6 @@ pub(crate) fn assemble_candidates(
 fn assemble_one(
     dist: &BitCsrDistanceMatrix,
     sigma: Simplex128,
-    threshold: f32,
     cleared_pivots: &FxHashMap<Simplex128, ()>,
     build_pool: bool,
     next_simplices: &mut Vec<Simplex128>,
@@ -484,7 +454,6 @@ fn assemble_one(
         assemble_edge_candidates(
             dist,
             sigma,
-            threshold,
             cleared_pivots,
             build_pool,
             next_simplices,
@@ -494,7 +463,6 @@ fn assemble_one(
         assemble_generic_candidates(
             dist,
             sigma,
-            threshold,
             cleared_pivots,
             build_pool,
             next_simplices,
@@ -507,7 +475,6 @@ fn assemble_one(
 fn assemble_edge_candidates(
     dist: &BitCsrDistanceMatrix,
     sigma: Simplex128,
-    threshold: f32,
     cleared_pivots: &FxHashMap<Simplex128, ()>,
     build_pool: bool,
     next_simplices: &mut Vec<Simplex128>,
@@ -523,10 +490,6 @@ fn assemble_edge_candidates(
     dist.for_each_common_neighbor_edges(v0, v1, floor, |w, d0, d1| {
         let extra = d0.max(d1);
         let diam = base.max(extra);
-        if diam > threshold {
-            return true;
-        }
-
         let tau = Simplex128::from_sorted_desc(diam, &[w, v0, v1]);
         if build_pool {
             next_simplices.push(tau);
@@ -545,7 +508,7 @@ fn assemble_edge_candidates(
                 diam_edges |= edge_bit(1, 2);
             }
             let tau_verts = [w, v0, v1, 0, 0, 0];
-            if keep_fused_candidate(dist, tau, &tau_verts, 3, diam_edges, threshold) {
+            if keep_fused_candidate(dist, tau, &tau_verts, 3, diam_edges) {
                 columns_to_reduce.push(tau);
             }
         }
@@ -557,13 +520,12 @@ fn assemble_edge_candidates(
 fn assemble_generic_candidates(
     dist: &BitCsrDistanceMatrix,
     sigma: Simplex128,
-    threshold: f32,
     cleared_pivots: &FxHashMap<Simplex128, ()>,
     build_pool: bool,
     next_simplices: &mut Vec<Simplex128>,
     columns_to_reduce: &mut Vec<Simplex128>,
 ) {
-    for_each_cofacet(dist, sigma, false, threshold, |tau| {
+    for_each_cofacet(dist, sigma, false, |tau| {
         if build_pool {
             next_simplices.push(tau);
         }
@@ -571,7 +533,7 @@ fn assemble_generic_candidates(
             let vc = tau.vertex_count();
             let verts = tau.vertices();
             let diam_edges = diameter_edge_mask(dist, &verts, vc, !tau.filtration_encoded());
-            if keep_fused_candidate(dist, tau, &verts, vc, diam_edges, threshold) {
+            if keep_fused_candidate(dist, tau, &verts, vc, diam_edges) {
                 columns_to_reduce.push(tau);
             }
         }
@@ -588,9 +550,8 @@ fn keep_fused_candidate(
     tau_verts: &[u16; 6],
     vc: usize,
     diam_edges: u64,
-    threshold: f32,
 ) -> bool {
-    !is_zero_apparent_facet_side(dist, tau, tau_verts, vc, diam_edges, threshold)
+    !is_zero_apparent_facet_side(dist, tau, tau_verts, vc, diam_edges)
         && !is_zero_apparent_cofacet_side(dist, tau, tau_verts, vc, diam_edges)
 }
 
@@ -625,9 +586,8 @@ fn is_zero_apparent_facet_side(
     tau_verts: &[u16; 6],
     vc: usize,
     diam_edges: u64,
-    threshold: f32,
 ) -> bool {
-    if vc >= 6 || tau.filtration() > threshold {
+    if vc >= 6 {
         return false;
     }
 
@@ -720,17 +680,12 @@ fn remap_edge_mask_after_insert(mask: u64, vc: usize, rank: usize) -> u64 {
 // Main loop
 // ═══════════════════════════════════════════════════════════════════════════════
 
-pub fn compute(
-    dist: &BitCsrDistanceMatrix,
-    threshold: f32,
-    max_dim: usize,
-    parallel: bool,
-) -> BarcodeResult {
+pub fn compute(dist: &BitCsrDistanceMatrix, max_dim: usize, parallel: bool) -> BarcodeResult {
     let mut intervals: Vec<Vec<PersistenceInterval>> = Vec::with_capacity(max_dim + 1);
 
     // H0: union-find. No clearing input needed (no previous dim).
     let mut h0 = Vec::new();
-    let (mut simplices, mut columns_to_reduce) = compute_h0(dist, threshold, &mut h0);
+    let (mut simplices, mut columns_to_reduce) = compute_h0(dist, &mut h0);
     intervals.push(h0);
 
     // Cleared-pivot set for the clearing optimization. Populated by
@@ -749,7 +704,6 @@ pub fn compute(
         compute_pairs(
             &columns_to_reduce,
             dist,
-            threshold,
             &mut dim_intervals,
             &mut cleared_pivots,
         );
@@ -757,14 +711,8 @@ pub fn compute(
 
         if dim < max_dim {
             let build_pool = dim + 1 < max_dim;
-            columns_to_reduce = assemble_candidates(
-                dist,
-                &mut simplices,
-                threshold,
-                &cleared_pivots,
-                build_pool,
-                parallel,
-            );
+            columns_to_reduce =
+                assemble_candidates(dist, &mut simplices, &cleared_pivots, build_pool, parallel);
         }
     }
 
@@ -785,9 +733,8 @@ mod tests {
     fn run(lt: &[f32], n: usize, threshold: f32, max_dim: usize) -> BarcodeResult {
         let sq = square_from_lower_tri(n, lt);
         let adj = dmat_csr(&sq, n, threshold);
-        let eff = threshold.min(adj.r_cheb);
-        let bitcsr = BitCsrDistanceMatrix::from_csr_parts(n, adj.row_ptr, adj.col, adj.val, eff);
-        compute(&bitcsr, eff, max_dim, true)
+        let bitcsr = BitCsrDistanceMatrix::from_csr_parts(n, adj.row_ptr, adj.col, adj.val);
+        compute(&bitcsr, max_dim, true)
     }
 
     fn approx_eq(a: f32, b: f32, tol: f32) -> bool {

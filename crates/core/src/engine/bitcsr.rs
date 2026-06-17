@@ -23,7 +23,6 @@
 /// `val[val_ptr[wi]..val_ptr[wi + 1]]`, ordered from high bit to low bit.
 pub struct BitCsrDistanceMatrix {
     n: usize,
-    threshold: f32,
     word_ptr: Vec<u32>,
     words: Vec<u64>,
     val_ptr: Vec<u32>,
@@ -36,15 +35,8 @@ impl BitCsrDistanceMatrix {
     /// Pack descending-sorted CSR rows into the bitset representation.
     ///
     /// `col[row_ptr[v]..row_ptr[v + 1]]` are vertex `v`'s neighbours in
-    /// DESCENDING id order, with parallel distances in `val`. `threshold` is the
-    /// effective cofacet threshold to store on the matrix.
-    fn from_sorted_rows(
-        n: usize,
-        row_ptr: &[usize],
-        col: &[u16],
-        val: &[f32],
-        threshold: f32,
-    ) -> Self {
+    /// DESCENDING id order, with parallel distances in `val`.
+    fn from_sorted_rows(n: usize, row_ptr: &[usize], col: &[u16], val: &[f32]) -> Self {
         let nnz = col.len();
         let mut word_ptr = Vec::with_capacity(n + 1);
         let mut words = Vec::new();
@@ -113,7 +105,6 @@ impl BitCsrDistanceMatrix {
 
         Self {
             n,
-            threshold,
             word_ptr,
             words,
             val_ptr,
@@ -122,14 +113,12 @@ impl BitCsrDistanceMatrix {
     }
 
     /// Build directly from raw CSR parts produced by the point-cloud preprocessor
-    /// (`pdist_csr`). Rows must be descending by neighbour id; `threshold` is the
-    /// effective threshold (`user_threshold.min(r_cheb)`).
+    /// (`pdist_csr`). Rows must be descending by neighbour id.
     pub(crate) fn from_csr_parts(
         n: usize,
         row_ptr: Vec<usize>,
         col: Vec<u16>,
         val: Vec<f32>,
-        threshold: f32,
     ) -> Self {
         debug_assert_eq!(row_ptr.len(), n + 1);
         debug_assert_eq!(col.len(), val.len());
@@ -138,7 +127,7 @@ impl BitCsrDistanceMatrix {
             .windows(2)
             .all(|w| w[0] > w[1])));
 
-        Self::from_sorted_rows(n, &row_ptr, &col, &val, threshold)
+        Self::from_sorted_rows(n, &row_ptr, &col, &val)
     }
 
     // ── Accessors ─────────────────────────────────────────────────────────────
@@ -146,12 +135,6 @@ impl BitCsrDistanceMatrix {
     #[inline(always)]
     pub(crate) fn n(&self) -> usize {
         self.n
-    }
-
-    /// Effective cofacet threshold baked into the matrix at construction.
-    #[inline(always)]
-    pub(crate) fn threshold(&self) -> f32 {
-        self.threshold
     }
 
     #[inline(always)]
@@ -500,7 +483,7 @@ mod tests {
         let adj = dmat_csr(&sq, n, threshold);
         let eff = threshold.min(adj.r_cheb);
         (
-            BitCsrDistanceMatrix::from_csr_parts(n, adj.row_ptr, adj.col, adj.val, eff),
+            BitCsrDistanceMatrix::from_csr_parts(n, adj.row_ptr, adj.col, adj.val),
             eff,
         )
     }
@@ -509,8 +492,8 @@ mod tests {
     /// barcodes on the same input.
     fn seq_par_check(lt: &[f32], n: usize, threshold: f32, max_dim: usize) {
         let (bitcsr, eff) = bitcsr_from_lower_tri(lt, n, threshold);
-        let seq = compute(&bitcsr, eff, max_dim, false);
-        let par = compute(&bitcsr, eff, max_dim, true);
+        let seq = compute(&bitcsr, max_dim, false);
+        let par = compute(&bitcsr, max_dim, true);
         assert!(
             barcodes_equal(&seq, &par),
             "seq vs par barcode mismatch (n={n}, eff={eff}, max_dim={max_dim})\n seq={:?}\n par={:?}",
@@ -535,10 +518,10 @@ mod tests {
         let mut data = vec![f32::MAX; n * (n - 1) / 2];
         data[65 * 64 / 2 + 50] = 1.0;
 
-        let (bitcsr, eff) = bitcsr_from_lower_tri(&data, n, 1.0);
+        let (bitcsr, _eff) = bitcsr_from_lower_tri(&data, n, 1.0);
 
         let mut edges = Vec::new();
-        for_each_edge(&bitcsr, eff, |edge| {
+        for_each_edge(&bitcsr, |edge| {
             edges.push(edge.vertices());
             true
         });
