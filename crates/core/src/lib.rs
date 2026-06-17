@@ -37,10 +37,9 @@ pub fn persistent_homology(
     validate_params(n, max_dim, threshold)?;
 
     if quotient || peel {
-        let (lt, c_star, minimax) = condense_points(points, n, d)?;
-        return Ok(run_dense_pipeline(
-            lt, n, c_star, minimax, max_dim, threshold, quotient, peel,
-        ));
+        // The quotient/peel optimizations rewrote dense distances and fed the
+        // (now-removed) dense reduction path. Pending a re-route through BitCSR.
+        todo!("quotient/peel reduction path removed in the BitCSR engine refactor");
     }
 
     run_bitcsr_points(points, n, d, max_dim, threshold, true)
@@ -62,20 +61,17 @@ pub fn persistent_homology_from_distances(
     validate_params(n, max_dim, threshold)?;
 
     if quotient || peel {
-        let (lt, c_star, minimax) = condense_distances(distances, n)?;
-        return Ok(run_dense_pipeline(
-            lt, n, c_star, minimax, max_dim, threshold, quotient, peel,
-        ));
+        // The quotient/peel optimizations rewrote dense distances and fed the
+        // (now-removed) dense reduction path. Pending a re-route through BitCSR.
+        todo!("quotient/peel reduction path removed in the BitCSR engine refactor");
     }
 
     validate_distance_shape(distances, n)?;
     let user_t = threshold.unwrap_or(f32::INFINITY);
     let (dist, _) = DistanceMatrix::from_square_matrix(distances, n);
-    let (bitcsr, r_cheb) = engine::bitcsr_from_distance_matrix(&dist, user_t);
+    let (bitcsr, r_cheb) = engine::BitCsrDistanceMatrix::from_distance_matrix(&dist, user_t);
     let eff = user_t.min(r_cheb);
-    Ok(engine::algorithm::compute_bitcsr(
-        &bitcsr, eff, max_dim, true,
-    ))
+    Ok(engine::algorithm::compute(&bitcsr, eff, max_dim, true))
 }
 
 fn run_bitcsr_points(
@@ -90,30 +86,8 @@ fn run_bitcsr_points(
     let user_t = threshold.unwrap_or(f32::INFINITY);
     let (row_ptr, col, val, r_cheb) = preprocess::pdist::pdist_csr(points, n, d, user_t);
     let eff = user_t.min(r_cheb);
-    let csr = engine::CsrDistanceMatrix::from_csr_parts(n, row_ptr, col, val);
-    let bitcsr = engine::BitCsrDistanceMatrix::from_csr(&csr, eff);
-    Ok(engine::algorithm::compute_bitcsr(
-        &bitcsr, eff, max_dim, parallel,
-    ))
-}
-
-// ═══════════════════════════════════════════════════════════════════════════════
-// Shared pipeline
-// ═══════════════════════════════════════════════════════════════════════════════
-
-fn run_dense_pipeline(
-    mut lt: Vec<f32>,
-    n: usize,
-    c_star: usize,
-    minimax: f32,
-    max_dim: usize,
-    threshold: Option<f32>,
-    quotient: bool,
-    peel: bool,
-) -> BarcodeResult {
-    let t = apply_optimizations(&mut lt, c_star, minimax, threshold, quotient, peel);
-    let dist = DistanceMatrix::from_lower_triangular(n, lt);
-    engine::algorithm::compute(&dist, t, max_dim)
+    let bitcsr = engine::BitCsrDistanceMatrix::from_csr_parts(n, row_ptr, col, val, eff);
+    Ok(engine::algorithm::compute(&bitcsr, eff, max_dim, parallel))
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════

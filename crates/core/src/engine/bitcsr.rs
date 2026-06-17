@@ -1,5 +1,5 @@
 // ═══════════════════════════════════════════════════════════════════════════════
-// bitcsr.rs — tail-truncated bitset sparse backend
+// bitcsr.rs — tail-truncated bitset sparse distance matrix (the data structure)
 // ═══════════════════════════════════════════════════════════════════════════════
 //
 // `BitCsrDistanceMatrix` stores one tail-truncated adjacency bitset per vertex,
@@ -7,17 +7,17 @@
 // so a neighbour id is implicit in the bit position and its distance is found by
 // one popcount rank inside the word. The hot cofacet operation is therefore a
 // k-way AND over aligned `u64` blocks followed by set-bit iteration.
+//
+// This file owns ONLY the representation and its primitive bit/neighbour
+// operations. It knows nothing about simplices, cofacets, apparent pairs, or
+// reduction columns — those live in the Ripser algorithm layer (`algorithm.rs`),
+// which drives this structure through the `pub(crate)` primitives below.
 
-use crate::engine::csr::{csr_from_distance_matrix, CsrDistanceMatrix};
 use crate::engine::distance::DistanceMatrix;
-use crate::engine::filtration::Filtration;
-use crate::engine::simplex::{encode_filtration, FxHashMap, Simplex128};
 
-/// Minimum number of input simplices before `assemble_candidates` uses rayon.
-/// Below this the per-task overhead and buffer merges outweigh the work, so we
-/// stay on the sequential, single-allocation path (this also covers H1 and
-/// small datasets even when the caller requests `parallel`).
-const PARALLEL_ASSEMBLE_THRESHOLD: usize = 512;
+/// Entries `>= NO_EDGE` are "no edge" and are excluded from the enclosing-radius
+/// reduction, mirroring `distance.rs`.
+const NO_EDGE: f32 = f32::MAX;
 
 /// Sparse distance matrix as flattened tail-truncated bitsets plus per-bit
 /// distances.
@@ -37,12 +37,25 @@ pub struct BitCsrDistanceMatrix {
 }
 
 impl BitCsrDistanceMatrix {
-    pub(crate) fn from_csr(csr: &CsrDistanceMatrix, threshold: f32) -> Self {
-        let n = csr.n();
+    // ── Construction ──────────────────────────────────────────────────────────
+
+    /// Pack descending-sorted CSR rows into the bitset representation.
+    ///
+    /// `col[row_ptr[v]..row_ptr[v + 1]]` are vertex `v`'s neighbours in
+    /// DESCENDING id order, with parallel distances in `val`. `threshold` is the
+    /// effective cofacet threshold to store on the matrix.
+    fn from_sorted_rows(
+        n: usize,
+        row_ptr: &[usize],
+        col: &[u16],
+        val: &[f32],
+        threshold: f32,
+    ) -> Self {
+        let nnz = col.len();
         let mut word_ptr = Vec::with_capacity(n + 1);
         let mut words = Vec::new();
         let mut val_ptr = Vec::new();
-        let mut val = Vec::with_capacity(csr.nnz());
+        let mut val_out = Vec::with_capacity(nnz);
 
         let mut counts: Vec<usize> = Vec::new();
         let mut offsets: Vec<usize> = Vec::new();
@@ -53,20 +66,23 @@ impl BitCsrDistanceMatrix {
         val_ptr.push(0);
 
         for v in 0..n {
-            let (col, row_val) = csr.neighbors(v);
-            if col.is_empty() {
+            let s = row_ptr[v];
+            let e = row_ptr[v + 1];
+            let col_row = &col[s..e];
+            let val_row = &val[s..e];
+            if col_row.is_empty() {
                 word_ptr.push(to_u32(words.len(), "bitcsr word count"));
                 continue;
             }
 
-            let word_len = ((col[0] as usize) >> 6) + 1;
+            let word_len = ((col_row[0] as usize) >> 6) + 1;
             let row_start = words.len();
             words.resize(row_start + word_len, 0);
 
             counts.clear();
             counts.resize(word_len, 0);
 
-            for &u in col {
+            for &u in col_row {
                 let block = (u as usize) >> 6;
                 words[row_start + block] |= 1u64 << (u & 63);
                 counts[block] += 1;
@@ -81,9 +97,9 @@ impl BitCsrDistanceMatrix {
             cursor.clear();
             cursor.resize(word_len, 0);
             row_vals.clear();
-            row_vals.resize(col.len(), 0.0);
+            row_vals.resize(col_row.len(), 0.0);
 
-            for (&u, &d) in col.iter().zip(row_val.iter()) {
+            for (&u, &d) in col_row.iter().zip(val_row.iter()) {
                 let block = (u as usize) >> 6;
                 let dst = offsets[block] + cursor[block];
                 row_vals[dst] = d;
@@ -91,15 +107,15 @@ impl BitCsrDistanceMatrix {
             }
 
             for block in 0..word_len {
-                val.extend_from_slice(&row_vals[offsets[block]..offsets[block + 1]]);
-                val_ptr.push(to_u32(val.len(), "bitcsr value count"));
+                val_out.extend_from_slice(&row_vals[offsets[block]..offsets[block + 1]]);
+                val_ptr.push(to_u32(val_out.len(), "bitcsr value count"));
             }
             word_ptr.push(to_u32(words.len(), "bitcsr word count"));
         }
 
         debug_assert_eq!(word_ptr.len(), n + 1);
         debug_assert_eq!(val_ptr.len(), words.len() + 1);
-        debug_assert_eq!(val.len(), csr.nnz());
+        debug_assert_eq!(val_out.len(), nnz);
 
         Self {
             n,
@@ -107,26 +123,138 @@ impl BitCsrDistanceMatrix {
             word_ptr,
             words,
             val_ptr,
-            val,
+            val: val_out,
         }
     }
 
-    #[allow(dead_code)]
+    /// Build directly from raw CSR parts produced by the point-cloud preprocessor
+    /// (`pdist_csr`). Rows must be descending by neighbour id; `threshold` is the
+    /// effective threshold (`user_threshold.min(r_cheb)`).
+    pub(crate) fn from_csr_parts(
+        n: usize,
+        row_ptr: Vec<usize>,
+        col: Vec<u16>,
+        val: Vec<f32>,
+        threshold: f32,
+    ) -> Self {
+        debug_assert_eq!(row_ptr.len(), n + 1);
+        debug_assert_eq!(col.len(), val.len());
+        debug_assert_eq!(*row_ptr.last().unwrap_or(&0), col.len());
+        debug_assert!((0..n).all(|v| col[row_ptr[v]..row_ptr[v + 1]]
+            .windows(2)
+            .all(|w| w[0] > w[1])));
+
+        Self::from_sorted_rows(n, &row_ptr, &col, &val, threshold)
+    }
+
+    /// Build from a dense lower-triangular distance matrix, keeping only edges
+    /// within the effective threshold. Returns `(matrix, r_cheb)` where `r_cheb`
+    /// is the Chebyshev (minimax) radius; the matrix stores
+    /// `threshold.min(r_cheb)` as its effective threshold. Supports
+    /// distance-matrix inputs and tests.
+    pub(crate) fn from_distance_matrix(dist: &DistanceMatrix, threshold: f32) -> (Self, f32) {
+        let n = dist.n();
+        if n < 2 {
+            let row_ptr = vec![0usize; n + 1];
+            let bitcsr = Self::from_sorted_rows(n, &row_ptr, &[], &[], threshold);
+            return (bitcsr, f32::INFINITY);
+        }
+
+        let raw = dist.raw();
+
+        let mut ecc = vec![f32::NEG_INFINITY; n];
+        {
+            let mut p = 0;
+            for i in 1..n {
+                let mut row_max = ecc[i];
+                for j in 0..i {
+                    let d = raw[p];
+                    p += 1;
+                    if d < NO_EDGE {
+                        if d > row_max {
+                            row_max = d;
+                        }
+                        if d > ecc[j] {
+                            ecc[j] = d;
+                        }
+                    }
+                }
+                ecc[i] = row_max;
+            }
+        }
+        let r_cheb = ecc
+            .iter()
+            .copied()
+            .filter(|&m| m > f32::NEG_INFINITY)
+            .fold(f32::INFINITY, f32::min);
+        let eff = threshold.min(r_cheb);
+
+        let mut row_ptr = vec![0usize; n + 1];
+        {
+            let mut p = 0;
+            for i in 1..n {
+                for j in 0..i {
+                    let d = raw[p];
+                    p += 1;
+                    if d <= eff && d < NO_EDGE {
+                        row_ptr[i + 1] += 1;
+                        row_ptr[j + 1] += 1;
+                    }
+                }
+            }
+            for v in 0..n {
+                row_ptr[v + 1] += row_ptr[v];
+            }
+        }
+
+        let nnz = row_ptr[n];
+        let mut col = vec![0u16; nnz];
+        let mut val = vec![0.0f32; nnz];
+
+        {
+            let mut cur = row_ptr[..n].to_vec();
+            let mut p = 0;
+            for i in 1..n {
+                for j in 0..i {
+                    let d = raw[p];
+                    p += 1;
+                    if d <= eff && d < NO_EDGE {
+                        let ci = cur[i];
+                        col[ci] = j as u16;
+                        val[ci] = d;
+                        cur[i] = ci + 1;
+
+                        let cj = cur[j];
+                        col[cj] = i as u16;
+                        val[cj] = d;
+                        cur[j] = cj + 1;
+                    }
+                }
+            }
+        }
+
+        // BitCSR needs neighbours descending by id.
+        for v in 0..n {
+            let s = row_ptr[v];
+            let e = row_ptr[v + 1];
+            col[s..e].reverse();
+            val[s..e].reverse();
+        }
+
+        (Self::from_sorted_rows(n, &row_ptr, &col, &val, eff), r_cheb)
+    }
+
+    // ── Accessors ─────────────────────────────────────────────────────────────
+
     #[inline(always)]
-    pub fn n(&self) -> usize {
+    pub(crate) fn n(&self) -> usize {
         self.n
     }
 
-    #[allow(dead_code)]
+    /// Effective cofacet threshold baked into the matrix at construction.
     #[inline(always)]
-    pub fn nnz(&self) -> usize {
-        self.val.len()
-    }
-
-    #[allow(dead_code)]
-    #[inline(always)]
-    pub fn bit_words(&self) -> usize {
-        self.words.len()
+    pub(crate) fn threshold(&self) -> f32 {
+        self.threshold
     }
 
     #[inline(always)]
@@ -153,8 +281,9 @@ impl BitCsrDistanceMatrix {
         unsafe { *self.val.get_unchecked(start + rank) }
     }
 
+    /// Distance between an existing edge `(a, b)`. Debug-asserts the edge exists.
     #[inline(always)]
-    fn edge_dist(&self, a: u16, b: u16) -> f32 {
+    pub(crate) fn edge_dist(&self, a: u16, b: u16) -> f32 {
         let block = (b as usize) >> 6;
         let bit = (b as usize) & 63;
         let row_start = self.row_start(a as usize);
@@ -171,13 +300,20 @@ impl BitCsrDistanceMatrix {
         self.word_distance_unchecked(flat, word, bit)
     }
 
+    /// Encoded (raw u32 bits) distance of edge `(a, b)`.
     #[inline(always)]
-    fn edge_dist_bits(&self, a: u16, b: u16) -> u32 {
+    pub(crate) fn edge_dist_bits(&self, a: u16, b: u16) -> u32 {
         self.edge_dist(a, b).to_bits()
     }
 
+    // ── Neighbour enumeration primitives ──────────────────────────────────────
+
+    /// Enumerate the common neighbours of `verts[0..vc]` whose id exceeds `floor`
+    /// (pass `-1` for no floor), youngest-first (descending id). For each, `f`
+    /// receives the neighbour id and `max_extra` — the largest distance from that
+    /// neighbour to any vertex in the set. Return `false` from `f` to stop.
     #[inline]
-    fn for_each_common_neighbor(
+    pub(crate) fn for_each_common_neighbor(
         &self,
         verts: &[u16; 6],
         vc: usize,
@@ -231,8 +367,11 @@ impl BitCsrDistanceMatrix {
         }
     }
 
+    /// Specialised common-neighbour enumeration for an edge `(v0, v1)` that
+    /// yields BOTH edge distances `(w, d(w,v0), d(w,v1))`, youngest-first above
+    /// `floor`. Return `false` from `f` to stop.
     #[inline]
-    fn for_each_common_neighbor_edges(
+    pub(crate) fn for_each_common_neighbor_edges(
         &self,
         v0: u16,
         v1: u16,
@@ -274,6 +413,39 @@ impl BitCsrDistanceMatrix {
                 let d0 = self.word_distance_unchecked(f0, word0, bit);
                 let d1 = self.word_distance_unchecked(f1, word1, bit);
                 if !f(w, d0, d1) {
+                    return;
+                }
+            }
+        }
+    }
+
+    /// Enumerate vertex `v`'s neighbours with id `> v`, youngest-first, each with
+    /// its edge distance. This is the per-row primitive H0 edge enumeration is
+    /// built from. Return `false` from `f` to stop.
+    #[inline]
+    pub(crate) fn for_each_neighbor_above(&self, v: usize, mut f: impl FnMut(u16, f32) -> bool) {
+        let row_start = self.row_start(v);
+        let row_len = self.row_len(v);
+        if row_len == 0 {
+            return;
+        }
+        let floor_block = v >> 6;
+        if floor_block >= row_len {
+            return;
+        }
+        for block in (floor_block..row_len).rev() {
+            let flat = row_start + block;
+            let word = unsafe { *self.words.get_unchecked(flat) };
+            let mut iter_word = word;
+            if block == floor_block {
+                iter_word &= bits_above(v & 63);
+            }
+            while iter_word != 0 {
+                let bit = highest_set_bit(iter_word);
+                iter_word &= !(1u64 << bit);
+                let w = ((block << 6) | bit) as u16;
+                let d = self.word_distance_unchecked(flat, word, bit);
+                if !f(w, d) {
                     return;
                 }
             }
@@ -369,493 +541,6 @@ impl BitCsrDistanceMatrix {
             }
         }
     }
-
-    #[inline]
-    fn cofacets(
-        &self,
-        sigma: Simplex128,
-        all_cofacets: bool,
-        threshold: f32,
-        mut f: impl FnMut(Simplex128) -> bool,
-    ) {
-        let vc = sigma.vertex_count();
-        if vc == 0 || sigma.filtration() > threshold {
-            return;
-        }
-
-        let verts = sigma.vertices();
-        let base = sigma.filtration();
-        let floor: i32 = if all_cofacets {
-            -1
-        } else {
-            sigma.largest_vertex() as i32
-        };
-        let check_threshold = threshold < self.threshold;
-
-        let payload = sigma.vertex_key();
-        let mut vi = 0usize;
-        let mut payload_upper: u128 = 0;
-        let mut payload_lower_shifted: u128 = payload >> 16;
-        let mut insert_shift: u32 = 80;
-
-        self.for_each_common_neighbor(&verts, vc, floor, |w, extra| {
-            let old_vi = vi;
-            while vi < vc && verts[vi] > w {
-                vi += 1;
-            }
-            if vi != old_vi {
-                let split = 96 - (vi as u32) * 16;
-                let upper_mask = (!0u128) << split;
-                payload_upper = payload & upper_mask;
-                payload_lower_shifted = (payload & !upper_mask) >> 16;
-                insert_shift = split - 16;
-            }
-
-            let diam = if extra > base { extra } else { base };
-            if check_threshold && diam > threshold {
-                return true;
-            }
-
-            let w_ins = (w as u128) + 1;
-            let cof = Simplex128(
-                ((encode_filtration(diam) as u128) << 96)
-                    | payload_upper
-                    | (w_ins << insert_shift)
-                    | payload_lower_shifted,
-            );
-            f(cof)
-        });
-    }
-
-    #[inline]
-    fn first_common_neighbor_le(&self, verts: &[u16; 6], vc: usize, max_extra: f32) -> Option<u16> {
-        let mut result = None;
-        self.for_each_common_neighbor(verts, vc, -1, |w, extra| {
-            if extra <= max_extra {
-                result = Some(w);
-                false
-            } else {
-                true
-            }
-        });
-        result
-    }
-
-    #[inline]
-    fn facet_diameter(&self, verts: &[u16; 6], vc: usize, skip: usize) -> f32 {
-        let mut diam = 0.0f32;
-        for i in 0..vc {
-            if i == skip {
-                continue;
-            }
-            for j in (i + 1)..vc {
-                if j == skip {
-                    continue;
-                }
-                let d = self.edge_dist(verts[i], verts[j]);
-                if d > diam {
-                    diam = d;
-                }
-            }
-        }
-        diam
-    }
-
-    #[inline]
-    fn diameter_edge_mask(&self, verts: &[u16; 6], vc: usize, diam_bits: u32) -> u64 {
-        let mut mask = 0u64;
-        for i in 0..vc {
-            for j in (i + 1)..vc {
-                if self.edge_dist_bits(verts[i], verts[j]) == diam_bits {
-                    mask |= edge_bit(i, j);
-                }
-            }
-        }
-        mask
-    }
-
-    #[inline]
-    fn zero_pivot_facet(&self, tau: Simplex128) -> Option<Simplex128> {
-        let target = tau.filtration_encoded();
-        let verts = tau.vertices();
-        let vc = tau.vertex_count();
-
-        if vc >= 3 {
-            let diam_edges = self.diameter_edge_mask(&verts, vc, !target);
-            if let Some(skip) = oldest_same_diam_facet_slot(vc, diam_edges) {
-                return Some(tau.remove_vertex_at(skip, target));
-            }
-            return None;
-        }
-
-        for k in 0..vc {
-            let diam = self.facet_diameter(&verts, vc, k);
-            if encode_filtration(diam) == target {
-                return Some(tau.remove_vertex_at(k, target));
-            }
-        }
-        None
-    }
-
-    #[inline]
-    fn zero_pivot_cofacet(&self, sigma: Simplex128, threshold: f32) -> Option<Simplex128> {
-        let same_diam = sigma.filtration();
-        if same_diam > threshold {
-            return None;
-        }
-        let vc = sigma.vertex_count();
-        if vc == 0 {
-            return None;
-        }
-        let verts = sigma.vertices();
-        let w = self.first_common_neighbor_le(&verts, vc, same_diam)?;
-        Some(sigma.cofacet(w, sigma.filtration_encoded()))
-    }
-
-    pub(crate) fn assemble_candidates(
-        &self,
-        simplices: &mut Vec<Simplex128>,
-        threshold: f32,
-        cleared_pivots: &FxHashMap<Simplex128, ()>,
-        build_pool: bool,
-        parallel: bool,
-    ) -> Vec<Simplex128> {
-        if simplices.is_empty() {
-            return Vec::new();
-        }
-
-        // Each simplex expands independently: the only inputs are the immutable
-        // matrix and the frozen `cleared_pivots`, and outputs are pure appends.
-        // So the loop parallelises by giving each worker its own buffers and
-        // concatenating; the final sort makes the merge order irrelevant. The
-        // size guard keeps small inputs (and every H1/small-dataset case) on the
-        // allocation-free sequential path where rayon's overhead would dominate.
-        let use_par = parallel && simplices.len() >= PARALLEL_ASSEMBLE_THRESHOLD;
-
-        let (next_simplices, mut columns_to_reduce) = if use_par {
-            use rayon::prelude::*;
-            simplices
-                .par_iter()
-                .fold(
-                    || (Vec::new(), Vec::new()),
-                    |(mut next_local, mut cols_local), &sigma| {
-                        self.assemble_one(
-                            sigma,
-                            threshold,
-                            cleared_pivots,
-                            build_pool,
-                            &mut next_local,
-                            &mut cols_local,
-                        );
-                        (next_local, cols_local)
-                    },
-                )
-                .reduce(
-                    || (Vec::new(), Vec::new()),
-                    |(mut na, mut ca), (nb, cb)| {
-                        na.extend(nb);
-                        ca.extend(cb);
-                        (na, ca)
-                    },
-                )
-        } else {
-            let mut next_simplices: Vec<Simplex128> = if build_pool {
-                Vec::with_capacity(simplices.len() * 2)
-            } else {
-                Vec::new()
-            };
-            let mut columns_to_reduce: Vec<Simplex128> = Vec::with_capacity(simplices.len());
-            for &sigma in simplices.iter() {
-                self.assemble_one(
-                    sigma,
-                    threshold,
-                    cleared_pivots,
-                    build_pool,
-                    &mut next_simplices,
-                    &mut columns_to_reduce,
-                );
-            }
-            (next_simplices, columns_to_reduce)
-        };
-
-        if use_par {
-            use rayon::prelude::*;
-            columns_to_reduce.par_sort_unstable();
-        } else {
-            columns_to_reduce.sort_unstable();
-        }
-        if build_pool {
-            *simplices = next_simplices;
-        }
-        columns_to_reduce
-    }
-
-    #[inline]
-    fn assemble_one(
-        &self,
-        sigma: Simplex128,
-        threshold: f32,
-        cleared_pivots: &FxHashMap<Simplex128, ()>,
-        build_pool: bool,
-        next_simplices: &mut Vec<Simplex128>,
-        columns_to_reduce: &mut Vec<Simplex128>,
-    ) {
-        if sigma.vertex_count() == 2 {
-            self.assemble_edge_candidates(
-                sigma,
-                threshold,
-                cleared_pivots,
-                build_pool,
-                next_simplices,
-                columns_to_reduce,
-            );
-        } else {
-            self.assemble_generic_candidates(
-                sigma,
-                threshold,
-                cleared_pivots,
-                build_pool,
-                next_simplices,
-                columns_to_reduce,
-            );
-        }
-    }
-
-    #[inline]
-    fn assemble_edge_candidates(
-        &self,
-        sigma: Simplex128,
-        threshold: f32,
-        cleared_pivots: &FxHashMap<Simplex128, ()>,
-        build_pool: bool,
-        next_simplices: &mut Vec<Simplex128>,
-        columns_to_reduce: &mut Vec<Simplex128>,
-    ) {
-        let verts = sigma.vertices();
-        let v0 = verts[0];
-        let v1 = verts[1];
-        let base = sigma.filtration();
-        let base_bits = !sigma.filtration_encoded();
-        let floor = sigma.largest_vertex() as i32;
-
-        self.for_each_common_neighbor_edges(v0, v1, floor, |w, d0, d1| {
-            let extra = d0.max(d1);
-            let diam = base.max(extra);
-            if diam > threshold {
-                return true;
-            }
-
-            let tau = Simplex128::from_sorted_desc(diam, &[w, v0, v1]);
-            if build_pool {
-                next_simplices.push(tau);
-            }
-
-            if !cleared_pivots.contains_key(&tau) {
-                let diam_bits = diam.to_bits();
-                let mut diam_edges = 0u64;
-                if d0.to_bits() == diam_bits {
-                    diam_edges |= edge_bit(0, 1);
-                }
-                if d1.to_bits() == diam_bits {
-                    diam_edges |= edge_bit(0, 2);
-                }
-                if base_bits == diam_bits {
-                    diam_edges |= edge_bit(1, 2);
-                }
-                let tau_verts = [w, v0, v1, 0, 0, 0];
-                if self.keep_fused_candidate(tau, &tau_verts, 3, diam_edges, threshold) {
-                    columns_to_reduce.push(tau);
-                }
-            }
-            true
-        });
-    }
-
-    #[inline]
-    fn assemble_generic_candidates(
-        &self,
-        sigma: Simplex128,
-        threshold: f32,
-        cleared_pivots: &FxHashMap<Simplex128, ()>,
-        build_pool: bool,
-        next_simplices: &mut Vec<Simplex128>,
-        columns_to_reduce: &mut Vec<Simplex128>,
-    ) {
-        self.cofacets(sigma, false, threshold, |tau| {
-            if build_pool {
-                next_simplices.push(tau);
-            }
-            if !cleared_pivots.contains_key(&tau) {
-                let vc = tau.vertex_count();
-                let verts = tau.vertices();
-                let diam_edges = self.diameter_edge_mask(&verts, vc, !tau.filtration_encoded());
-                if self.keep_fused_candidate(tau, &verts, vc, diam_edges, threshold) {
-                    columns_to_reduce.push(tau);
-                }
-            }
-            true
-        });
-    }
-
-    #[inline]
-    fn keep_fused_candidate(
-        &self,
-        tau: Simplex128,
-        tau_verts: &[u16; 6],
-        vc: usize,
-        diam_edges: u64,
-        threshold: f32,
-    ) -> bool {
-        !self.is_zero_apparent_facet_side(tau, tau_verts, vc, diam_edges, threshold)
-            && !self.is_zero_apparent_cofacet_side(tau, tau_verts, vc, diam_edges)
-    }
-
-    #[inline]
-    fn is_zero_apparent_cofacet_side(
-        &self,
-        tau: Simplex128,
-        tau_verts: &[u16; 6],
-        vc: usize,
-        diam_edges: u64,
-    ) -> bool {
-        let Some(skip) = oldest_same_diam_facet_slot(vc, diam_edges) else {
-            return false;
-        };
-
-        let mut facet_verts = [0u16; 6];
-        let mut out = 0usize;
-        for i in 0..vc {
-            if i != skip {
-                facet_verts[out] = tau_verts[i];
-                out += 1;
-            }
-        }
-
-        self.first_common_neighbor_le(&facet_verts, vc - 1, tau.filtration())
-            == Some(tau_verts[skip])
-    }
-
-    #[inline]
-    fn is_zero_apparent_facet_side(
-        &self,
-        tau: Simplex128,
-        tau_verts: &[u16; 6],
-        vc: usize,
-        diam_edges: u64,
-        threshold: f32,
-    ) -> bool {
-        if vc >= 6 || tau.filtration() > threshold {
-            return false;
-        }
-
-        let Some(w) = self.first_common_neighbor_le(tau_verts, vc, tau.filtration()) else {
-            return false;
-        };
-
-        let (_rho_verts, rank) = insert_vertex_desc(tau_verts, vc, w);
-        let mut rho_edges = remap_edge_mask_after_insert(diam_edges, vc, rank);
-        let diam_bits = !tau.filtration_encoded();
-        for i in 0..vc {
-            if self.edge_dist_bits(w, tau_verts[i]) == diam_bits {
-                let j = if i >= rank { i + 1 } else { i };
-                let (a, b) = if rank < j { (rank, j) } else { (j, rank) };
-                rho_edges |= edge_bit(a, b);
-            }
-        }
-
-        oldest_same_diam_facet_slot(vc + 1, rho_edges) == Some(rank)
-    }
-}
-
-impl Filtration for BitCsrDistanceMatrix {
-    #[inline(always)]
-    fn n(&self) -> usize {
-        self.n
-    }
-
-    #[inline]
-    fn for_each_edge(&self, threshold: f32, mut f: impl FnMut(Simplex128) -> bool) {
-        let check_threshold = threshold < self.threshold;
-        for v in 0..self.n {
-            let row_start = self.row_start(v);
-            let row_len = self.row_len(v);
-            if row_len == 0 {
-                continue;
-            }
-
-            let floor_block = v >> 6;
-            if floor_block >= row_len {
-                continue;
-            }
-            for block in (floor_block..row_len).rev() {
-                let flat = row_start + block;
-                let mut word = unsafe { *self.words.get_unchecked(flat) };
-                if block == floor_block {
-                    word &= bits_above(v & 63);
-                }
-                while word != 0 {
-                    let bit = highest_set_bit(word);
-                    word &= !(1u64 << bit);
-                    let w = ((block << 6) | bit) as u16;
-                    let d = self.word_distance_unchecked(
-                        flat,
-                        unsafe { *self.words.get_unchecked(flat) },
-                        bit,
-                    );
-                    if (!check_threshold || d <= threshold)
-                        && !f(Simplex128::from_sorted_desc(d, &[w, v as u16]))
-                    {
-                        return;
-                    }
-                }
-            }
-        }
-    }
-
-    #[inline]
-    fn for_each_cofacet(
-        &self,
-        sigma: Simplex128,
-        all_cofacets: bool,
-        threshold: f32,
-        f: impl FnMut(Simplex128) -> bool,
-    ) {
-        self.cofacets(sigma, all_cofacets, threshold, f);
-    }
-
-    #[inline]
-    fn zero_apparent_facet(&self, tau: Simplex128, threshold: f32) -> Option<Simplex128> {
-        let phi = self.zero_pivot_facet(tau)?;
-        let tau_check = self.zero_pivot_cofacet(phi, threshold)?;
-        if tau_check == tau {
-            Some(phi)
-        } else {
-            None
-        }
-    }
-
-    #[inline]
-    fn zero_apparent_cofacet(&self, sigma: Simplex128, threshold: f32) -> Option<Simplex128> {
-        let tau = self.zero_pivot_cofacet(sigma, threshold)?;
-        let phi = self.zero_pivot_facet(tau)?;
-        if phi == sigma {
-            Some(tau)
-        } else {
-            None
-        }
-    }
-
-    #[inline]
-    fn is_apparent_cofacet(&self, tau: Simplex128, threshold: f32) -> bool {
-        let sigma = match self.zero_pivot_facet(tau) {
-            Some(s) => s,
-            None => return false,
-        };
-        match self.zero_pivot_cofacet(sigma, threshold) {
-            Some(t) => t == tau,
-            None => false,
-        }
-    }
 }
 
 #[inline(always)]
@@ -865,13 +550,13 @@ fn to_u32(value: usize, what: &str) -> u32 {
 }
 
 #[inline(always)]
-fn highest_set_bit(word: u64) -> usize {
+pub(crate) fn highest_set_bit(word: u64) -> usize {
     debug_assert!(word != 0);
     63 - word.leading_zeros() as usize
 }
 
 #[inline(always)]
-fn bits_above(bit: usize) -> u64 {
+pub(crate) fn bits_above(bit: usize) -> u64 {
     if bit >= 63 {
         0
     } else {
@@ -879,82 +564,10 @@ fn bits_above(bit: usize) -> u64 {
     }
 }
 
-#[inline(always)]
-fn edge_bit(i: usize, j: usize) -> u64 {
-    debug_assert!(i < j && j < 6);
-    1u64 << (i * 6 + j)
-}
-
-#[inline]
-fn oldest_same_diam_facet_slot(vc: usize, diam_edges: u64) -> Option<usize> {
-    if vc < 3 || diam_edges == 0 {
-        return None;
-    }
-    for skip in 0..vc {
-        for i in 0..vc {
-            if i == skip {
-                continue;
-            }
-            for j in (i + 1)..vc {
-                if j != skip && (diam_edges & edge_bit(i, j)) != 0 {
-                    return Some(skip);
-                }
-            }
-        }
-    }
-    None
-}
-
-#[inline]
-fn insert_vertex_desc(verts: &[u16; 6], vc: usize, w: u16) -> ([u16; 6], usize) {
-    let mut out = [0u16; 6];
-    let mut i = 0usize;
-    while i < vc && verts[i] > w {
-        out[i] = verts[i];
-        i += 1;
-    }
-    let rank = i;
-    out[rank] = w;
-    while i < vc {
-        out[i + 1] = verts[i];
-        i += 1;
-    }
-    (out, rank)
-}
-
-#[inline]
-fn remap_edge_mask_after_insert(mask: u64, vc: usize, rank: usize) -> u64 {
-    let mut out = 0u64;
-    for i in 0..vc {
-        for j in (i + 1)..vc {
-            if (mask & edge_bit(i, j)) == 0 {
-                continue;
-            }
-            let ni = if i >= rank { i + 1 } else { i };
-            let nj = if j >= rank { j + 1 } else { j };
-            out |= edge_bit(ni, nj);
-        }
-    }
-    out
-}
-
-/// Build a bitset sparse matrix from a dense distance matrix, returning the
-/// same Chebyshev radius convention as the CSR builder.
-pub(crate) fn bitcsr_from_distance_matrix(
-    dist: &DistanceMatrix,
-    threshold: f32,
-) -> (BitCsrDistanceMatrix, f32) {
-    let (csr, r_cheb) = csr_from_distance_matrix(dist, threshold);
-    let eff = threshold.min(r_cheb);
-    (BitCsrDistanceMatrix::from_csr(&csr, eff), r_cheb)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::engine::algorithm::{compute, compute_bitcsr};
-    use crate::engine::csr::csr_from_distance_matrix;
-    use crate::engine::filtration::Filtration;
+    use crate::engine::algorithm::{compute, for_each_edge};
     use crate::types::BarcodeResult;
 
     fn barcodes_equal(a: &BarcodeResult, b: &BarcodeResult) -> bool {
@@ -982,25 +595,19 @@ mod tests {
         true
     }
 
-    fn diff_check(dist: &DistanceMatrix, threshold: f32, max_dim: usize) {
-        let (csr, r_cheb) = csr_from_distance_matrix(dist, threshold);
+    /// The sequential and parallel assembly paths must produce bit-identical
+    /// barcodes on the same input.
+    fn seq_par_check(dist: &DistanceMatrix, threshold: f32, max_dim: usize) {
+        let (bitcsr, r_cheb) = BitCsrDistanceMatrix::from_distance_matrix(dist, threshold);
         let eff = threshold.min(r_cheb);
-        let bitcsr = BitCsrDistanceMatrix::from_csr(&csr, eff);
-        let dense = compute(dist, eff, max_dim);
-        let sparse = compute_bitcsr(&bitcsr, eff, max_dim, false);
+        let seq = compute(&bitcsr, eff, max_dim, false);
+        let par = compute(&bitcsr, eff, max_dim, true);
         assert!(
-            barcodes_equal(&dense, &sparse),
-            "barcode mismatch (n={}, eff={eff}, max_dim={max_dim})\n dense={:?}\nsparse={:?}",
+            barcodes_equal(&seq, &par),
+            "seq vs par barcode mismatch (n={}, eff={eff}, max_dim={max_dim})\n seq={:?}\n par={:?}",
             dist.n(),
-            dense.intervals,
-            sparse.intervals,
-        );
-        // The parallel assembly must produce a bit-identical barcode.
-        let sparse_par = compute_bitcsr(&bitcsr, eff, max_dim, true);
-        assert!(
-            barcodes_equal(&dense, &sparse_par),
-            "parallel barcode mismatch (n={}, eff={eff}, max_dim={max_dim})",
-            dist.n(),
+            seq.intervals,
+            par.intervals,
         );
     }
 
@@ -1021,12 +628,11 @@ mod tests {
         data[65 * 64 / 2 + 50] = 1.0;
 
         let dist = DistanceMatrix::from_lower_triangular(n, data);
-        let (csr, r_cheb) = csr_from_distance_matrix(&dist, 1.0);
+        let (bitcsr, r_cheb) = BitCsrDistanceMatrix::from_distance_matrix(&dist, 1.0);
         let eff = 1.0f32.min(r_cheb);
-        let bitcsr = BitCsrDistanceMatrix::from_csr(&csr, eff);
 
         let mut edges = Vec::new();
-        bitcsr.for_each_edge(eff, |edge| {
+        for_each_edge(&bitcsr, eff, |edge| {
             edges.push(edge.vertices());
             true
         });
@@ -1037,7 +643,7 @@ mod tests {
     }
 
     #[test]
-    fn bitcsr_matches_dense_no_ties() {
+    fn bitcsr_seq_matches_par_no_ties() {
         for &(n, seed) in &[(5usize, 1u64), (8, 7), (12, 99), (20, 31337)] {
             let mut rng = xorshift(seed);
             let m = n * (n - 1) / 2;
@@ -1047,14 +653,14 @@ mod tests {
             let dist = DistanceMatrix::from_lower_triangular(n, data);
             for &thr in &[0.3f32, 0.6, 0.9, f32::INFINITY] {
                 for max_dim in 1..=3 {
-                    diff_check(&dist, thr, max_dim);
+                    seq_par_check(&dist, thr, max_dim);
                 }
             }
         }
     }
 
     #[test]
-    fn bitcsr_matches_dense_with_ties() {
+    fn bitcsr_seq_matches_par_with_ties() {
         for &(n, levels, seed) in &[(6usize, 2u64, 5), (8, 3, 17), (12, 3, 2024)] {
             let mut rng = xorshift(seed);
             let m = n * (n - 1) / 2;
@@ -1064,15 +670,15 @@ mod tests {
             let dist = DistanceMatrix::from_lower_triangular(n, data);
             for &thr in &[0.5f32, 1.0, 1.5, f32::INFINITY] {
                 for max_dim in 1..=3 {
-                    diff_check(&dist, thr, max_dim);
+                    seq_par_check(&dist, thr, max_dim);
                 }
             }
         }
     }
 
     /// Exercise the rayon path (n large enough to cross
-    /// `PARALLEL_ASSEMBLE_THRESHOLD`) and assert it equals both the sequential
-    /// sparse path and the dense path, with and without diameter ties.
+    /// `PARALLEL_ASSEMBLE_THRESHOLD`) and assert it equals the sequential sparse
+    /// path, with and without diameter ties.
     #[test]
     fn bitcsr_parallel_matches_sequential() {
         for &(n, seed, levels) in &[(80usize, 12345u64, 0u64), (80, 999, 6)] {
@@ -1094,20 +700,7 @@ mod tests {
                 // simplex pool across workers.
                 let max_dims: &[usize] = if thr.is_finite() { &[1, 2, 3] } else { &[1, 2] };
                 for &max_dim in max_dims {
-                    let (csr, r_cheb) = csr_from_distance_matrix(&dist, thr);
-                    let eff = thr.min(r_cheb);
-                    let bitcsr = BitCsrDistanceMatrix::from_csr(&csr, eff);
-                    let seq = compute_bitcsr(&bitcsr, eff, max_dim, false);
-                    let par = compute_bitcsr(&bitcsr, eff, max_dim, true);
-                    let dense = compute(&dist, eff, max_dim);
-                    assert!(
-                        barcodes_equal(&seq, &par),
-                        "seq vs par (n={n}, thr={thr}, d={max_dim})"
-                    );
-                    assert!(
-                        barcodes_equal(&dense, &par),
-                        "dense vs par (n={n}, thr={thr}, d={max_dim})"
-                    );
+                    seq_par_check(&dist, thr, max_dim);
                 }
             }
         }

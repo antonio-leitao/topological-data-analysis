@@ -2,7 +2,8 @@
 // reduction.rs — Implicit cohomological matrix reduction over Z/2
 // ═══════════════════════════════════════════════════════════════════════════════
 
-use crate::engine::filtration::Filtration;
+use crate::engine::algorithm::{for_each_cofacet, zero_apparent_facet};
+use crate::engine::bitcsr::BitCsrDistanceMatrix;
 use crate::engine::heap::FastHeap;
 use crate::engine::simplex::{FxHashMap, Simplex128};
 use crate::types::PersistenceInterval;
@@ -56,40 +57,40 @@ impl CompressedSparseMatrix {
 
 //hottest loop accounts for 55% of runtime
 #[inline]
-fn add_simplex_coboundary<F: Filtration>(
+fn add_simplex_coboundary(
     simplex: Simplex128,
-    filt: &F,
+    dist: &BitCsrDistanceMatrix,
     threshold: f32,
     working_v: &mut Vec<Simplex128>,
     working_coboundary: &mut FastHeap,
 ) {
     working_v.push(simplex);
-    filt.for_each_cofacet(simplex, true, threshold, |cofacet| {
+    for_each_cofacet(dist, simplex, true, threshold, |cofacet| {
         working_coboundary.push(cofacet);
         true
     });
 }
 
 #[inline]
-fn add_coboundary<F: Filtration>(
+fn add_coboundary(
     v_matrix: &CompressedSparseMatrix,
     columns: &[Simplex128],
     column_index: usize,
-    filt: &F,
+    dist: &BitCsrDistanceMatrix,
     threshold: f32,
     working_v: &mut Vec<Simplex128>,
     working_coboundary: &mut FastHeap,
 ) {
     add_simplex_coboundary(
         columns[column_index],
-        filt,
+        dist,
         threshold,
         working_v,
         working_coboundary,
     );
 
     for &simplex in v_matrix.column(column_index) {
-        add_simplex_coboundary(simplex, filt, threshold, working_v, working_coboundary);
+        add_simplex_coboundary(simplex, dist, threshold, working_v, working_coboundary);
     }
 }
 
@@ -97,9 +98,9 @@ fn add_coboundary<F: Filtration>(
 // Initial pivot search with emergent-pair shortcut
 // ═══════════════════════════════════════════════════════════════════════════════
 
-fn init_coboundary_and_get_pivot<F: Filtration>(
+fn init_coboundary_and_get_pivot(
     sigma: Simplex128,
-    filt: &F,
+    dist: &BitCsrDistanceMatrix,
     threshold: f32,
     pivot_column_index: &FxHashMap<Simplex128, usize>,
     working_coboundary: &mut FastHeap,
@@ -108,10 +109,10 @@ fn init_coboundary_and_get_pivot<F: Filtration>(
     let mut check_for_emergent_pair = true;
     let mut emergent: Option<Simplex128> = None;
 
-    filt.for_each_cofacet(sigma, true, threshold, |cofacet| {
+    for_each_cofacet(dist, sigma, true, threshold, |cofacet| {
         if check_for_emergent_pair && cofacet.filtration_encoded() == sigma_filt {
             if !pivot_column_index.contains_key(&cofacet)
-                && filt.zero_apparent_facet(cofacet, threshold).is_none()
+                && zero_apparent_facet(dist, cofacet, threshold).is_none()
             {
                 working_coboundary.clear(); // discard pollution
                 emergent = Some(cofacet);
@@ -135,9 +136,9 @@ fn init_coboundary_and_get_pivot<F: Filtration>(
 // compute_pairs — the main reduction loop
 // ═══════════════════════════════════════════════════════════════════════════════
 
-pub fn compute_pairs<F: Filtration>(
+pub fn compute_pairs(
     columns: &[Simplex128],
-    filt: &F,
+    dist: &BitCsrDistanceMatrix,
     threshold: f32,
     dim_intervals: &mut Vec<PersistenceInterval>,
     cleared_pivots: &mut FxHashMap<Simplex128, ()>,
@@ -161,7 +162,7 @@ pub fn compute_pairs<F: Filtration>(
 
         let mut pivot = init_coboundary_and_get_pivot(
             sigma,
-            filt,
+            dist,
             threshold,
             &pivot_column_index,
             &mut working_coboundary,
@@ -201,7 +202,7 @@ pub fn compute_pairs<F: Filtration>(
                             &v_matrix,
                             columns,
                             k,
-                            filt,
+                            dist,
                             threshold,
                             &mut working_v,
                             &mut working_coboundary,
@@ -210,10 +211,10 @@ pub fn compute_pairs<F: Filtration>(
                         continue;
                     }
 
-                    if let Some(phi) = filt.zero_apparent_facet(tau, threshold) {
+                    if let Some(phi) = zero_apparent_facet(dist, tau, threshold) {
                         add_simplex_coboundary(
                             phi,
-                            filt,
+                            dist,
                             threshold,
                             &mut working_v,
                             &mut working_coboundary,

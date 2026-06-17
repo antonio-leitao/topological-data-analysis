@@ -38,9 +38,13 @@ impl DistanceMatrix {
     /// Build from a pre-computed flat lower-triangular distance vector.
     /// `data[i*(i-1)/2 + j]` = distance between points i and j, for i > j.
     ///
+    /// Test-only: production builds BitCSR from `from_square_matrix` (distance
+    /// matrices) or `pdist_csr` (point clouds), never from a bare lower triangle.
+    ///
     /// # Panics
     /// If `data.len() != n*(n-1)/2` or `n > u16::MAX`.
     /// Negative entries trigger a debug-only assert.
+    #[cfg(test)]
     pub fn from_lower_triangular(n: usize, data: Vec<f32>) -> Self {
         let expected = n * (n - 1) / 2;
         assert_eq!(
@@ -86,22 +90,6 @@ impl DistanceMatrix {
     #[inline(always)]
     pub fn raw(&self) -> &[f32] {
         &self.data
-    }
-
-    /// Distance between points i and j. Symmetric; dist(i, i) = 0.0.
-    ///
-    /// # Safety contract
-    /// Both i and j must be valid point indices (< n). The bounds check is
-    /// elided via `get_unchecked` because this is called O(n) times per
-    /// cofacet candidate in the innermost loop.
-    #[inline(always)]
-    pub fn get(&self, i: usize, j: usize) -> f32 {
-        if i == j {
-            return 0.0;
-        }
-        let (r, c) = if i > j { (i, j) } else { (j, i) };
-        // SAFETY: r > c ≥ 0, and both < n, so index < n*(n-1)/2 = data.len().
-        unsafe { *self.data.get_unchecked(r * (r - 1) / 2 + c) }
     }
 }
 
@@ -175,101 +163,4 @@ pub fn condense_square_matrix(mat: &[f32], n: usize) -> (Vec<f32>, usize, f32) {
     }
 
     (data, c_star, r_cheb)
-}
-
-// ═══════════════════════════════════════════════════════════════════════════════
-// Cofacet diameter — the single hottest function in the codebase
-// ═══════════════════════════════════════════════════════════════════════════════
-
-/// Compute the diameter of the cofacet formed by inserting `new_v` into a
-/// simplex with vertices `verts[0..vc]` and existing diameter `base_diam`.
-///
-/// Returns `Some(diameter)` if the cofacet diameter ≤ threshold, `None` otherwise.
-///
-/// The early-exit on threshold is the most important optimization here:
-/// most candidate vertices produce cofacets above threshold, and bailing at the
-/// first exceeding distance avoids the remaining (vc - i - 1) lookups.
-#[inline(always)]
-pub fn cofacet_diameter(
-    new_v: u16,
-    verts: &[u16; 6],
-    vc: usize,
-    base_diam: f32,
-    dist: &DistanceMatrix,
-    threshold: f32,
-) -> Option<f32> {
-    let mut diam = base_diam;
-    // The compiler will unroll this for small vc (≤ 6).
-    // Each iteration: one distance lookup + one branch (threshold) + one cmov (max).
-    for i in 0..vc {
-        let d = dist.get(new_v as usize, verts[i] as usize);
-        if d > threshold {
-            return None;
-        }
-        // Branchless max — the compiler emits vmaxss or cmov.
-        if d > diam {
-            diam = d;
-        }
-    }
-    Some(diam)
-}
-
-/// Same as `cofacet_diameter`, but the caller GUARANTEES `new_v > verts[i]`
-/// for all i in 0..vc. This lets us:
-///   - precompute the row base once (vs inside each `dist.get`)
-///   - skip the `i == j` branch (caller has already filtered new_v ≠ verts[i])
-///   - skip the `i > j` swap (always true here)
-///
-/// # Safety
-/// Caller must ensure `new_v > verts[i]` for every i ∈ [0, vc), and
-/// `new_v < dist.n()`.
-#[inline(always)]
-pub fn cofacet_diameter_v_larger(
-    new_v: u16,
-    verts: &[u16; 6],
-    vc: usize,
-    base_diam: f32,
-    dist: &DistanceMatrix,
-    threshold: f32,
-) -> Option<f32> {
-    let new_v = new_v as usize;
-    let row_base = new_v * (new_v - 1) / 2;
-    let raw = dist.raw();
-    let mut diam = base_diam;
-    for i in 0..vc {
-        // SAFETY: new_v > verts[i] (caller guarantee) and both < n.
-        let d = unsafe { *raw.get_unchecked(row_base + verts[i] as usize) };
-        if d > threshold {
-            return None;
-        }
-        if d > diam {
-            diam = d;
-        }
-    }
-    Some(diam)
-}
-
-/// Compute the diameter of a facet formed by removing vertex at slot `skip`
-/// from `verts[0..vc]`.
-///
-/// This recomputes max pairwise distance over the remaining vertices.
-/// For dim ≤ 5, this is at most (5 choose 2) = 10 pair checks.
-#[inline]
-pub fn facet_diameter(verts: &[u16; 6], vc: usize, skip: usize, dist: &DistanceMatrix) -> f32 {
-    let mut diam: f32 = 0.0;
-    for i in 0..vc {
-        if i == skip {
-            continue;
-        }
-        for j in (i + 1)..vc {
-            if j == skip {
-                continue;
-            }
-            let d = dist.get(verts[i] as usize, verts[j] as usize);
-            if d > diam {
-                diam = d;
-            }
-        }
-    }
-    diam
 }

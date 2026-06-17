@@ -306,7 +306,8 @@ fn store_tile_partial_sparse(
 /// Fused point-cloud → CSR + minimax radius, in a single distance-kernel pass.
 ///
 /// Returns `(row_ptr, col, val, r_cheb)`, with `col`/`val` DESCENDING within each
-/// row (the `Filtration` ordering contract). `threshold` is the user threshold
+/// row (the order `BitCsrDistanceMatrix::from_csr_parts` requires). `threshold`
+/// is the user threshold
 /// (`f32::INFINITY` if none); edges with `d ≤ min(threshold, r_cheb)` are kept.
 /// `r_cheb` is the threshold-free minimax over all pairs, identical to
 /// `pdist_tiled_v3`, so the caller resolves the engine threshold the same way.
