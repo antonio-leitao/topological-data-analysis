@@ -8,7 +8,7 @@
 // one popcount rank inside the word. The hot cofacet operation is therefore a
 // k-way AND over aligned `u64` blocks followed by set-bit iteration.
 
-use crate::engine::csr::CsrDistanceMatrix;
+use crate::engine::csr::{csr_from_distance_matrix, CsrDistanceMatrix};
 use crate::engine::distance::DistanceMatrix;
 use crate::engine::filtration::Filtration;
 use crate::engine::simplex::{encode_filtration, FxHashMap, Simplex128};
@@ -940,12 +940,11 @@ fn remap_edge_mask_after_insert(mask: u64, vc: usize, rank: usize) -> u64 {
 
 /// Build a bitset sparse matrix from a dense distance matrix, returning the
 /// same Chebyshev radius convention as the CSR builder.
-#[allow(dead_code)]
-pub fn bitcsr_from_distance_matrix(
+pub(crate) fn bitcsr_from_distance_matrix(
     dist: &DistanceMatrix,
     threshold: f32,
 ) -> (BitCsrDistanceMatrix, f32) {
-    let (csr, r_cheb) = crate::engine::csr::csr_from_distance_matrix(dist, threshold);
+    let (csr, r_cheb) = csr_from_distance_matrix(dist, threshold);
     let eff = threshold.min(r_cheb);
     (BitCsrDistanceMatrix::from_csr(&csr, eff), r_cheb)
 }
@@ -1101,8 +1100,14 @@ mod tests {
                     let seq = compute_bitcsr(&bitcsr, eff, max_dim, false);
                     let par = compute_bitcsr(&bitcsr, eff, max_dim, true);
                     let dense = compute(&dist, eff, max_dim);
-                    assert!(barcodes_equal(&seq, &par), "seq vs par (n={n}, thr={thr}, d={max_dim})");
-                    assert!(barcodes_equal(&dense, &par), "dense vs par (n={n}, thr={thr}, d={max_dim})");
+                    assert!(
+                        barcodes_equal(&seq, &par),
+                        "seq vs par (n={n}, thr={thr}, d={max_dim})"
+                    );
+                    assert!(
+                        barcodes_equal(&dense, &par),
+                        "dense vs par (n={n}, thr={thr}, d={max_dim})"
+                    );
                 }
             }
         }

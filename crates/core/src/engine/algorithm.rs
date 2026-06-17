@@ -1,7 +1,6 @@
 use std::collections::HashMap;
 
 use crate::engine::bitcsr::BitCsrDistanceMatrix;
-use crate::engine::csr::CsrDistanceMatrix;
 use crate::engine::filtration::Filtration;
 use crate::engine::reduction::compute_pairs;
 use crate::engine::simplex::{FxBuildHasher, FxHashMap, Simplex128};
@@ -207,40 +206,6 @@ pub fn compute<F: Filtration>(dist: &F, threshold: f32, max_dim: usize) -> Barco
             let build_pool = dim + 1 < max_dim;
             columns_to_reduce =
                 assemble_candidates(&mut simplices, dist, threshold, &cleared_pivots, build_pool);
-        }
-    }
-
-    BarcodeResult { intervals }
-}
-
-#[allow(dead_code)]
-pub fn compute_sparse(dist: &CsrDistanceMatrix, threshold: f32, max_dim: usize) -> BarcodeResult {
-    let mut intervals: Vec<Vec<PersistenceInterval>> = Vec::with_capacity(max_dim + 1);
-
-    let mut h0 = Vec::new();
-    let (mut simplices, mut columns_to_reduce) = compute_h0(dist, threshold, &mut h0);
-    intervals.push(h0);
-
-    let mut cleared_pivots: FxHashMap<Simplex128, ()> =
-        HashMap::with_hasher(FxBuildHasher::default());
-
-    for dim in 1..=max_dim {
-        let mut dim_intervals = Vec::new();
-
-        cleared_pivots.clear();
-        compute_pairs(
-            &columns_to_reduce,
-            dist,
-            threshold,
-            &mut dim_intervals,
-            &mut cleared_pivots,
-        );
-        intervals.push(dim_intervals);
-
-        if dim < max_dim {
-            let build_pool = dim + 1 < max_dim;
-            columns_to_reduce =
-                dist.assemble_candidates(&mut simplices, threshold, &cleared_pivots, build_pool);
         }
     }
 

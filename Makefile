@@ -1,4 +1,4 @@
-.PHONY: help install build-py build-rust test test-core test-dense test-sparse bench bench-dense bench-sparse bench-save profile profile-build profile-dense profile-sparse profile-dense-all profile-sparse-all publish-py publish-rust clean
+.PHONY: help install build-py build-rust test test-core test-python bench profile profile-build profile-all release-py publish-rust clean
 .DEFAULT_GOAL := help
 
 # ── Colors ────────────────────────────────────────────────────────────────
@@ -46,113 +46,58 @@ test-core: ## Run Rust core tests
 	@echo "$(CYAN)🧪 Running Rust core tests...$(RESET)"
 	@cargo test -p $(BENCH_CRATE)
 
-test-dense: install ## Run Python dense correctness test
-	@echo "$(CYAN)🧪 Running Python dense correctness...$(RESET)"
-	@$(PYTHON) crates/python/tests/correctness.py dense $(MAX_DIM)
+test-python: install ## Run Python correctness test
+	@echo "$(CYAN)🧪 Running Python correctness...$(RESET)"
+	@$(PYTHON) crates/python/tests/correctness.py $(MAX_DIM)
 
-test-sparse: install ## Run Python sparse correctness test
-	@echo "$(CYAN)🧪 Running Python sparse correctness...$(RESET)"
-	@$(PYTHON) crates/python/tests/correctness.py sparse $(MAX_DIM)
-
-test: test-core test-dense test-sparse ## Run all correctness tests
+test: test-core test-python ## Run all correctness tests
 	@echo "$(GREEN)✅ Tests passed!$(RESET)"
 
 # ── Bench ─────────────────────────────────────────────────────────────────
 
-bench-dense: ## Run dense Rust core benchmarks
-	@echo "$(CYAN)📊 Running dense Rust core benchmarks...$(RESET)"
-	@TDA_MAX_DIM=$(MAX_DIM) TDA_BENCH_MODE=dense cargo bench -p $(BENCH_CRATE) --bench $(BENCH_NAME)
-
-bench-sparse: ## Run sparse Rust core benchmarks
-	@echo "$(CYAN)📊 Running sparse Rust core benchmarks...$(RESET)"
-	@TDA_MAX_DIM=$(MAX_DIM) TDA_BENCH_MODE=sparse cargo bench -p $(BENCH_CRATE) --bench $(BENCH_NAME)
-
-bench: ## Run dense and sparse Rust core benchmarks
-	@echo "$(CYAN)📊 Running dense and sparse Rust core benchmarks...$(RESET)"
-	@TDA_MAX_DIM=$(MAX_DIM) TDA_BENCH_MODE=both cargo bench -p $(BENCH_CRATE) --bench $(BENCH_NAME)
+bench: ## Run BitCSR Rust core benchmarks
+	@echo "$(CYAN)📊 Running BitCSR Rust core benchmarks...$(RESET)"
+	@TDA_MAX_DIM=$(MAX_DIM) cargo bench -p $(BENCH_CRATE) --bench $(BENCH_NAME)
 
 profile-build: ## Build the single-run profiling runner
 	@echo "$(CYAN)📦 Building profiling runner...$(RESET)"
 	@cargo build --release -p $(BENCH_CRATE) --example profile_runner
 
-profile-dense: profile-build ## Profile one dense dataset with samply (DATASET=dragon_2000.txt)
+profile: profile-build ## Profile one dataset with samply (DATASET=dragon_2000.txt)
 	@if [ -z "$(DATASET)" ]; then \
-		echo "$(RED)Usage: make profile-dense DATASET=dragon_2000.txt$(RESET)"; \
+		echo "$(RED)Usage: make profile DATASET=dragon_2000.txt$(RESET)"; \
 		exit 1; \
 	fi
 	@file="$(DATASET)"; \
 	name=$$(basename "$$file" .txt); \
-	OUT_DIR="$(PROFILE_DIR)/dense_h$(MAX_DIM)"; \
+	OUT_DIR="$(PROFILE_DIR)/bitcsr_h$(MAX_DIM)"; \
 	mkdir -p "$$OUT_DIR"; \
 	out="$$OUT_DIR/$$name.json.gz"; \
-	echo "$(CYAN)📊 Profiling dense_h$(MAX_DIM)/$$name...$(RESET)"; \
+	echo "$(CYAN)📊 Profiling bitcsr_h$(MAX_DIM)/$$name...$(RESET)"; \
 	$(SAMPLY) record \
 		--save-only \
 		--unstable-presymbolicate \
-		--main-thread-only \
 		--rate $(PROFILE_RATE) \
 		-o "$$out" \
-		-- target/release/examples/profile_runner dense "$(MAX_DIM)" "$$file" "$(PROFILE_REPEATS)"; \
-	echo "$(GREEN)✅ Dense profile written to $$out.$(RESET)"
+		-- target/release/examples/profile_runner "$(MAX_DIM)" "$$file" "$(PROFILE_REPEATS)"; \
+	echo "$(GREEN)✅ Profile written to $$out.$(RESET)"
 
-profile-sparse: profile-build ## Profile one sparse dataset with samply (DATASET=dragon_2000.txt)
-	@if [ -z "$(DATASET)" ]; then \
-		echo "$(RED)Usage: make profile-sparse DATASET=dragon_2000.txt$(RESET)"; \
-		exit 1; \
-	fi
-	@file="$(DATASET)"; \
-	name=$$(basename "$$file" .txt); \
-	OUT_DIR="$(PROFILE_DIR)/sparse_h$(MAX_DIM)"; \
-	mkdir -p "$$OUT_DIR"; \
-	out="$$OUT_DIR/$$name.json.gz"; \
-	echo "$(CYAN)📊 Profiling sparse_h$(MAX_DIM)/$$name...$(RESET)"; \
-	$(SAMPLY) record \
-		--save-only \
-		--unstable-presymbolicate \
-		--main-thread-only \
-		--rate $(PROFILE_RATE) \
-		-o "$$out" \
-		-- target/release/examples/profile_runner sparse "$(MAX_DIM)" "$$file" "$(PROFILE_REPEATS)"; \
-	echo "$(GREEN)✅ Sparse profile written to $$out.$(RESET)"
-
-profile-dense-all: profile-build ## Profile every dense dataset with samply
-	@OUT_DIR="$(PROFILE_DIR)/dense_h$(MAX_DIM)"; \
+profile-all: profile-build ## Profile every dataset with samply
+	@OUT_DIR="$(PROFILE_DIR)/bitcsr_h$(MAX_DIM)"; \
 	mkdir -p "$$OUT_DIR"; \
 	DATASETS=$$(awk -v max_dim="$(MAX_DIM)" -v cutoff="$(PROFILE_H2_LAST_DATASET)" 'NF && $$1 !~ /^#/ { print $$1; if (max_dim == 2 && $$1 == cutoff) exit }' data/datasets.txt); \
 	for file in $$DATASETS; do \
 		name=$${file%.txt}; \
 		out="$$OUT_DIR/$$name.json.gz"; \
-		echo "$(CYAN)📊 Profiling dense_h$(MAX_DIM)/$$name...$(RESET)"; \
+		echo "$(CYAN)📊 Profiling bitcsr_h$(MAX_DIM)/$$name...$(RESET)"; \
 		$(SAMPLY) record \
 			--save-only \
 			--unstable-presymbolicate \
-			--main-thread-only \
 			--rate $(PROFILE_RATE) \
 			-o "$$out" \
-			-- target/release/examples/profile_runner dense "$(MAX_DIM)" "$$file" "$(PROFILE_REPEATS)"; \
+			-- target/release/examples/profile_runner "$(MAX_DIM)" "$$file" "$(PROFILE_REPEATS)"; \
 	done; \
-	echo "$(GREEN)✅ Dense profiles written to $$OUT_DIR.$(RESET)"
-
-profile-sparse-all: profile-build ## Profile every sparse dataset with samply
-	@OUT_DIR="$(PROFILE_DIR)/sparse_h$(MAX_DIM)"; \
-	mkdir -p "$$OUT_DIR"; \
-	DATASETS=$$(awk -v max_dim="$(MAX_DIM)" -v cutoff="$(PROFILE_H2_LAST_DATASET)" 'NF && $$1 !~ /^#/ { print $$1; if (max_dim == 2 && $$1 == cutoff) exit }' data/datasets.txt); \
-	for file in $$DATASETS; do \
-		name=$${file%.txt}; \
-		out="$$OUT_DIR/$$name.json.gz"; \
-		echo "$(CYAN)📊 Profiling sparse_h$(MAX_DIM)/$$name...$(RESET)"; \
-		$(SAMPLY) record \
-			--save-only \
-			--unstable-presymbolicate \
-			--main-thread-only \
-			--rate $(PROFILE_RATE) \
-			-o "$$out" \
-			-- target/release/examples/profile_runner sparse "$(MAX_DIM)" "$$file" "$(PROFILE_REPEATS)"; \
-	done; \
-	echo "$(GREEN)✅ Sparse profiles written to $$OUT_DIR.$(RESET)"
-
-profile: profile-dense-all profile-sparse-all ## Profile dense and sparse Rust core benchmarks with samply
-	@echo "$(GREEN)✅ Profiles complete.$(RESET)"
+	echo "$(GREEN)✅ Profiles written to $$OUT_DIR.$(RESET)"
 
 # ── Publish ───────────────────────────────────────────────────────────────
 

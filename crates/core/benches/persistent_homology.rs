@@ -3,52 +3,15 @@ use std::hint::black_box;
 
 mod common;
 
-use common::{
-    dataset_files, load_dataset, max_dim_from_env, parallel_from_env, run_once, should_bench, Mode,
-};
+use common::{dataset_files, load_dataset, max_dim_from_env, run_once};
 
-fn bench_dense(c: &mut Criterion) {
-    if !should_bench(Mode::Dense) {
-        return;
-    }
-
+fn bench_persistent_homology(c: &mut Criterion) {
     let max_dim = max_dim_from_env();
-    let mut group = c.benchmark_group(format!("dense_h{max_dim}"));
+    let mut group = c.benchmark_group(format!("bitcsr_h{max_dim}"));
     for file in dataset_files(max_dim) {
         let dataset = load_dataset(&file);
         group.bench_function(dataset.name.clone(), |b| {
-            b.iter(|| {
-                black_box(run_once(
-                    black_box(Mode::Dense),
-                    black_box(&dataset),
-                    black_box(max_dim),
-                    black_box(false),
-                ))
-            });
-        });
-    }
-    group.finish();
-}
-
-fn bench_sparse(c: &mut Criterion) {
-    if !should_bench(Mode::Sparse) {
-        return;
-    }
-
-    let max_dim = max_dim_from_env();
-    let parallel = parallel_from_env();
-    let mut group = c.benchmark_group(format!("sparse_h{max_dim}"));
-    for file in dataset_files(max_dim) {
-        let dataset = load_dataset(&file);
-        group.bench_function(dataset.name.clone(), |b| {
-            b.iter(|| {
-                black_box(run_once(
-                    black_box(Mode::Sparse),
-                    black_box(&dataset),
-                    black_box(max_dim),
-                    black_box(parallel),
-                ))
-            });
+            b.iter(|| black_box(run_once(black_box(&dataset), black_box(max_dim))));
         });
     }
     group.finish();
@@ -57,6 +20,6 @@ fn bench_sparse(c: &mut Criterion) {
 criterion_group! {
     name = benches;
     config = Criterion::default().sample_size(10);
-    targets = bench_dense, bench_sparse
+    targets = bench_persistent_homology
 }
 criterion_main!(benches);

@@ -8,7 +8,6 @@ from gudhi.sklearn import RipsPersistence
 import numpy as np
 
 import tda
-import tda._core as core
 
 
 ROOT = Path(__file__).resolve().parents[3]
@@ -40,10 +39,8 @@ def load_points(file):
     return np.loadtxt(DATA_DIR / file).astype(np.float32)
 
 
-def run_tda(data, mode, max_dim):
-    if mode == "dense":
-        return tda.persistent_homology(data, max_dim=max_dim)
-    return core._persistent_homology_sparse(data, max_dim=max_dim)
+def run_tda(data, max_dim):
+    return tda.persistent_homology(data, max_dim=max_dim)
 
 
 def gudhi_reference(data, max_dim):
@@ -77,29 +74,26 @@ def bottleneck_ok(got, want, max_dim, tol):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("mode", nargs="?", choices=["dense", "sparse"])
     parser.add_argument(
         "max_dim", nargs="?", type=int, choices=[1, 2], default=default_max_dim()
     )
     args = parser.parse_args()
 
-    modes = [args.mode] if args.mode else ["dense", "sparse"]
-    for mode in modes:
-        print(f"Python correctness: {mode} H0..H{args.max_dim} vs GUDHI")
-        print(f"  {'dataset':<24} {'status':<6} {f'tda_{mode}':>10} {'gudhi':>10}")
-        for file in dataset_files(args.max_dim):
-            data = load_points(file)
-            got, tda_time = timed(run_tda, data, mode, args.max_dim)
-            ref, gudhi_time = timed(gudhi_reference, data, args.max_dim)
-            ok, dim, bd, n_got, n_ref = bottleneck_ok(
-                got, ref, args.max_dim, REFERENCE_TOL
+    print(f"Python correctness: BitCSR H0..H{args.max_dim} vs GUDHI")
+    print(f"  {'dataset':<24} {'status':<6} {'tda':>10} {'gudhi':>10}")
+    for file in dataset_files(args.max_dim):
+        data = load_points(file)
+        got, tda_time = timed(run_tda, data, args.max_dim)
+        ref, gudhi_time = timed(gudhi_reference, data, args.max_dim)
+        ok, dim, bd, n_got, n_ref = bottleneck_ok(
+            got, ref, args.max_dim, REFERENCE_TOL
+        )
+        if not ok:
+            raise AssertionError(
+                f"{file} H{dim} mismatch: bottleneck={bd:.3e}, "
+                f"tda={n_got}, gudhi={n_ref}"
             )
-            if not ok:
-                raise AssertionError(
-                    f"{file} H{dim} mismatch: bottleneck={bd:.3e}, "
-                    f"tda={n_got}, gudhi={n_ref}"
-                )
-            print(f"  {file:<24} {'ok':<6} {tda_time:9.3f}s {gudhi_time:9.3f}s")
+        print(f"  {file:<24} {'ok':<6} {tda_time:9.3f}s {gudhi_time:9.3f}s")
 
 
 if __name__ == "__main__":

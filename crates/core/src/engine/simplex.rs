@@ -42,11 +42,9 @@ const VERTEX_MASK: u128 = (1u128 << 96) - 1;
 pub struct Simplex128(pub u128);
 
 impl Simplex128 {
-    /// Sentinel for "no simplex" / invalid.
-    pub const INVALID: Simplex128 = Simplex128(0);
-
     /// Create from a filtration value (f32) and an unsorted vertex slice.
     /// Vertices are sorted descending internally.
+    #[cfg(test)]
     #[inline]
     pub fn new(filtration: f32, vertices: &[u16]) -> Self {
         let mut sorted = [0u16; 6];
@@ -130,6 +128,7 @@ impl Simplex128 {
     }
 
     /// Dimension of the simplex (vertex_count − 1).
+    #[cfg(test)]
     #[inline(always)]
     pub fn dim(self) -> usize {
         self.vertex_count().saturating_sub(1)
@@ -165,6 +164,7 @@ impl Simplex128 {
 
     /// Check whether vertex v is contained in this simplex.
     /// Uses descending sort order for early exit.
+    #[cfg(test)]
     #[inline(always)]
     pub fn contains_vertex(self, v: u16) -> bool {
         let target = (v as u128) + 1;
@@ -363,6 +363,7 @@ impl<'a> CofacetIter<'a> {
     /// Each returned `Simplex128` has its filtration set to the cofacet's
     /// diameter (encoded as u32).
     #[inline]
+    #[cfg(test)]
     pub fn next(&mut self) -> Option<Simplex128> {
         loop {
             if self.v <= self.stop {
@@ -533,15 +534,6 @@ impl<'a> FacetIter<'a> {
             simplex,
             k: 0,
         }
-    }
-
-    /// Reset to iterate over a different simplex.
-    #[inline]
-    pub fn reset(&mut self, simplex: Simplex128) {
-        self.verts = simplex.vertices();
-        self.vc = simplex.vertex_count();
-        self.simplex = simplex;
-        self.k = 0;
     }
 
     /// Advance to the next facet. Returns `None` when exhausted.
@@ -733,7 +725,6 @@ impl Hasher for FxHasher {
 
 pub type FxBuildHasher = BuildHasherDefault<FxHasher>;
 pub type FxHashMap<K, V> = std::collections::HashMap<K, V, FxBuildHasher>;
-pub type FxHashSet<T> = std::collections::HashSet<T, FxBuildHasher>;
 // ═══════════════════════════════════════════════════════════════════════════════
 // Tests
 // ═══════════════════════════════════════════════════════════════════════════════

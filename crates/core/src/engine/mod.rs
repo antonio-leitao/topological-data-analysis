@@ -1,12 +1,12 @@
 pub mod algorithm;
 mod bitcsr;
-mod csr;
-pub mod distance;
+pub(crate) mod csr;
+pub(crate) mod distance;
 mod filtration;
 mod heap;
 mod reduction;
-pub mod simplex;
+pub(crate) mod simplex;
 
-pub use bitcsr::BitCsrDistanceMatrix;
-pub use csr::CsrDistanceMatrix;
-pub use distance::DistanceMatrix;
+pub(crate) use bitcsr::{bitcsr_from_distance_matrix, BitCsrDistanceMatrix};
+pub(crate) use csr::CsrDistanceMatrix;
+pub(crate) use distance::DistanceMatrix;

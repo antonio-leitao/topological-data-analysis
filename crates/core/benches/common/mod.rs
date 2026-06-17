@@ -4,32 +4,9 @@ use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use tda_core::{persistent_homology, persistent_homology_sparse, BarcodeResult};
+use tda_core::{persistent_homology, BarcodeResult};
 
 const H2_LAST_DATASET: &str = "hiv1.txt";
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum Mode {
-    Dense,
-    Sparse,
-}
-
-impl Mode {
-    pub fn parse(value: &str) -> Result<Self, String> {
-        match value {
-            "dense" => Ok(Self::Dense),
-            "sparse" => Ok(Self::Sparse),
-            other => Err(format!("mode must be dense or sparse, got {other}")),
-        }
-    }
-
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Dense => "dense",
-            Self::Sparse => "sparse",
-        }
-    }
-}
 
 pub struct Dataset {
     pub name: String,
@@ -53,20 +30,6 @@ pub fn parse_max_dim(value: &str) -> Result<usize, String> {
         "2" => Ok(2),
         other => Err(format!("max_dim must be 1 or 2, got {other}")),
     }
-}
-
-pub fn bench_mode_from_env() -> String {
-    match env::var("TDA_BENCH_MODE").ok().as_deref() {
-        None | Some("") | Some("both") => "both".to_owned(),
-        Some("dense") => "dense".to_owned(),
-        Some("sparse") => "sparse".to_owned(),
-        Some(other) => panic!("TDA_BENCH_MODE must be dense, sparse, or both, got {other}"),
-    }
-}
-
-pub fn should_bench(mode: Mode) -> bool {
-    let bench_mode = bench_mode_from_env();
-    bench_mode == "both" || bench_mode == mode.as_str()
 }
 
 pub fn dataset_files(max_dim: usize) -> Vec<String> {
@@ -136,38 +99,14 @@ pub fn load_dataset(file: &str) -> Dataset {
     }
 }
 
-pub fn run_once(
-    mode: Mode,
-    dataset: &Dataset,
-    max_dim: usize,
-    parallel: bool,
-) -> tda_core::Result<BarcodeResult> {
-    match mode {
-        Mode::Dense => persistent_homology(
-            &dataset.points,
-            dataset.n,
-            dataset.d,
-            max_dim,
-            None,
-            false,
-            false,
-        ),
-        Mode::Sparse => persistent_homology_sparse(
-            &dataset.points,
-            dataset.n,
-            dataset.d,
-            max_dim,
-            None,
-            parallel,
-        ),
-    }
-}
-
-/// Whether the sparse backend should parallelise. Defaults to `true`; set
-/// `TDA_PARALLEL=0`/`false` to measure or profile the single-thread path.
-pub fn parallel_from_env() -> bool {
-    !matches!(
-        std::env::var("TDA_PARALLEL").ok().as_deref(),
-        Some("0") | Some("false") | Some("no")
+pub fn run_once(dataset: &Dataset, max_dim: usize) -> tda_core::Result<BarcodeResult> {
+    persistent_homology(
+        &dataset.points,
+        dataset.n,
+        dataset.d,
+        max_dim,
+        None,
+        false,
+        false,
     )
 }

@@ -17,14 +17,14 @@ pub const MAX_DIM: usize = 4;
 // ═══════════════════════════════════════════════════════════════════════════════
 
 /// Compute Vietoris–Rips persistent homology from a row-major `(n, d)`
-/// point cloud.
+/// point cloud using the BitCSR sparse backend.
 ///
 /// `peel` tightens the truncation radius via a sound strong collapse
 /// ([`opt::peel`]) — strictly cheaper, identical barcode. `quotient` rewrites
 /// the filtration into a quotient-cover (complete-linkage) coning
-/// ([`opt::coperto`]) before reduction. Both default to off; either may be
-/// enabled independently, and when both are set peeling runs first so the
-/// coning happens at the already-tightened radius.
+/// ([`opt::coperto`]) before reduction. These optimization flags still use the
+/// condensed-distance compatibility path because they rewrite dense distances
+/// before the filtration is built.
 pub fn persistent_homology(
     points: &[f32],
     n: usize,
@@ -35,10 +35,15 @@ pub fn persistent_homology(
     peel: bool,
 ) -> Result<BarcodeResult> {
     validate_params(n, max_dim, threshold)?;
-    let (lt, c_star, minimax) = condense_points(points, n, d)?;
-    Ok(run_pipeline(
-        lt, n, c_star, minimax, max_dim, threshold, quotient, peel,
-    ))
+
+    if quotient || peel {
+        let (lt, c_star, minimax) = condense_points(points, n, d)?;
+        return Ok(run_dense_pipeline(
+            lt, n, c_star, minimax, max_dim, threshold, quotient, peel,
+        ));
+    }
+
+    run_bitcsr_points(points, n, d, max_dim, threshold, true)
 }
 
 /// Compute Vietoris–Rips persistent homology from a row-major `(n, n)`
@@ -55,22 +60,25 @@ pub fn persistent_homology_from_distances(
     peel: bool,
 ) -> Result<BarcodeResult> {
     validate_params(n, max_dim, threshold)?;
-    let (lt, c_star, minimax) = condense_distances(distances, n)?;
-    Ok(run_pipeline(
-        lt, n, c_star, minimax, max_dim, threshold, quotient, peel,
+
+    if quotient || peel {
+        let (lt, c_star, minimax) = condense_distances(distances, n)?;
+        return Ok(run_dense_pipeline(
+            lt, n, c_star, minimax, max_dim, threshold, quotient, peel,
+        ));
+    }
+
+    validate_distance_shape(distances, n)?;
+    let user_t = threshold.unwrap_or(f32::INFINITY);
+    let (dist, _) = DistanceMatrix::from_square_matrix(distances, n);
+    let (bitcsr, r_cheb) = engine::bitcsr_from_distance_matrix(&dist, user_t);
+    let eff = user_t.min(r_cheb);
+    Ok(engine::algorithm::compute_bitcsr(
+        &bitcsr, eff, max_dim, true,
     ))
 }
 
-/// Vietoris–Rips persistent homology from a row-major `(n, d)` point cloud,
-/// computed through the sparse (CSR) backend.
-///
-/// Builds a CSR filtration keeping only within-threshold edges, then runs the
-/// same reduction the dense path uses.
-///
-/// `parallel` enables rayon-parallel candidate assembly (the dominant cost). It
-/// produces an identical barcode; turn it off for deterministic single-thread
-/// profiling or when running many computations concurrently.
-pub fn persistent_homology_sparse(
+fn run_bitcsr_points(
     points: &[f32],
     n: usize,
     d: usize,
@@ -78,30 +86,22 @@ pub fn persistent_homology_sparse(
     threshold: Option<f32>,
     parallel: bool,
 ) -> Result<BarcodeResult> {
-    validate_params(n, max_dim, threshold)?;
-    if d == 0 {
-        return Err(Error::EmptyDimension);
-    }
-    if points.len() != n * d {
-        return Err(Error::ShapeMismatch {
-            n,
-            got: points.len(),
-            mode: "points (expected n*d)",
-        });
-    }
+    validate_point_shape(points, n, d)?;
     let user_t = threshold.unwrap_or(f32::INFINITY);
     let (row_ptr, col, val, r_cheb) = preprocess::pdist::pdist_csr(points, n, d, user_t);
     let eff = user_t.min(r_cheb);
-    let csr = engine::CsrDistanceMatrix::from_csr_parts(n, eff, row_ptr, col, val);
+    let csr = engine::CsrDistanceMatrix::from_csr_parts(n, row_ptr, col, val);
     let bitcsr = engine::BitCsrDistanceMatrix::from_csr(&csr, eff);
-    Ok(engine::algorithm::compute_bitcsr(&bitcsr, eff, max_dim, parallel))
+    Ok(engine::algorithm::compute_bitcsr(
+        &bitcsr, eff, max_dim, parallel,
+    ))
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // Shared pipeline
 // ═══════════════════════════════════════════════════════════════════════════════
 
-fn run_pipeline(
+fn run_dense_pipeline(
     mut lt: Vec<f32>,
     n: usize,
     c_star: usize,
@@ -155,6 +155,20 @@ pub fn filtration_size_from_distances(
 /// minimax radius. Validates the `(n, d)` shape.
 #[inline]
 fn condense_points(points: &[f32], n: usize, d: usize) -> Result<(Vec<f32>, usize, f32)> {
+    validate_point_shape(points, n, d)?;
+    Ok(preprocess::pdist::pdist_tiled_v3(points, n, d))
+}
+
+/// Distance matrix → condensed lower-triangular distances, Chebyshev center, and
+/// minimax radius. Validates the `(n, n)` shape.
+#[inline]
+fn condense_distances(distances: &[f32], n: usize) -> Result<(Vec<f32>, usize, f32)> {
+    validate_distance_shape(distances, n)?;
+    Ok(engine::distance::condense_square_matrix(distances, n))
+}
+
+#[inline]
+fn validate_point_shape(points: &[f32], n: usize, d: usize) -> Result<()> {
     if d == 0 {
         return Err(Error::EmptyDimension);
     }
@@ -165,13 +179,11 @@ fn condense_points(points: &[f32], n: usize, d: usize) -> Result<(Vec<f32>, usiz
             mode: "points (expected n*d)",
         });
     }
-    Ok(preprocess::pdist::pdist_tiled_v3(points, n, d))
+    Ok(())
 }
 
-/// Distance matrix → condensed lower-triangular distances, Chebyshev center, and
-/// minimax radius. Validates the `(n, n)` shape.
 #[inline]
-fn condense_distances(distances: &[f32], n: usize) -> Result<(Vec<f32>, usize, f32)> {
+fn validate_distance_shape(distances: &[f32], n: usize) -> Result<()> {
     if distances.len() != n * n {
         return Err(Error::ShapeMismatch {
             n,
@@ -179,7 +191,7 @@ fn condense_distances(distances: &[f32], n: usize) -> Result<(Vec<f32>, usize, f
             mode: "distance matrix (expected n*n)",
         });
     }
-    Ok(engine::distance::condense_square_matrix(distances, n))
+    Ok(())
 }
 
 #[inline]

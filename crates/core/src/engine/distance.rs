@@ -103,17 +103,6 @@ impl DistanceMatrix {
         // SAFETY: r > c ≥ 0, and both < n, so index < n*(n-1)/2 = data.len().
         unsafe { *self.data.get_unchecked(r * (r - 1) / 2 + c) }
     }
-
-    /// Distance between points `i` and `j` where the caller guarantees `i > j`.
-    /// Skips the `i == j` check and the ordering swap.
-    ///
-    /// # Safety
-    /// Caller must ensure `i > j` and `i < self.n()`.
-    #[inline(always)]
-    pub unsafe fn get_unchecked_ordered(&self, i: usize, j: usize) -> f32 {
-        debug_assert!(i > j && i < self.n);
-        *self.data.get_unchecked(i * (i - 1) / 2 + j)
-    }
 }
 
 /// Extract the strict lower triangle of a row-major `(n, n)` matrix into the

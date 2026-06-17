@@ -98,26 +98,9 @@ fn persistent_homology<'py>(
     barcode_to_py(py, barcode)
 }
 
-/// Test-only sparse entry point. Not re-exported from `tda.__init__`.
-#[pyfunction(name = "_persistent_homology_sparse")]
-#[pyo3(signature = (data, max_dim=1, threshold=None, parallel=true))]
-fn persistent_homology_sparse<'py>(
-    py: Python<'py>,
-    data: PyReadonlyArray2<'py, f32>,
-    max_dim: usize,
-    threshold: Option<f32>,
-    parallel: bool,
-) -> PyResult<Vec<Bound<'py, PyArray2<f32>>>> {
-    let (flat, rows, cols) = flatten(&data);
-    let barcode =
-        tda_core::persistent_homology_sparse(&flat, rows, cols, max_dim, threshold, parallel)
-            .map_err(to_py_err)?;
-    barcode_to_py(py, barcode)
-}
-
 /// Truncated Vietoris–Rips filtration size (simplices of dimension ≤ max_dim).
 #[pyfunction]
-#[pyo3(signature = (data, max_dim=1, threshold=None, distance_matrix=false, quotient=false,peel=false))]
+#[pyo3(signature = (data, max_dim=1, threshold=None, distance_matrix=false, quotient=false, peel=false))]
 fn filtration_size(
     data: PyReadonlyArray2<'_, f32>,
     max_dim: usize,
@@ -140,7 +123,6 @@ fn filtration_size(
 #[pymodule]
 fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(persistent_homology, m)?)?;
-    m.add_function(wrap_pyfunction!(persistent_homology_sparse, m)?)?;
     m.add_function(wrap_pyfunction!(filtration_size, m)?)?;
     Ok(())
 }
