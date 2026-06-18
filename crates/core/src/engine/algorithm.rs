@@ -726,14 +726,15 @@ pub fn compute(dist: &BitCsrDistanceMatrix, max_dim: usize, parallel: bool) -> B
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::preprocess::pdist::{dmat_csr, square_from_lower_tri};
+    use crate::preprocess::_pdist::square_from_lower_tri;
+    use crate::preprocess::edgelist::EdgeList;
 
     /// Build a BitCSR from a lower-triangular fixture (through the real pdist
     /// distance-matrix path) and run the engine.
     fn run(lt: &[f32], n: usize, threshold: f32, max_dim: usize) -> BarcodeResult {
         let sq = square_from_lower_tri(n, lt);
-        let adj = dmat_csr(&sq, n, threshold);
-        let bitcsr = BitCsrDistanceMatrix::from_csr_parts(n, adj.row_ptr, adj.col, adj.val);
+        let edges = EdgeList::from_distance_matrix(&sq, n, threshold);
+        let bitcsr = BitCsrDistanceMatrix::from_edge_list(edges);
         compute(&bitcsr, max_dim, true)
     }
 

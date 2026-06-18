@@ -13,6 +13,8 @@
 // reduction columns — those live in the Ripser algorithm layer (`algorithm.rs`),
 // which drives this structure through the `pub(crate)` primitives below.
 
+use crate::preprocess::edgelist::EdgeList;
+
 /// Sparse distance matrix as flattened tail-truncated bitsets plus per-bit
 /// distances.
 ///
@@ -32,102 +34,71 @@ pub struct BitCsrDistanceMatrix {
 impl BitCsrDistanceMatrix {
     // ── Construction ──────────────────────────────────────────────────────────
 
-    /// Pack descending-sorted CSR rows into the bitset representation.
-    ///
-    /// `col[row_ptr[v]..row_ptr[v + 1]]` are vertex `v`'s neighbours in
-    /// DESCENDING id order, with parallel distances in `val`.
-    fn from_sorted_rows(n: usize, row_ptr: &[usize], col: &[u16], val: &[f32]) -> Self {
-        let nnz = col.len();
-        let mut word_ptr = Vec::with_capacity(n + 1);
-        let mut words = Vec::new();
-        let mut val_ptr = Vec::new();
-        let mut val_out = Vec::with_capacity(nnz);
+    /// Consume a canonical half-edge list and build the symmetric BitCSR layout.
+    pub(crate) fn from_edge_list(edge_list: EdgeList) -> Self {
+        let EdgeList { n, edges, .. } = edge_list;
 
-        let mut counts: Vec<usize> = Vec::new();
-        let mut offsets: Vec<usize> = Vec::new();
-        let mut cursor: Vec<usize> = Vec::new();
-        let mut row_vals: Vec<f32> = Vec::new();
-
-        word_ptr.push(0);
-        val_ptr.push(0);
-
-        for v in 0..n {
-            let s = row_ptr[v];
-            let e = row_ptr[v + 1];
-            let col_row = &col[s..e];
-            let val_row = &val[s..e];
-            if col_row.is_empty() {
-                word_ptr.push(to_u32(words.len(), "bitcsr word count"));
-                continue;
-            }
-
-            let word_len = ((col_row[0] as usize) >> 6) + 1;
-            let row_start = words.len();
-            words.resize(row_start + word_len, 0);
-
-            counts.clear();
-            counts.resize(word_len, 0);
-
-            for &u in col_row {
-                let block = (u as usize) >> 6;
-                words[row_start + block] |= 1u64 << (u & 63);
-                counts[block] += 1;
-            }
-
-            offsets.clear();
-            offsets.resize(word_len + 1, 0);
-            for block in 0..word_len {
-                offsets[block + 1] = offsets[block] + counts[block];
-            }
-
-            cursor.clear();
-            cursor.resize(word_len, 0);
-            row_vals.clear();
-            row_vals.resize(col_row.len(), 0.0);
-
-            for (&u, &d) in col_row.iter().zip(val_row.iter()) {
-                let block = (u as usize) >> 6;
-                let dst = offsets[block] + cursor[block];
-                row_vals[dst] = d;
-                cursor[block] += 1;
-            }
-
-            for block in 0..word_len {
-                val_out.extend_from_slice(&row_vals[offsets[block]..offsets[block + 1]]);
-                val_ptr.push(to_u32(val_out.len(), "bitcsr value count"));
-            }
-            word_ptr.push(to_u32(words.len(), "bitcsr word count"));
+        let mut row_word_len = vec![0usize; n];
+        for edge in &edges {
+            let u = edge.u as usize;
+            let v = edge.v as usize;
+            debug_assert!(u < n && v < n && u > v);
+            row_word_len[u] = row_word_len[u].max((v >> 6) + 1);
+            row_word_len[v] = row_word_len[v].max((u >> 6) + 1);
         }
 
-        debug_assert_eq!(word_ptr.len(), n + 1);
-        debug_assert_eq!(val_ptr.len(), words.len() + 1);
-        debug_assert_eq!(val_out.len(), nnz);
+        let mut word_ptr = Vec::with_capacity(n + 1);
+        word_ptr.push(0);
+        let mut word_count = 0usize;
+        for len in row_word_len {
+            word_count += len;
+            word_ptr.push(to_u32(word_count, "bitcsr word count"));
+        }
+
+        let mut words = vec![0u64; word_count];
+        for edge in &edges {
+            set_neighbor_bit(&word_ptr, &mut words, edge.u as usize, edge.v as usize);
+            set_neighbor_bit(&word_ptr, &mut words, edge.v as usize, edge.u as usize);
+        }
+
+        let mut val_ptr = Vec::with_capacity(word_count + 1);
+        val_ptr.push(0);
+        let mut value_count = 0usize;
+        for &word in &words {
+            value_count += word.count_ones() as usize;
+            val_ptr.push(to_u32(value_count, "bitcsr value count"));
+        }
+        debug_assert_eq!(value_count, edges.len() * 2, "duplicate edge in EdgeList");
+
+        let mut val = vec![0.0f32; value_count];
+        for edge in edges {
+            set_edge_distance(
+                &word_ptr,
+                &words,
+                &val_ptr,
+                &mut val,
+                edge.u as usize,
+                edge.v as usize,
+                edge.distance,
+            );
+            set_edge_distance(
+                &word_ptr,
+                &words,
+                &val_ptr,
+                &mut val,
+                edge.v as usize,
+                edge.u as usize,
+                edge.distance,
+            );
+        }
 
         Self {
             n,
             word_ptr,
             words,
             val_ptr,
-            val: val_out,
+            val,
         }
-    }
-
-    /// Build directly from raw CSR parts produced by the point-cloud preprocessor
-    /// (`pdist_csr`). Rows must be descending by neighbour id.
-    pub(crate) fn from_csr_parts(
-        n: usize,
-        row_ptr: Vec<usize>,
-        col: Vec<u16>,
-        val: Vec<f32>,
-    ) -> Self {
-        debug_assert_eq!(row_ptr.len(), n + 1);
-        debug_assert_eq!(col.len(), val.len());
-        debug_assert_eq!(*row_ptr.last().unwrap_or(&0), col.len());
-        debug_assert!((0..n).all(|v| col[row_ptr[v]..row_ptr[v + 1]]
-            .windows(2)
-            .all(|w| w[0] > w[1])));
-
-        Self::from_sorted_rows(n, &row_ptr, &col, &val)
     }
 
     // ── Accessors ─────────────────────────────────────────────────────────────
@@ -444,11 +415,34 @@ pub(crate) fn bits_above(bit: usize) -> u64 {
     }
 }
 
+#[inline(always)]
+fn set_neighbor_bit(word_ptr: &[u32], words: &mut [u64], row: usize, neighbor: usize) {
+    let flat = word_ptr[row] as usize + (neighbor >> 6);
+    words[flat] |= 1u64 << (neighbor & 63);
+}
+
+#[inline(always)]
+fn set_edge_distance(
+    word_ptr: &[u32],
+    words: &[u64],
+    val_ptr: &[u32],
+    val: &mut [f32],
+    row: usize,
+    neighbor: usize,
+    distance: f32,
+) {
+    let flat = word_ptr[row] as usize + (neighbor >> 6);
+    let bit = neighbor & 63;
+    let rank = (words[flat] & bits_above(bit)).count_ones() as usize;
+    val[val_ptr[flat] as usize + rank] = distance;
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::engine::algorithm::{compute, for_each_edge};
-    use crate::preprocess::pdist::{dmat_csr, square_from_lower_tri};
+    use crate::preprocess::_pdist::square_from_lower_tri;
+    use crate::preprocess::edgelist::EdgeList;
     use crate::types::BarcodeResult;
 
     fn barcodes_equal(a: &BarcodeResult, b: &BarcodeResult) -> bool {
@@ -480,12 +474,9 @@ mod tests {
     /// distance-matrix path.
     fn bitcsr_from_lower_tri(lt: &[f32], n: usize, threshold: f32) -> (BitCsrDistanceMatrix, f32) {
         let sq = square_from_lower_tri(n, lt);
-        let adj = dmat_csr(&sq, n, threshold);
-        let eff = threshold.min(adj.r_cheb);
-        (
-            BitCsrDistanceMatrix::from_csr_parts(n, adj.row_ptr, adj.col, adj.val),
-            eff,
-        )
+        let edges = EdgeList::from_distance_matrix(&sq, n, threshold);
+        let effective = edges.threshold;
+        (BitCsrDistanceMatrix::from_edge_list(edges), effective)
     }
 
     /// The sequential and parallel assembly paths must produce bit-identical

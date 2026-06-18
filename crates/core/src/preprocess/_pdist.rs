@@ -1,20 +1,20 @@
-//! Distance preprocessing: point cloud (or precomputed distance matrix) → the
-//! adjacency the engine consumes, plus the Chebyshev radius and center.
+//! Legacy distance preprocessing retained for dense compatibility utilities and
+//! edge-list equivalence tests.
 //!
 //! The V3 tiled kernel (`micro_kernel` / `pack_panel`) is the O(n²·d) hot path and
-//! is byte-for-byte the source V3. Three things are built on top of it:
+//! is byte-for-byte the source V3. Two paths are built on top of it:
 //!
-//! - [`pdist_csr`] / [`dmat_csr`]: input → [`Adjacency`] (CSR parts kept at the
-//!   minimax radius + `r_cheb` + `c_star`). This is what `persistent_homology`
-//!   feeds to `BitCsrDistanceMatrix::from_csr_parts`.
+//! - [`pdist_csr`] / [`dmat_csr`]: legacy input → [`Adjacency`] construction,
+//!   retained temporarily for equivalence tests during the edge-list migration.
 //! - [`pdist_tiled_v3`] / [`condense_square_matrix`]: input → the full condensed
-//!   lower-triangular distance vector, used by `filtration_size` (clique counting)
-//!   and `opt::peel`.
+//!   lower-triangular distance vector retained only for quotient compatibility.
 //!
 //! `R_cheb = min_i max_j d(i, j)` is only known after every distance is seen, so
 //! the point-cloud adjacency build is *adaptive*: a single buffered pass while the
 //! pair set fits a memory budget, falling back to a memory-safe two-pass build
 //! (radius first, then adjacency at the known radius) for very large n.
+
+#![allow(dead_code)] // Legacy compatibility code retained during EdgeList migration.
 
 const MR: usize = 16;
 const NR: usize = 16;
@@ -170,9 +170,9 @@ fn reduce_minimax(max_dist: &[f32]) -> (usize, f32) {
 // Adjacency: CSR parts + radius + center
 // ═══════════════════════════════════════════════════════════════════════════════
 
-/// Sparse adjacency in CSR form (rows DESCENDING by neighbour id, as
-/// `BitCsrDistanceMatrix::from_csr_parts` requires) plus the Chebyshev radius and
-/// center. Edges kept are those with `d ≤ min(threshold, r_cheb)`.
+/// Sparse adjacency in CSR form (rows DESCENDING by neighbour id), plus the
+/// Chebyshev radius and center. Edges kept are those with
+/// `d ≤ min(threshold, r_cheb)`.
 pub struct Adjacency {
     pub row_ptr: Vec<usize>,
     pub col: Vec<u16>,
@@ -505,7 +505,7 @@ pub fn dmat_csr(mat: &[f32], n: usize, threshold: f32) -> Adjacency {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// Full condensed distance vector (for filtration_size / opt::peel)
+// Full condensed distance vector (legacy quotient compatibility)
 // ═══════════════════════════════════════════════════════════════════════════════
 
 #[inline(always)]
@@ -572,8 +572,7 @@ fn store_tile_partial(
 }
 
 /// Pairwise Euclidean distances (condensed lower-triangular), the Chebyshev
-/// center, and the minimax radius `(distances, c_star, r_cheb)`. Used by
-/// `filtration_size` (clique counting) and `opt::peel`.
+/// center, and the minimax radius `(distances, c_star, r_cheb)`.
 pub fn pdist_tiled_v3(data: &[f32], n: usize, d: usize) -> (Vec<f32>, usize, f32) {
     debug_assert_eq!(data.len(), n * d);
     if n < 2 {
@@ -608,8 +607,7 @@ pub fn pdist_tiled_v3(data: &[f32], n: usize, d: usize) -> (Vec<f32>, usize, f32
 /// condensed layout, together with the Chebyshev center and minimax radius
 /// `(condensed, c_star, r_cheb)` (length `n*(n-1)/2`). Entries `≥ NO_EDGE` are
 /// stored verbatim but excluded from the minimax; an all-no-edge row is isolated.
-/// Mirrors [`pdist_tiled_v3`]'s return shape so distance-matrix and point-cloud
-/// inputs feed `filtration_size` / `opt::peel` identically.
+/// Mirrors [`pdist_tiled_v3`]'s return shape for the quotient compatibility path.
 ///
 /// # Panics
 /// If `mat.len() != n*n` or `n > u16::MAX`.

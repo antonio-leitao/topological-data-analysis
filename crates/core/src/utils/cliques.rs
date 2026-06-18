@@ -1,9 +1,7 @@
 //! Vietoris–Rips clique (simplex) counting up to a fixed size.
 //!
-//! Single public entry point: [`count_cliques`]. Given a condensed distance
-//! matrix, a scale `threshold`, and a maximum simplex size `max_size` (a count
-//! of *vertices*), it returns the number of cliques of size `1..=max_size` in
-//! the graph whose edges are the point pairs at distance `≤ threshold`.
+//! [`count_cliques`] consumes a truncated weighted edge list and returns the
+//! number of cliques of size `1..=max_size`, where `max_size` counts vertices.
 //! Equivalently, this is the Vietoris–Rips filtration size truncated at that
 //! scale and dimension (a clique of size `k` is a `(k-1)`-simplex):
 //!
@@ -11,16 +9,14 @@
 //!   * `max_size = 2` → + edges,
 //!   * `max_size = 3` → + triangles, and so on.
 //!
-//! Method. Build, for every vertex `i`, the bitset of its lower-indexed
-//! neighbours `N⁻(i) = {j < i : d(i, j) ≤ threshold}`. Those rows are exactly
-//! the contiguous blocks of the condensed matrix, so the build is one linear
-//! sweep. Then enumerate cliques largest-vertex-first: each clique is rooted at
-//! its maximum vertex and grown downward by intersecting candidate sets, which
-//! keeps every clique canonical (counted once) with no per-candidate ordering
-//! test. The intersection trims trailing-zero words so deeper intersections
-//! stay short, scratch is allocated once per recursion depth and reused, and
-//! the deepest level — where cliques can no longer grow — is counted by
-//! `popcount` rather than bit-by-bit.
+//! Method. Build, for every vertex `i`, the bitset of its lower-indexed neighbors
+//! `N-(i) = {j < i : (i, j) is an edge}`. Then enumerate cliques
+//! largest-vertex-first: each clique is rooted at its maximum vertex and grown
+//! downward by intersecting candidate sets, which keeps every clique canonical
+//! and counted once. The intersection trims trailing-zero words, scratch is
+//! reused by recursion depth, and the deepest level is counted by `popcount`.
+
+use crate::preprocess::edgelist::EdgeList;
 
 /// Set bit `v` in a dynamically-sized bit vector, growing it if needed.
 #[inline]
@@ -103,23 +99,9 @@ fn extend(
     }
 }
 
-/// Number of cliques of size `1..=max_size` in the Vietoris–Rips graph of a
-/// finite metric space at scale `threshold` — its truncated filtration size.
-///
-/// `d` is the lower-triangular condensed distance matrix (length `n*(n-1)/2`,
-/// as produced by [`crate::pdist::pdist_tiled_v3`]); `n` is recovered from its
-/// length. An edge joins two points iff their distance is `≤ threshold`. A
-/// length-0 matrix is treated as a single point (`n = 1`).
-pub fn count_cliques(d: &[f32], threshold: f32, max_size: usize) -> usize {
-    // Recover n from the condensed length m = n(n-1)/2.
-    let m = d.len();
-    let n = ((1.0 + (1.0 + 8.0 * m as f64).sqrt()) / 2.0).round() as usize;
-    debug_assert_eq!(
-        n * (n - 1) / 2,
-        m,
-        "count_cliques: distance length {m} is not n(n-1)/2 for any n"
-    );
-
+/// Number of cliques of size `1..=max_size` in a truncated weighted graph.
+pub(crate) fn count_cliques(edge_list: EdgeList, max_size: usize) -> usize {
+    let EdgeList { n, edges, .. } = edge_list;
     // No clique can exceed n vertices; clamp so absurd max_size neither
     // over-allocates scratch nor over-grows the recursion.
     let max_size = max_size.min(n);
@@ -128,19 +110,17 @@ pub fn count_cliques(d: &[f32], threshold: f32, max_size: usize) -> usize {
     if max_size <= 1 {
         return n;
     }
+    if max_size == 2 {
+        return n + edges.len();
+    }
 
-    // Lower-neighbour adjacency: adj[i] = {j < i : d(i, j) ≤ threshold}, read
-    // straight from the contiguous condensed row d[i(i-1)/2 .. i(i-1)/2 + i].
+    // Lower-neighbor adjacency: every edge is canonical with u > v.
     let mut adj: Vec<Vec<u64>> = vec![Vec::new(); n];
-    let mut base = 0;
-    for i in 1..n {
-        let row = &d[base..base + i];
-        for (j, &dist) in row.iter().enumerate() {
-            if dist <= threshold {
-                set_bit(&mut adj[i], j);
-            }
-        }
-        base += i;
+    for edge in edges {
+        let u = edge.u as usize;
+        let v = edge.v as usize;
+        debug_assert!(u < n && u > v);
+        set_bit(&mut adj[u], v);
     }
 
     let mut count = n; // size-1 simplices (vertices)
@@ -161,17 +141,28 @@ pub fn count_cliques(d: &[f32], threshold: f32, max_size: usize) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::preprocess::edgelist::{Edge, EdgeList};
 
-    fn edge(d: &[f32], a: usize, b: usize, thr: f32) -> bool {
-        if a == b {
-            return false;
+    fn edge_list(n: usize, edges: Vec<Edge>) -> EdgeList {
+        EdgeList {
+            n,
+            edges,
+            center: 0,
+            threshold: 1.0,
+            sorted: false,
         }
-        let (i, j) = if a > b { (a, b) } else { (b, a) }; // i > j
-        d[i * (i - 1) / 2 + j] <= thr
     }
 
     /// O(2ⁿ) reference: count every vertex subset of size ≤ max_size that is a clique.
-    fn brute(d: &[f32], n: usize, thr: f32, max_size: usize) -> usize {
+    fn brute(n: usize, edges: &[Edge], max_size: usize) -> usize {
+        let mut adjacency = vec![vec![false; n]; n];
+        for edge in edges {
+            let u = edge.u as usize;
+            let v = edge.v as usize;
+            adjacency[u][v] = true;
+            adjacency[v][u] = true;
+        }
+
         let mut count = 0usize;
         for mask in 1u32..(1u32 << n) {
             let verts: Vec<usize> = (0..n).filter(|&k| (mask >> k) & 1 == 1).collect();
@@ -181,7 +172,7 @@ mod tests {
             let mut ok = true;
             'pairs: for a in 0..verts.len() {
                 for b in (a + 1)..verts.len() {
-                    if !edge(d, verts[a], verts[b], thr) {
+                    if !adjacency[verts[a]][verts[b]] {
                         ok = false;
                         break 'pairs;
                     }
@@ -196,23 +187,31 @@ mod tests {
 
     #[test]
     fn k4_complete() {
-        let d = vec![1.0f32; 6]; // 4 points, all pairwise distance 1
-        assert_eq!(count_cliques(&d, 1.0, 1), 4); // vertices
-        assert_eq!(count_cliques(&d, 1.0, 2), 10); // + 6 edges
-        assert_eq!(count_cliques(&d, 1.0, 3), 14); // + 4 triangles
-        assert_eq!(count_cliques(&d, 1.0, 4), 15); // + 1 tetrahedron
-        assert_eq!(count_cliques(&d, 1.0, 9), 15); // max_size clamps to n
-        assert_eq!(count_cliques(&d, 0.5, 4), 4); // threshold below all edges
+        let edges: Vec<Edge> = (1..4)
+            .flat_map(|u| {
+                (0..u).map(move |v| Edge {
+                    u,
+                    v,
+                    distance: 1.0,
+                })
+            })
+            .collect();
+        assert_eq!(count_cliques(edge_list(4, edges.clone()), 1), 4);
+        assert_eq!(count_cliques(edge_list(4, edges.clone()), 2), 10);
+        assert_eq!(count_cliques(edge_list(4, edges.clone()), 3), 14);
+        assert_eq!(count_cliques(edge_list(4, edges.clone()), 4), 15);
+        assert_eq!(count_cliques(edge_list(4, edges), 9), 15);
+        assert_eq!(count_cliques(edge_list(4, Vec::new()), 4), 4);
     }
 
     #[test]
     fn single_point() {
-        assert_eq!(count_cliques(&[], 10.0, 3), 1);
+        assert_eq!(count_cliques(edge_list(1, Vec::new()), 3), 1);
     }
 
     #[test]
     fn matches_brute_force() {
-        // Deterministic xorshift over random condensed matrices.
+        // Deterministic xorshift over random graph topologies.
         let mut s: u64 = 0x9E37_79B9_7F4A_7C15;
         let mut rng = || {
             s ^= s << 13;
@@ -221,14 +220,25 @@ mod tests {
             (s >> 40) as f32 / 16_777_216.0
         };
         for n in 2..=8usize {
-            let m = n * (n - 1) / 2;
             for _ in 0..40 {
-                let d: Vec<f32> = (0..m).map(|_| rng()).collect();
                 for &thr in &[0.2f32, 0.4, 0.5, 0.7, 0.9, 1.0] {
+                    let mut edges = Vec::new();
+                    for u in 1..n {
+                        for v in 0..u {
+                            let distance = rng();
+                            if distance <= thr {
+                                edges.push(Edge {
+                                    u: u as u16,
+                                    v: v as u16,
+                                    distance,
+                                });
+                            }
+                        }
+                    }
                     for max_size in 1..=n {
                         assert_eq!(
-                            count_cliques(&d, thr, max_size),
-                            brute(&d, n, thr, max_size),
+                            count_cliques(edge_list(n, edges.clone()), max_size),
+                            brute(n, &edges, max_size),
                             "n={n} thr={thr} max_size={max_size}"
                         );
                     }
