@@ -1,35 +1,30 @@
 //! Python bindings for the `tda` core crate.
 //!
-//! Two endpoints, mirroring the core API but collapsing the point-cloud /
-//! distance-matrix split into a single `distance_matrix` flag (the 2-D NumPy
-//! array already carries the shape):
+//! Two endpoints. The point-cloud / distance-matrix split collapses into a
+//! single `distance_matrix` flag: the 2-D NumPy array already carries the shape,
+//! so for a point cloud the ambient dimension is the column count (the core
+//! re-infers it as `len / n`), and `distance_matrix` is the only disambiguator
+//! when the array is square (`d == n`).
 //!
 //!   * `persistent_homology(data, max_dim=1, threshold=None,
-//!                          distance_matrix=False, quotient=False, peel=False)`
+//!                          distance_matrix=False, quotient=False, peel=False,
+//!                          parallel=True)`
 //!       → list of `(k, 2)` float32 arrays `[[birth, death], …]`, one per
 //!         homology dimension `0..=max_dim` (Ripser-compatible `dgms` layout;
 //!         essential classes carry `death = inf`).
 //!
-//!   * `filtration_size(data, max_dim=1, threshold=None, distance_matrix=False)`
+//!   * `filtration_size(data, max_dim=1, threshold=None, distance_matrix=False,
+//!                      quotient=False, peel=False)`
 //!       → int, the simplex count of the filtered complex (dimension ≤ max_dim).
 //!
-//! Cargo.toml (this crate is separate from the core; e.g. `crates/python`):
-//!
-//! ```toml
-//! [lib]
-//! name = "tda"
-//! crate-type = ["cdylib"]
-//!
-//! [dependencies]
-//! # Point `package` at the core crate's actual name if it isn't `tda`.
-//! tda_core = { path = "../core", package = "tda" }
-//! pyo3 = { version = "0.22", features = ["extension-module"] }
-//! numpy = "0.22"
-//! ```
+//! When `data` is square and `distance_matrix=False`, the input is ambiguous
+//! (square point cloud vs. distance matrix); a `UserWarning` is emitted naming
+//! the interpretation actually used.
 
 use numpy::{IntoPyArray, PyArray2, PyArrayMethods, PyReadonlyArray2};
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
+use pyo3::types::PyDict;
 
 /// Flatten a 2-D array into a row-major `Vec<f32>` plus its `(rows, cols)`.
 /// `ndarray`'s logical iteration is row-major regardless of the underlying
@@ -56,6 +51,25 @@ fn to_py_err(e: tda_core::Error) -> PyErr {
     PyValueError::new_err(e.to_string())
 }
 
+/// Best-effort `UserWarning` for the `d == n` footgun: square data on the points
+/// path is byte-identical to a distance matrix. Fired only when ambiguous, so it
+/// costs nothing on the common non-square call. A failed warn must never abort
+/// the computation.
+fn warn_square_points(py: Python<'_>, rows: usize, cols: usize) {
+    if rows != cols {
+        return;
+    }
+    let msg = format!(
+        "tda: input is square ({rows}×{rows}); interpreting it as {rows} points in \
+         {rows}-D. Pass distance_matrix=True if it is a distance matrix."
+    );
+    if let Ok(warnings) = py.import("warnings") {
+        let kwargs = PyDict::new(py);
+        let _ = kwargs.set_item("stacklevel", 2);
+        let _ = warnings.call_method("warn", (msg,), Some(&kwargs));
+    }
+}
+
 fn barcode_to_py<'py>(
     py: Python<'py>,
     barcode: tda_core::BarcodeResult,
@@ -71,9 +85,20 @@ fn barcode_to_py<'py>(
     Ok(dgms)
 }
 
+/// Branch-specific input guard, shared by both endpoints. For a distance matrix,
+/// enforce squareness; for points, warn on the square (`d == n`) ambiguity.
+#[inline]
+fn check_input(py: Python<'_>, rows: usize, cols: usize, distance_matrix: bool) -> PyResult<()> {
+    if distance_matrix {
+        require_square(rows, cols)?;
+    } else {
+        warn_square_points(py, rows, cols);
+    }
+    Ok(())
+}
 /// Vietoris–Rips persistent homology.
 #[pyfunction]
-#[pyo3(signature = (data, max_dim=1, threshold=None, distance_matrix=false, quotient=false, peel=false))]
+#[pyo3(signature = (data, max_dim=1, threshold=None, distance_matrix=false, quotient=false, peel=false, parallel=true))]
 fn persistent_homology<'py>(
     py: Python<'py>,
     data: PyReadonlyArray2<'py, f32>,
@@ -82,17 +107,22 @@ fn persistent_homology<'py>(
     distance_matrix: bool,
     quotient: bool,
     peel: bool,
+    parallel: bool,
 ) -> PyResult<Vec<Bound<'py, PyArray2<f32>>>> {
     let (flat, rows, cols) = flatten(&data);
 
-    let barcode = if distance_matrix {
-        require_square(rows, cols)?;
-        tda_core::persistent_homology_from_distances(
-            &flat, rows, max_dim, threshold, quotient, peel,
-        )
-    } else {
-        tda_core::persistent_homology(&flat, rows, cols, max_dim, threshold, quotient, peel)
-    }
+    check_input(py, rows, cols, distance_matrix)?;
+
+    let barcode = tda_core::persistent_homology(
+        &flat,
+        rows,
+        max_dim,
+        threshold,
+        distance_matrix,
+        quotient,
+        peel,
+        parallel,
+    )
     .map_err(to_py_err)?;
 
     barcode_to_py(py, barcode)
@@ -101,8 +131,9 @@ fn persistent_homology<'py>(
 /// Truncated Vietoris–Rips filtration size (simplices of dimension ≤ max_dim).
 #[pyfunction]
 #[pyo3(signature = (data, max_dim=1, threshold=None, distance_matrix=false, quotient=false, peel=false))]
-fn filtration_size(
-    data: PyReadonlyArray2<'_, f32>,
+fn filtration_size<'py>(
+    py: Python<'py>,
+    data: PyReadonlyArray2<'py, f32>,
     max_dim: usize,
     threshold: Option<f32>,
     distance_matrix: bool,
@@ -111,12 +142,17 @@ fn filtration_size(
 ) -> PyResult<usize> {
     let (flat, rows, cols) = flatten(&data);
 
-    if distance_matrix {
-        require_square(rows, cols)?;
-        tda_core::filtration_size_from_distances(&flat, rows, max_dim, threshold, quotient, peel)
-    } else {
-        tda_core::filtration_size(&flat, rows, cols, max_dim, threshold, quotient, peel)
-    }
+    check_input(py, rows, cols, distance_matrix)?;
+
+    tda_core::filtration_size(
+        &flat,
+        rows,
+        max_dim,
+        threshold,
+        distance_matrix,
+        quotient,
+        peel,
+    )
     .map_err(to_py_err)
 }
 

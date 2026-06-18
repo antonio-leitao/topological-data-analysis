@@ -17,119 +17,98 @@ pub const MAX_DIM: usize = 4;
 // Persistent homology
 // ═══════════════════════════════════════════════════════════════════════════════
 
-/// Compute Vietoris–Rips persistent homology from a row-major `(n, d)`
-/// point cloud using the BitCSR sparse backend.
+/// Vietoris–Rips persistent homology over the BitCSR sparse backend.
+///
+/// `data` is a row-major `&[f32]` whose length is:
+///   * `n * n` when `distance_matrix` is true — the strict lower triangle is
+///     read; symmetry, zero diagonal, and non-negativity are documented
+///     preconditions, not enforced invariants, and `f32::INFINITY` is a valid
+///     "disconnected" entry; or
+///   * `n * d` otherwise — a point cloud, with `d` inferred as `data.len() / n`.
+///
+/// The two layouts collide at `d == n` (square data): they are byte-identical,
+/// so `distance_matrix` is the *only* thing that disambiguates them — pass it
+/// correctly. (The Python layer warns on this case; the core cannot, since its
+/// hot caller is the benchmark loop.)
 ///
 /// `peel` tightens the truncation radius via a sound strong collapse
-/// ([`opt::peel`]) — strictly cheaper, identical barcode. `quotient` rewrites
-/// the filtration into a quotient-cover (complete-linkage) coning
-/// ([`opt::coperto`]) before reduction — strictly smaller, and `log 3`-interleaved
-/// with VR rather than equal. The two compose: when both are set, `peel` runs
-/// first and `quotient` reuses its sort.
+/// ([`opt::peel`]) — strictly cheaper, identical barcode. `quotient` rewrites the
+/// filtration into a quotient-cover (complete-linkage) coning ([`opt::coperto`]) —
+/// strictly smaller, and `log 3`-interleaved with VR rather than equal. When both
+/// are set, `peel` runs first and `quotient` reuses its sort. `parallel` enables
+/// the rayon assembly path in the reduction.
 pub fn persistent_homology(
-    points: &[f32],
-    n: usize,
-    d: usize,
-    max_dim: usize,
-    threshold: Option<f32>,
-    quotient: bool,
-    peel: bool,
-) -> Result<BarcodeResult> {
-    validate_params(n, max_dim, threshold)?;
-    let edges = edges_from_points(points, n, d, threshold, quotient, peel)?;
-    let bitcsr = engine::BitCsrDistanceMatrix::from_edge_list(edges);
-    Ok(engine::algorithm::compute(&bitcsr, max_dim, true))
-}
-
-/// Compute Vietoris–Rips persistent homology from a row-major `(n, n)`
-/// distance matrix. Symmetry, zero diagonal, and non-negativity are
-/// documented preconditions, not enforced invariants.
-///
-/// See [`persistent_homology`] for the meaning of `peel` and `quotient`.
-pub fn persistent_homology_from_distances(
-    distances: &[f32],
+    data: &[f32],
     n: usize,
     max_dim: usize,
     threshold: Option<f32>,
+    distance_matrix: bool,
     quotient: bool,
     peel: bool,
+    parallel: bool,
 ) -> Result<BarcodeResult> {
-    validate_params(n, max_dim, threshold)?;
-    let edges = edges_from_distances(distances, n, threshold, quotient, peel)?;
-    let bitcsr = engine::BitCsrDistanceMatrix::from_edge_list(edges);
-    Ok(engine::algorithm::compute(&bitcsr, max_dim, true))
+    let edges = build_edges(data, n, max_dim, threshold, distance_matrix, quotient, peel)?;
+    Ok(compute_barcode(edges, max_dim, parallel))
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // Filtration size
 // ═══════════════════════════════════════════════════════════════════════════════
+//
+// No `parallel` flag: the simplex count runs through `count_cliques`, which has
+// no parallel path. See [`persistent_homology`] for the `data` / `distance_matrix`
+// layout contract and the meaning of `peel` / `quotient`.
 
 pub fn filtration_size(
-    points: &[f32],
-    n: usize,
-    d: usize,
-    max_dim: usize,
-    threshold: Option<f32>,
-    quotient: bool,
-    peel: bool,
-) -> Result<usize> {
-    validate_params(n, max_dim, threshold)?;
-    let edges = edges_from_points(points, n, d, threshold, quotient, peel)?;
-    Ok(utils::cliques::count_cliques(edges, max_dim + 2))
-}
-
-pub fn filtration_size_from_distances(
-    distances: &[f32],
+    data: &[f32],
     n: usize,
     max_dim: usize,
     threshold: Option<f32>,
+    distance_matrix: bool,
     quotient: bool,
     peel: bool,
 ) -> Result<usize> {
-    validate_params(n, max_dim, threshold)?;
-    let edges = edges_from_distances(distances, n, threshold, quotient, peel)?;
+    let edges = build_edges(data, n, max_dim, threshold, distance_matrix, quotient, peel)?;
     Ok(utils::cliques::count_cliques(edges, max_dim + 2))
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// Shared edge-list construction
+// Shared construction (the hourglass waist)
 // ═══════════════════════════════════════════════════════════════════════════════
 
-/// Build the final `EdgeList` for a point cloud: distances → optional `peel` →
-/// optional `quotient` coning. The single boundary shared by the homology and
+/// Validate, build the truncated `EdgeList` for whichever input layout, then
+/// apply the optional transforms. The single boundary shared by the homology and
 /// filtration-size paths and by both input modes.
-fn edges_from_points(
-    points: &[f32],
+///
+/// `max_dim` is validated up front, before the O(n²·d) distance build, so an
+/// out-of-range value fails fast rather than after the work.
+fn build_edges(
+    data: &[f32],
     n: usize,
-    d: usize,
+    max_dim: usize,
     threshold: Option<f32>,
+    distance_matrix: bool,
     quotient: bool,
     peel: bool,
 ) -> Result<EdgeList> {
-    validate_point_shape(points, n, d)?;
-    let mut edges = EdgeList::from_points(points, n, d, threshold.unwrap_or(f32::INFINITY));
+    validate_params(n, max_dim, threshold)?;
+    let t = threshold.unwrap_or(f32::INFINITY);
+
+    let mut edges = if distance_matrix {
+        validate_distance_shape(data, n)?;
+        EdgeList::from_distance_matrix(data, n, t)
+    } else {
+        let d = infer_dimension(data, n)?;
+        EdgeList::from_points(data, n, d, t)
+    };
+
     apply_optimizations(&mut edges, peel, quotient);
     Ok(edges)
 }
 
-/// Build the final `EdgeList` for a distance matrix. See [`edges_from_points`].
-fn edges_from_distances(
-    distances: &[f32],
-    n: usize,
-    threshold: Option<f32>,
-    quotient: bool,
-    peel: bool,
-) -> Result<EdgeList> {
-    validate_distance_shape(distances, n)?;
-    let mut edges =
-        EdgeList::from_distance_matrix(distances, n, threshold.unwrap_or(f32::INFINITY));
-    apply_optimizations(&mut edges, peel, quotient);
-    Ok(edges)
-}
-
-/// Apply the optional transforms in canonical order: `peel` first (an exact,
-/// barcode-preserving truncation that tightens the radius and leaves the edges
-/// sorted), then `quotient` coning (`coperto`, which reuses that sort).
+/// Apply the optional transforms in canonical order: `peel` first (exact,
+/// barcode-preserving, leaves the edges sorted), then `quotient` coning
+/// (`coperto`, which reuses that sort).
 #[inline]
 fn apply_optimizations(edges: &mut EdgeList, peel: bool, quotient: bool) {
     if peel {
@@ -140,19 +119,30 @@ fn apply_optimizations(edges: &mut EdgeList, peel: bool, quotient: bool) {
     }
 }
 
+/// Reduce an `EdgeList` to a barcode through the BitCSR backend. The homology
+/// back-half, mirroring `count_cliques` for the filtration-size path.
 #[inline]
-fn validate_point_shape(points: &[f32], n: usize, d: usize) -> Result<()> {
-    if d == 0 {
+fn compute_barcode(edges: EdgeList, max_dim: usize, parallel: bool) -> BarcodeResult {
+    let bitcsr = engine::BitCsrDistanceMatrix::from_edge_list(edges);
+    engine::algorithm::compute(&bitcsr, max_dim, parallel)
+}
+
+/// Recover the ambient dimension of a row-major point cloud from its flat length.
+/// `n` is already validated (`>= 2`), so the division is safe.
+#[inline]
+fn infer_dimension(points: &[f32], n: usize) -> Result<usize> {
+    let len = points.len();
+    if len == 0 {
         return Err(Error::EmptyDimension);
     }
-    if points.len() != n * d {
+    if len % n != 0 {
         return Err(Error::ShapeMismatch {
             n,
-            got: points.len(),
-            mode: "points (expected n*d)",
+            got: len,
+            mode: "points (length must be a multiple of n)",
         });
     }
-    Ok(())
+    Ok(len / n)
 }
 
 #[inline]
@@ -213,14 +203,23 @@ mod pipeline_tests {
         }
     }
 
+    fn ring_distances() -> ([f32; 8], [f32; 16]) {
+        let s = std::f32::consts::SQRT_2;
+        let points = [0.0, 0.0, 1.0, 0.0, 1.0, 1.0, 0.0, 1.0];
+        let distances = [
+            0.0, 1.0, s, 1.0, 1.0, 0.0, 1.0, s, s, 1.0, 0.0, 1.0, 1.0, s, 1.0, 0.0,
+        ];
+        (points, distances)
+    }
+
     #[test]
     fn point_pipeline_peel_preserves_barcode() {
         let points = [
             0.0, 0.0, 0.1, 0.0, 0.0, 0.1, 0.1, 0.1, 0.05, 0.05, 0.2, 0.05, 0.05, 0.2,
         ];
         let n = points.len() / 2;
-        let plain = persistent_homology(&points, n, 2, 2, None, false, false).unwrap();
-        let peeled = persistent_homology(&points, n, 2, 2, None, false, true).unwrap();
+        let plain = persistent_homology(&points, n, 2, None, false, false, false, true).unwrap();
+        let peeled = persistent_homology(&points, n, 2, None, false, false, true, true).unwrap();
         assert_same_barcode(&plain, &peeled);
     }
 
@@ -239,9 +238,9 @@ mod pipeline_tests {
         }
 
         let plain =
-            persistent_homology_from_distances(&distances, n, 1, Some(1.5), false, false).unwrap();
+            persistent_homology(&distances, n, 1, Some(1.5), true, false, false, true).unwrap();
         let peeled =
-            persistent_homology_from_distances(&distances, n, 1, Some(1.5), false, true).unwrap();
+            persistent_homology(&distances, n, 1, Some(1.5), true, false, true, true).unwrap();
         assert_same_barcode(&plain, &peeled);
     }
 
@@ -262,61 +261,78 @@ mod pipeline_tests {
         }
 
         let plain =
-            persistent_homology_from_distances(&distances, n, 1, Some(1.5), false, false).unwrap();
+            persistent_homology(&distances, n, 1, Some(1.5), true, false, false, true).unwrap();
         let peeled =
-            persistent_homology_from_distances(&distances, n, 1, Some(1.5), false, true).unwrap();
+            persistent_homology(&distances, n, 1, Some(1.5), true, false, true, true).unwrap();
         assert_same_barcode(&plain, &peeled);
     }
 
     #[test]
-    fn filtration_size_consumes_edge_list_for_both_input_modes() {
-        let points = [0.0, 0.0, 1.0, 0.0, 1.0, 1.0, 0.0, 1.0];
-        let diagonal = std::f32::consts::SQRT_2;
-        let distances = [
-            0.0, 1.0, diagonal, 1.0, 1.0, 0.0, 1.0, diagonal, diagonal, 1.0, 0.0, 1.0, 1.0,
-            diagonal, 1.0, 0.0,
+    fn parallel_flag_preserves_barcode() {
+        // The new flag must be behaviour-neutral: seq and par assembly agree.
+        let points = [
+            0.0, 0.0, 0.1, 0.0, 0.0, 0.1, 0.1, 0.1, 0.05, 0.05, 0.2, 0.05, 0.05, 0.2,
         ];
+        let n = points.len() / 2;
+        let seq = persistent_homology(&points, n, 2, None, false, false, false, false).unwrap();
+        let par = persistent_homology(&points, n, 2, None, false, false, false, true).unwrap();
+        assert_same_barcode(&seq, &par);
+    }
 
-        let point_count = filtration_size(&points, 4, 2, 1, Some(1.0), false, false).unwrap();
+    #[test]
+    fn filtration_size_matches_across_input_modes() {
+        let (points, distances) = ring_distances();
+
+        let point_count = filtration_size(&points, 4, 1, Some(1.0), false, false, false).unwrap();
         let matrix_count =
-            filtration_size_from_distances(&distances, 4, 1, Some(1.0), false, false).unwrap();
+            filtration_size(&distances, 4, 1, Some(1.0), true, false, false).unwrap();
         assert_eq!(point_count, 8); // 4 vertices + 4 cycle edges
         assert_eq!(matrix_count, point_count);
 
-        let peeled = filtration_size(&points, 4, 2, 1, None, false, true).unwrap();
-        let unpeeled = filtration_size(&points, 4, 2, 1, None, false, false).unwrap();
+        let peeled = filtration_size(&points, 4, 1, None, false, false, true).unwrap();
+        let unpeeled = filtration_size(&points, 4, 1, None, false, false, false).unwrap();
         assert!(peeled <= unpeeled);
     }
 
     #[test]
     fn quotient_filtration_matches_input_modes() {
-        let points = [0.0, 0.0, 1.0, 0.0, 1.0, 1.0, 0.0, 1.0];
-        let diagonal = std::f32::consts::SQRT_2;
-        let distances = [
-            0.0, 1.0, diagonal, 1.0, 1.0, 0.0, 1.0, diagonal, diagonal, 1.0, 0.0, 1.0, 1.0,
-            diagonal, 1.0, 0.0,
-        ];
-
-        let from_points = filtration_size(&points, 4, 2, 1, None, true, true).unwrap();
-        let from_matrix =
-            filtration_size_from_distances(&distances, 4, 1, None, true, true).unwrap();
+        let (points, distances) = ring_distances();
+        let from_points = filtration_size(&points, 4, 1, None, false, true, true).unwrap();
+        let from_matrix = filtration_size(&distances, 4, 1, None, true, true, true).unwrap();
         assert_eq!(from_points, from_matrix);
     }
 
     #[test]
     fn quotient_persistent_homology_matches_input_modes() {
-        // Regression anchor for the (previously `todo!()`) sparse quotient path:
-        // both input modes feed coperto the same edge set, so the barcodes agree.
-        let points = [0.0, 0.0, 1.0, 0.0, 1.0, 1.0, 0.0, 1.0];
-        let diagonal = std::f32::consts::SQRT_2;
-        let distances = [
-            0.0, 1.0, diagonal, 1.0, 1.0, 0.0, 1.0, diagonal, diagonal, 1.0, 0.0, 1.0, 1.0,
-            diagonal, 1.0, 0.0,
-        ];
-
-        let from_points = persistent_homology(&points, 4, 2, 1, None, true, true).unwrap();
+        // Regression anchor for the sparse quotient path: both input modes feed
+        // coperto the same edge set, so the barcodes agree.
+        let (points, distances) = ring_distances();
+        let from_points =
+            persistent_homology(&points, 4, 1, None, false, true, true, true).unwrap();
         let from_matrix =
-            persistent_homology_from_distances(&distances, 4, 1, None, true, true).unwrap();
+            persistent_homology(&distances, 4, 1, None, true, true, true, true).unwrap();
         assert_same_barcode(&from_points, &from_matrix);
+    }
+
+    #[test]
+    fn points_dimension_is_inferred() {
+        // 4 points in 2-D: length 8, n=4 ⇒ d=2 inferred, matching the explicit-d era.
+        let (points, _) = ring_distances();
+        let count = filtration_size(&points, 4, 1, Some(1.0), false, false, false).unwrap();
+        assert_eq!(count, 8);
+    }
+
+    #[test]
+    fn points_length_not_multiple_of_n_errors() {
+        let points = [0.0, 0.0, 1.0, 0.0, 1.0]; // length 5, n=2 ⇒ not divisible
+        let err = filtration_size(&points, 2, 1, None, false, false, false).unwrap_err();
+        assert!(matches!(err, Error::ShapeMismatch { .. }));
+    }
+
+    #[test]
+    fn empty_points_errors() {
+        let points: [f32; 0] = [];
+        let err = filtration_size(&points, 2, 1, None, false, false, false).unwrap_err();
+        assert!(matches!(err, Error::EmptyDimension));
     }
 }

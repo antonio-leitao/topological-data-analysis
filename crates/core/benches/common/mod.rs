@@ -103,10 +103,11 @@ pub fn run_once(dataset: &Dataset, max_dim: usize) -> tda_core::Result<BarcodeRe
     persistent_homology(
         &dataset.points,
         dataset.n,
-        dataset.d,
         max_dim,
         None,
         false,
         false,
+        false,
+        false, //benches should not be parallel
     )
 }
