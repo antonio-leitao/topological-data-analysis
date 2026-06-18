@@ -5,6 +5,8 @@ mod preprocess;
 mod types;
 mod utils;
 
+use preprocess::edgelist::EdgeList;
+
 pub use error::{Error, Result};
 pub use types::{BarcodeResult, PersistenceInterval};
 
@@ -21,8 +23,9 @@ pub const MAX_DIM: usize = 4;
 /// `peel` tightens the truncation radius via a sound strong collapse
 /// ([`opt::peel`]) — strictly cheaper, identical barcode. `quotient` rewrites
 /// the filtration into a quotient-cover (complete-linkage) coning
-/// ([`opt::coperto`]) before reduction. Quotient integration into the sparse
-/// pipeline is still pending.
+/// ([`opt::coperto`]) before reduction — strictly smaller, and `log 3`-interleaved
+/// with VR rather than equal. The two compose: when both are set, `peel` runs
+/// first and `quotient` reuses its sort.
 pub fn persistent_homology(
     points: &[f32],
     n: usize,
@@ -33,12 +36,9 @@ pub fn persistent_homology(
     peel: bool,
 ) -> Result<BarcodeResult> {
     validate_params(n, max_dim, threshold)?;
-
-    if quotient {
-        todo!("quotient reduction path is not yet integrated with EdgeList");
-    }
-
-    run_bitcsr_points(points, n, d, max_dim, threshold, peel, true)
+    let edges = edges_from_points(points, n, d, threshold, quotient, peel)?;
+    let bitcsr = engine::BitCsrDistanceMatrix::from_edge_list(edges);
+    Ok(engine::algorithm::compute(&bitcsr, max_dim, true))
 }
 
 /// Compute Vietoris–Rips persistent homology from a row-major `(n, n)`
@@ -55,38 +55,9 @@ pub fn persistent_homology_from_distances(
     peel: bool,
 ) -> Result<BarcodeResult> {
     validate_params(n, max_dim, threshold)?;
-
-    if quotient {
-        todo!("quotient reduction path is not yet integrated with EdgeList");
-    }
-
-    validate_distance_shape(distances, n)?;
-    let user_t = threshold.unwrap_or(f32::INFINITY);
-    let mut edges = preprocess::edgelist::EdgeList::from_distance_matrix(distances, n, user_t);
-    if peel {
-        opt::peel::peel(&mut edges);
-    }
+    let edges = edges_from_distances(distances, n, threshold, quotient, peel)?;
     let bitcsr = engine::BitCsrDistanceMatrix::from_edge_list(edges);
     Ok(engine::algorithm::compute(&bitcsr, max_dim, true))
-}
-
-fn run_bitcsr_points(
-    points: &[f32],
-    n: usize,
-    d: usize,
-    max_dim: usize,
-    threshold: Option<f32>,
-    peel: bool,
-    parallel: bool,
-) -> Result<BarcodeResult> {
-    validate_point_shape(points, n, d)?;
-    let user_t = threshold.unwrap_or(f32::INFINITY);
-    let mut edges = preprocess::edgelist::EdgeList::from_points(points, n, d, user_t);
-    if peel {
-        opt::peel::peel(&mut edges);
-    }
-    let bitcsr = engine::BitCsrDistanceMatrix::from_edge_list(edges);
-    Ok(engine::algorithm::compute(&bitcsr, max_dim, parallel))
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -103,24 +74,7 @@ pub fn filtration_size(
     peel: bool,
 ) -> Result<usize> {
     validate_params(n, max_dim, threshold)?;
-    if quotient {
-        let (mut lt, center, minimax) = condense_points(points, n, d)?;
-        let threshold =
-            apply_dense_quotient_optimizations(&mut lt, n, center, minimax, threshold, peel);
-        let edges = edge_list_from_condensed(&lt, n, center, threshold);
-        return Ok(utils::cliques::count_cliques(edges, max_dim + 2));
-    }
-
-    validate_point_shape(points, n, d)?;
-    let mut edges = preprocess::edgelist::EdgeList::from_points(
-        points,
-        n,
-        d,
-        threshold.unwrap_or(f32::INFINITY),
-    );
-    if peel {
-        opt::peel::peel(&mut edges);
-    }
+    let edges = edges_from_points(points, n, d, threshold, quotient, peel)?;
     Ok(utils::cliques::count_cliques(edges, max_dim + 2))
 }
 
@@ -133,38 +87,57 @@ pub fn filtration_size_from_distances(
     peel: bool,
 ) -> Result<usize> {
     validate_params(n, max_dim, threshold)?;
-    if quotient {
-        let (mut lt, center, minimax) = condense_distances(distances, n)?;
-        let threshold =
-            apply_dense_quotient_optimizations(&mut lt, n, center, minimax, threshold, peel);
-        let edges = edge_list_from_condensed(&lt, n, center, threshold);
-        return Ok(utils::cliques::count_cliques(edges, max_dim + 2));
-    }
-
-    validate_distance_shape(distances, n)?;
-    let mut edges = preprocess::edgelist::EdgeList::from_distance_matrix(
-        distances,
-        n,
-        threshold.unwrap_or(f32::INFINITY),
-    );
-    if peel {
-        opt::peel::peel(&mut edges);
-    }
+    let edges = edges_from_distances(distances, n, threshold, quotient, peel)?;
     Ok(utils::cliques::count_cliques(edges, max_dim + 2))
 }
 
-/// Legacy point-cloud condensation for the quotient compatibility path.
-#[inline]
-fn condense_points(points: &[f32], n: usize, d: usize) -> Result<(Vec<f32>, usize, f32)> {
+// ═══════════════════════════════════════════════════════════════════════════════
+// Shared edge-list construction
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Build the final `EdgeList` for a point cloud: distances → optional `peel` →
+/// optional `quotient` coning. The single boundary shared by the homology and
+/// filtration-size paths and by both input modes.
+fn edges_from_points(
+    points: &[f32],
+    n: usize,
+    d: usize,
+    threshold: Option<f32>,
+    quotient: bool,
+    peel: bool,
+) -> Result<EdgeList> {
     validate_point_shape(points, n, d)?;
-    Ok(preprocess::_pdist::pdist_tiled_v3(points, n, d))
+    let mut edges = EdgeList::from_points(points, n, d, threshold.unwrap_or(f32::INFINITY));
+    apply_optimizations(&mut edges, peel, quotient);
+    Ok(edges)
 }
 
-/// Legacy distance-matrix condensation for the quotient compatibility path.
-#[inline]
-fn condense_distances(distances: &[f32], n: usize) -> Result<(Vec<f32>, usize, f32)> {
+/// Build the final `EdgeList` for a distance matrix. See [`edges_from_points`].
+fn edges_from_distances(
+    distances: &[f32],
+    n: usize,
+    threshold: Option<f32>,
+    quotient: bool,
+    peel: bool,
+) -> Result<EdgeList> {
     validate_distance_shape(distances, n)?;
-    Ok(preprocess::_pdist::condense_square_matrix(distances, n))
+    let mut edges =
+        EdgeList::from_distance_matrix(distances, n, threshold.unwrap_or(f32::INFINITY));
+    apply_optimizations(&mut edges, peel, quotient);
+    Ok(edges)
+}
+
+/// Apply the optional transforms in canonical order: `peel` first (an exact,
+/// barcode-preserving truncation that tightens the radius and leaves the edges
+/// sorted), then `quotient` coning (`coperto`, which reuses that sort).
+#[inline]
+fn apply_optimizations(edges: &mut EdgeList, peel: bool, quotient: bool) {
+    if peel {
+        opt::peel::peel(edges);
+    }
+    if quotient {
+        opt::coperto::cone_in_place(edges);
+    }
 }
 
 #[inline]
@@ -217,68 +190,6 @@ fn validate_params(n: usize, max_dim: usize, threshold: Option<f32>) -> Result<(
         }
     }
     Ok(())
-}
-
-#[inline]
-fn resolve_threshold(user: Option<f32>, minimax: f32) -> f32 {
-    match user {
-        None => minimax,
-        Some(t) => t.min(minimax),
-    }
-}
-
-#[inline]
-fn apply_dense_quotient_optimizations(
-    lt: &mut Vec<f32>,
-    n: usize,
-    c_star: usize,
-    minimax: f32,
-    threshold: Option<f32>,
-    peel: bool,
-) -> f32 {
-    let mut t = resolve_threshold(threshold, minimax);
-
-    if peel {
-        let mut edges = edge_list_from_condensed(lt, n, c_star, t);
-        opt::peel::peel(&mut edges);
-        t = edges.threshold;
-    }
-    opt::coperto::cone_in_place(lt, t);
-
-    t
-}
-
-/// Temporary compatibility adapter for dense filtration-size and quotient paths.
-/// Removed once both consumers operate directly on `EdgeList`.
-fn edge_list_from_condensed(
-    distances: &[f32],
-    n: usize,
-    center: usize,
-    threshold: f32,
-) -> preprocess::edgelist::EdgeList {
-    let mut edges = Vec::new();
-    let mut k = 0usize;
-    for u in 1..n {
-        for v in 0..u {
-            let distance = distances[k];
-            if distance <= threshold && distance < f32::MAX {
-                edges.push(preprocess::edgelist::Edge {
-                    u: u as u16,
-                    v: v as u16,
-                    distance,
-                });
-            }
-            k += 1;
-        }
-    }
-
-    preprocess::edgelist::EdgeList {
-        n,
-        edges,
-        center: center as u16,
-        threshold,
-        sorted: false,
-    }
 }
 
 #[cfg(test)]
@@ -378,7 +289,7 @@ mod pipeline_tests {
     }
 
     #[test]
-    fn quotient_filtration_compatibility_still_matches_input_modes() {
+    fn quotient_filtration_matches_input_modes() {
         let points = [0.0, 0.0, 1.0, 0.0, 1.0, 1.0, 0.0, 1.0];
         let diagonal = std::f32::consts::SQRT_2;
         let distances = [
@@ -390,5 +301,22 @@ mod pipeline_tests {
         let from_matrix =
             filtration_size_from_distances(&distances, 4, 1, None, true, true).unwrap();
         assert_eq!(from_points, from_matrix);
+    }
+
+    #[test]
+    fn quotient_persistent_homology_matches_input_modes() {
+        // Regression anchor for the (previously `todo!()`) sparse quotient path:
+        // both input modes feed coperto the same edge set, so the barcodes agree.
+        let points = [0.0, 0.0, 1.0, 0.0, 1.0, 1.0, 0.0, 1.0];
+        let diagonal = std::f32::consts::SQRT_2;
+        let distances = [
+            0.0, 1.0, diagonal, 1.0, 1.0, 0.0, 1.0, diagonal, diagonal, 1.0, 0.0, 1.0, 1.0,
+            diagonal, 1.0, 0.0,
+        ];
+
+        let from_points = persistent_homology(&points, 4, 2, 1, None, true, true).unwrap();
+        let from_matrix =
+            persistent_homology_from_distances(&distances, 4, 1, None, true, true).unwrap();
+        assert_same_barcode(&from_points, &from_matrix);
     }
 }

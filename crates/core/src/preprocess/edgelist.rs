@@ -374,28 +374,27 @@ fn points_two_pass(data: &[f32], n: usize, d: usize, threshold: f32) -> EdgeList
     }
 }
 
+/// Lower-triangular fixture → symmetric square matrix. Test-only helper shared
+/// with the engine fixtures (formerly `_pdist::square_from_lower_tri`).
+#[cfg(test)]
+pub(crate) fn square_from_lower_tri(n: usize, lt: &[f32]) -> Vec<f32> {
+    debug_assert_eq!(lt.len(), n * (n - 1) / 2);
+    let mut sq = vec![0.0f32; n * n];
+    let mut p = 0;
+    for i in 1..n {
+        for j in 0..i {
+            let d = lt[p];
+            p += 1;
+            sq[i * n + j] = d;
+            sq[j * n + i] = d;
+        }
+    }
+    sq
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::preprocess::_pdist::{self as pdist, Adjacency};
-
-    fn old_half_edges(adjacency: &Adjacency, n: usize) -> Vec<Edge> {
-        let mut edges = Vec::new();
-        for u in 0..n {
-            for k in adjacency.row_ptr[u]..adjacency.row_ptr[u + 1] {
-                let v = adjacency.col[k] as usize;
-                if u > v {
-                    edges.push(Edge {
-                        u: u as u16,
-                        v: v as u16,
-                        distance: adjacency.val[k],
-                    });
-                }
-            }
-        }
-        edges.sort_unstable_by_key(|edge| (edge.u, edge.v));
-        edges
-    }
 
     fn sorted_edges(edge_list: &EdgeList) -> Vec<Edge> {
         let mut edges = edge_list.edges.clone();
@@ -403,40 +402,9 @@ mod tests {
         edges
     }
 
-    fn assert_matches_old(edge_list: &EdgeList, adjacency: &Adjacency, threshold: f32) {
-        assert_eq!(edge_list.n + 1, adjacency.row_ptr.len());
-        assert_eq!(edge_list.center as usize, adjacency.c_star);
-        assert_eq!(
-            edge_list.threshold.to_bits(),
-            threshold.min(adjacency.r_cheb).to_bits()
-        );
-        assert!(!edge_list.sorted);
-        assert_eq!(
-            sorted_edges(edge_list),
-            old_half_edges(adjacency, edge_list.n)
-        );
-        assert!(edge_list
-            .edges
-            .iter()
-            .all(|edge| edge.u > edge.v && edge.distance <= edge_list.threshold));
-    }
-
     #[test]
-    fn point_cloud_matches_legacy_pdist() {
-        let n = 9;
-        let d = 3;
-        let points: Vec<f32> = (0..n)
-            .flat_map(|i| {
-                let x = i as f32;
-                [x * 0.31, (x * 1.7).sin(), (x * 0.43).cos()]
-            })
-            .collect();
-
-        for threshold in [0.6, 1.4, f32::INFINITY] {
-            let edge_list = EdgeList::from_points(&points, n, d, threshold);
-            let adjacency = pdist::pdist_csr(&points, n, d, threshold);
-            assert_matches_old(&edge_list, &adjacency, threshold);
-        }
+    fn edge_is_eight_bytes() {
+        assert_eq!(std::mem::size_of::<Edge>(), 8);
     }
 
     #[test]
@@ -457,35 +425,5 @@ mod tests {
                 assert_eq!(sorted_edges(&single), sorted_edges(&double));
             }
         }
-    }
-
-    #[test]
-    fn distance_matrix_matches_legacy_pdist() {
-        let n = 6;
-        let lower = [
-            0.4,
-            1.2,
-            0.9,
-            f32::MAX,
-            1.7,
-            0.8,
-            1.4,
-            0.6,
-            1.1,
-            0.7,
-            1.9,
-            1.3,
-            0.5,
-            1.6,
-            1.0,
-        ];
-        let matrix = pdist::square_from_lower_tri(n, &lower);
-
-        for threshold in [0.75, 1.25, f32::INFINITY] {
-            let edge_list = EdgeList::from_distance_matrix(&matrix, n, threshold);
-            let adjacency = pdist::dmat_csr(&matrix, n, threshold);
-            assert_matches_old(&edge_list, &adjacency, threshold);
-        }
-        assert_eq!(std::mem::size_of::<Edge>(), 8);
     }
 }

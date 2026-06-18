@@ -726,7 +726,7 @@ pub fn compute(dist: &BitCsrDistanceMatrix, max_dim: usize, parallel: bool) -> B
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::preprocess::_pdist::square_from_lower_tri;
+    use crate::preprocess::edgelist::square_from_lower_tri;
     use crate::preprocess::edgelist::EdgeList;
 
     /// Build a BitCSR from a lower-triangular fixture (through the real pdist

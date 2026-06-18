@@ -441,7 +441,7 @@ fn set_edge_distance(
 mod tests {
     use super::*;
     use crate::engine::algorithm::{compute, for_each_edge};
-    use crate::preprocess::_pdist::square_from_lower_tri;
+    use crate::preprocess::edgelist::square_from_lower_tri;
     use crate::preprocess::edgelist::EdgeList;
     use crate::types::BarcodeResult;
 
