@@ -1,119 +1,175 @@
-// FastHeap: eager N-ary max-heap over Simplex128 (N = ARITY). Drop-in for the
-// 2-ary version; every push restores the invariant (no lazy heapify — small,
-// frequent batches made lazy heapify pay O(N) per read). Pop is O(log_N).
-// append_raw + heapify is the bulk-load path (Floyd build, used by the
-// reduction's coboundary init).
+// FastHeap: a collection of local N-ary heaps (N = ARITY), with a small binary
+// heap containing one head per local heap. Consecutive pushes form a batch;
+// the first read Floyd-heapifies that batch in O(k), instead of paying k
+// dependent sift-ups through one potentially huge global heap.
 
 use crate::engine::simplex::Simplex128;
+use std::collections::{binary_heap::PeekMut, BinaryHeap};
+
 const ARITY: usize = 8;
+const COMPACT_MIN_ENTRIES: usize = 16 * 1024;
+
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct RunHead {
+    key: Simplex128,
+    run: usize,
+}
+
+#[derive(Clone, Copy)]
+struct Run {
+    start: usize,
+    len: usize,
+}
 
 pub struct FastHeap {
-    data: Vec<Simplex128>,
+    arena: Vec<Simplex128>,
+    runs: Vec<Run>,
+    heads: BinaryHeap<RunHead>,
+    pending_start: usize,
+    pending_max: Option<usize>,
+    live_len: usize,
 }
 
 impl FastHeap {
     #[inline]
     pub fn new() -> Self {
-        Self { data: Vec::new() }
+        Self {
+            arena: Vec::new(),
+            runs: Vec::new(),
+            heads: BinaryHeap::new(),
+            pending_start: 0,
+            pending_max: None,
+            live_len: 0,
+        }
     }
 
     #[inline]
     pub fn with_capacity(cap: usize) -> Self {
         Self {
-            data: Vec::with_capacity(cap),
+            arena: Vec::with_capacity(cap),
+            ..Self::new()
         }
     }
 
     #[inline]
     pub fn is_empty(&self) -> bool {
-        self.data.is_empty()
+        self.live_len == 0
     }
 
     #[inline]
     pub fn clear(&mut self) {
-        self.data.clear();
+        self.arena.clear();
+        self.runs.clear();
+        self.heads.clear();
+        self.pending_start = 0;
+        self.pending_max = None;
+        self.live_len = 0;
     }
 
     #[inline]
     pub fn peek(&self) -> Option<&Simplex128> {
-        self.data.first()
+        let finalized = self.heads.peek().map(|head| &head.key);
+        let pending = self.pending_max.map(|index| &self.arena[index]);
+        match (finalized, pending) {
+            (Some(a), Some(b)) => Some(if a >= b { a } else { b }),
+            (Some(a), None) => Some(a),
+            (None, Some(b)) => Some(b),
+            (None, None) => None,
+        }
     }
 
     #[inline(always)]
     pub fn push(&mut self, item: Simplex128) {
-        let pos = self.data.len();
-        self.data.push(item);
-        if pos == 0 {
-            return;
-        }
-        // SAFETY: we just pushed at index `pos`, so data has `pos + 1`
-        // elements; ptr is valid for that range. We only ever index in
-        // [0, pos], inclusive.
-        unsafe {
-            let ptr = self.data.as_mut_ptr();
-            let mut pos = pos;
-            while pos > 0 {
-                let parent = (pos - 1) / ARITY;
-                let p_val = *ptr.add(parent);
-                if p_val >= item {
-                    break;
-                }
-                *ptr.add(pos) = p_val;
-                pos = parent;
-            }
-            *ptr.add(pos) = item;
+        let index = self.arena.len();
+        self.arena.push(item);
+        self.live_len += 1;
+        if self
+            .pending_max
+            .is_none_or(|max_index| item > self.arena[max_index])
+        {
+            self.pending_max = Some(index);
         }
     }
-    /// Append without restoring the heap invariant. Caller MUST call
-    /// `heapify()` before the next read (`peek` / `pop` / `get_pivot` /
-    /// `pop_pivot`). Useful for bulk-loading an empty heap, where Floyd's
-    /// O(N) build beats N sequential O(log N) sift-ups.
+
+    /// Append to the current batch. Kept as the explicit bulk-build spelling
+    /// used by the initial coboundary path.
     #[inline(always)]
     pub fn append_raw(&mut self, item: Simplex128) {
-        self.data.push(item);
+        self.push(item);
     }
 
+    #[inline]
     pub fn heapify(&mut self) {
-        let n = self.data.len();
-        if n <= 1 {
+        self.finalize_pending();
+    }
+
+    fn finalize_pending(&mut self) {
+        let end = self.arena.len();
+        let len = end - self.pending_start;
+        if len == 0 {
             return;
         }
-        let last_internal = (n - 2) / ARITY;
-        // SAFETY: indices in [0, last_internal] are all < n; sift_down_4ary
-        // only accesses [0, n). Simplex128 is Copy, so the temporary `item`
-        // copy is sound even with the raw pointer aliasing the buffer.
+
         unsafe {
-            let ptr = self.data.as_mut_ptr();
-            let mut pos = last_internal as isize;
-            while pos >= 0 {
-                let item = *ptr.add(pos as usize);
-                sift_down(ptr, pos as usize, n, item);
-                pos -= 1;
-            }
+            heapify_slice(self.arena.as_mut_ptr().add(self.pending_start), len);
         }
+
+        let run = self.runs.len();
+        self.runs.push(Run {
+            start: self.pending_start,
+            len,
+        });
+        self.heads.push(RunHead {
+            key: self.arena[self.pending_start],
+            run,
+        });
+        self.pending_start = end;
+        self.pending_max = None;
     }
-    // ── Pop: take root, sift last down (4-ary) ─────────────────────────────
 
     pub fn pop(&mut self) -> Option<Simplex128> {
-        let n = self.data.len();
-        if n == 0 {
-            return None;
-        }
-        // SAFETY: n ≥ 1 verified above. set_len with n−1 leaves data valid
-        // because Simplex128 is Copy. ptr remains valid for the original n
-        // elements until function return.
-        unsafe {
-            let ptr = self.data.as_mut_ptr();
-            let result = *ptr;
-            if n == 1 {
-                self.data.set_len(0);
-                return Some(result);
+        self.finalize_pending();
+
+        let result;
+        {
+            let mut head = self.heads.peek_mut()?;
+            let run = &mut self.runs[head.run];
+            result = unsafe { pop_heap(self.arena.as_mut_ptr().add(run.start), &mut run.len) };
+            debug_assert_eq!(result, head.key);
+
+            if run.len == 0 {
+                PeekMut::pop(head);
+            } else {
+                head.key = self.arena[run.start];
             }
-            let last = *ptr.add(n - 1);
-            self.data.set_len(n - 1);
-            sift_down(ptr, 0, n - 1, last);
-            Some(result)
         }
+
+        self.live_len -= 1;
+        self.maybe_compact();
+        Some(result)
+    }
+
+    fn maybe_compact(&mut self) {
+        let dead = self.arena.len() - self.live_len;
+        if self.arena.len() < COMPACT_MIN_ENTRIES || dead <= self.live_len {
+            return;
+        }
+
+        let mut write = 0;
+        for run in &mut self.runs {
+            if run.len == 0 {
+                continue;
+            }
+            if run.start != write {
+                self.arena
+                    .copy_within(run.start..run.start + run.len, write);
+            }
+            run.start = write;
+            write += run.len;
+        }
+        debug_assert_eq!(write, self.live_len);
+        self.arena.truncate(write);
+        self.pending_start = write;
     }
 
     // ── Z/2 cancellation (unchanged from original) ─────────────────────────
@@ -221,6 +277,32 @@ unsafe fn sift_down(ptr: *mut Simplex128, mut pos: usize, end: usize, item: Simp
         pos = best;
     }
     *ptr.add(pos) = item;
+}
+
+#[inline]
+unsafe fn heapify_slice(ptr: *mut Simplex128, len: usize) {
+    if len <= 1 {
+        return;
+    }
+    let mut pos = ((len - 2) / ARITY) as isize;
+    while pos >= 0 {
+        let item = *ptr.add(pos as usize);
+        sift_down(ptr, pos as usize, len, item);
+        pos -= 1;
+    }
+}
+
+#[inline]
+unsafe fn pop_heap(ptr: *mut Simplex128, len: &mut usize) -> Simplex128 {
+    let n = *len;
+    debug_assert!(n > 0);
+    let result = *ptr;
+    *len = n - 1;
+    if n > 1 {
+        let last = *ptr.add(n - 1);
+        sift_down(ptr, 0, n - 1, last);
+    }
+    result
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -394,5 +476,60 @@ mod tests {
             out_bulk.push(v);
         }
         assert_eq!(out_push, out_bulk);
+    }
+
+    #[test]
+    fn multiple_batches_match_binary_heap() {
+        let mut h = FastHeap::new();
+        let mut reference = BinaryHeap::new();
+        let mut x: u64 = 0xa5a5_1234_dead_beef;
+
+        for phase in 0..32 {
+            for _ in 0..512 {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                let value = s(x as u128);
+                h.push(value);
+                reference.push(value);
+            }
+            h.heapify();
+
+            if phase % 3 == 2 {
+                for _ in 0..300 {
+                    assert_eq!(h.pop(), reference.pop());
+                }
+            }
+        }
+
+        while let Some(expected) = reference.pop() {
+            assert_eq!(h.pop(), Some(expected));
+        }
+        assert!(h.is_empty());
+    }
+
+    #[test]
+    fn compaction_preserves_run_offsets() {
+        let mut h = FastHeap::new();
+        for value in 0..20_000u128 {
+            h.push(s(value));
+        }
+        h.heapify();
+
+        for expected in (5_000..20_000u128).rev() {
+            assert_eq!(h.pop(), Some(s(expected)));
+        }
+        assert!(h.arena.len() < 20_000);
+
+        for value in 30_000..31_000u128 {
+            h.push(s(value));
+        }
+        for expected in (30_000..31_000u128).rev() {
+            assert_eq!(h.pop(), Some(s(expected)));
+        }
+        for expected in (0..5_000u128).rev() {
+            assert_eq!(h.pop(), Some(s(expected)));
+        }
+        assert!(h.is_empty());
     }
 }

@@ -17,3 +17,9 @@ categories = ["mathematics", "science"]
 debug = "line-tables-only"
 split-debuginfo = "packed"
 strip = false
+
+[profile.profiling]
+inherits = "release"     # keep opt-level, LTO, codegen-units from release
+debug = true             # add full debuginfo -> source-line attribution in samply
+# debug = "line-tables-only"   # leaner alternative: line info only, faster link
+# force-frame-pointers = true  # optional: extra-robust unwinding of inlined release stacks

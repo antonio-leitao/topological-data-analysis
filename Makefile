@@ -19,6 +19,8 @@ PROFILE_RATE ?= 1000
 PROFILE_DIR ?= target/profiles
 PROFILE_H2_LAST_DATASET ?= hiv1.txt
 PROFILE_REPEATS ?= 1
+PROFILE_PROFILE     ?= profiling
+PROFILE_TARGET_DIR  ?= target/$(PROFILE_PROFILE)
 DATASET ?=
 SAMPLY ?= samply
 
@@ -59,9 +61,10 @@ bench: ## Run BitCSR Rust core benchmarks
 	@echo "$(CYAN)📊 Running BitCSR Rust core benchmarks...$(RESET)"
 	@TDA_MAX_DIM=$(MAX_DIM) cargo bench -p $(BENCH_CRATE) --bench $(BENCH_NAME)
 
-profile-build: ## Build the single-run profiling runner
+
+profile-build: ## Build the single-run profiling runner (optimized + line info)
 	@echo "$(CYAN)📦 Building profiling runner...$(RESET)"
-	@cargo build --release -p $(BENCH_CRATE) --example profile_runner
+	@cargo build --profile $(PROFILE_PROFILE) -p $(BENCH_CRATE) --example profile_runner
 
 profile: profile-build ## Profile one dataset with samply (DATASET=dragon_2000.txt)
 	@if [ -z "$(DATASET)" ]; then \
@@ -79,25 +82,8 @@ profile: profile-build ## Profile one dataset with samply (DATASET=dragon_2000.t
 		--unstable-presymbolicate \
 		--rate $(PROFILE_RATE) \
 		-o "$$out" \
-		-- target/release/examples/profile_runner "$(MAX_DIM)" "$$file" "$(PROFILE_REPEATS)"; \
+		-- $(PROFILE_TARGET_DIR)/examples/profile_runner "$(MAX_DIM)" "$$file" "$(PROFILE_REPEATS)"; \
 	echo "$(GREEN)✅ Profile written to $$out.$(RESET)"
-
-profile-all: profile-build ## Profile every dataset with samply
-	@OUT_DIR="$(PROFILE_DIR)/bitcsr_h$(MAX_DIM)"; \
-	mkdir -p "$$OUT_DIR"; \
-	DATASETS=$$(awk -v max_dim="$(MAX_DIM)" -v cutoff="$(PROFILE_H2_LAST_DATASET)" 'NF && $$1 !~ /^#/ { print $$1; if (max_dim == 2 && $$1 == cutoff) exit }' data/datasets.txt); \
-	for file in $$DATASETS; do \
-		name=$${file%.txt}; \
-		out="$$OUT_DIR/$$name.json.gz"; \
-		echo "$(CYAN)📊 Profiling bitcsr_h$(MAX_DIM)/$$name...$(RESET)"; \
-		$(SAMPLY) record \
-			--save-only \
-			--unstable-presymbolicate \
-			--rate $(PROFILE_RATE) \
-			-o "$$out" \
-			-- target/release/examples/profile_runner "$(MAX_DIM)" "$$file" "$(PROFILE_REPEATS)"; \
-	done; \
-	echo "$(GREEN)✅ Profiles written to $$OUT_DIR.$(RESET)"
 
 # ── Publish ───────────────────────────────────────────────────────────────
 
