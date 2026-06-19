@@ -26,7 +26,6 @@ pub struct FastHeap {
     runs: Vec<Run>,
     heads: BinaryHeap<RunHead>,
     pending_start: usize,
-    pending_max: Option<usize>,
     live_len: usize,
 }
 
@@ -38,7 +37,6 @@ impl FastHeap {
             runs: Vec::new(),
             heads: BinaryHeap::new(),
             pending_start: 0,
-            pending_max: None,
             live_len: 0,
         }
     }
@@ -62,33 +60,19 @@ impl FastHeap {
         self.runs.clear();
         self.heads.clear();
         self.pending_start = 0;
-        self.pending_max = None;
         self.live_len = 0;
     }
 
     #[inline]
-    pub fn peek(&self) -> Option<&Simplex128> {
-        let finalized = self.heads.peek().map(|head| &head.key);
-        let pending = self.pending_max.map(|index| &self.arena[index]);
-        match (finalized, pending) {
-            (Some(a), Some(b)) => Some(if a >= b { a } else { b }),
-            (Some(a), None) => Some(a),
-            (None, Some(b)) => Some(b),
-            (None, None) => None,
-        }
+    pub fn peek(&mut self) -> Option<&Simplex128> {
+        self.finalize_pending();
+        self.heads.peek().map(|head| &head.key)
     }
 
     #[inline(always)]
     pub fn push(&mut self, item: Simplex128) {
-        let index = self.arena.len();
         self.arena.push(item);
         self.live_len += 1;
-        if self
-            .pending_max
-            .is_none_or(|max_index| item > self.arena[max_index])
-        {
-            self.pending_max = Some(index);
-        }
     }
 
     /// Append to the current batch. Kept as the explicit bulk-build spelling
@@ -124,7 +108,6 @@ impl FastHeap {
             run,
         });
         self.pending_start = end;
-        self.pending_max = None;
     }
 
     pub fn pop(&mut self) -> Option<Simplex128> {
