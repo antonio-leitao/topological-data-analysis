@@ -5,6 +5,7 @@
 //! contractible for every `t >= R'`.
 
 use crate::preprocess::edgelist::EdgeList;
+use rayon::prelude::*;
 
 #[inline(always)]
 fn is_subset(a: &[u64], b: &[u64]) -> bool {
@@ -30,11 +31,17 @@ fn bit_set(bits: &[u64], i: usize) -> bool {
 /// The list is sorted by ascending `(distance, endpoints)`, truncated to the
 /// certified radius, and left sorted for subsequent optimizations. Its center is
 /// the fixed cone apex and is not changed.
-pub(crate) fn peel(edge_list: &mut EdgeList) {
+pub(crate) fn peel(edge_list: &mut EdgeList, parallel: bool) {
     if !edge_list.sorted {
-        edge_list
-            .edges
-            .sort_unstable_by_key(|edge| (edge.distance.to_bits(), edge.u, edge.v));
+        if parallel {
+            edge_list
+                .edges
+                .par_sort_unstable_by_key(|edge| (edge.distance.to_bits(), edge.u, edge.v));
+        } else {
+            edge_list
+                .edges
+                .sort_unstable_by_key(|edge| (edge.distance.to_bits(), edge.u, edge.v));
+        }
         edge_list.sorted = true;
     }
 
@@ -237,8 +244,8 @@ mod tests {
 
     #[test]
     fn trivial_size_is_contractible_at_zero() {
-        let mut edge_list = EdgeList::from_points(&[0.0, 0.0], 1, 2, f32::INFINITY);
-        peel(&mut edge_list);
+        let mut edge_list = EdgeList::from_points(&[0.0, 0.0], 1, 2, f32::INFINITY, false);
+        peel(&mut edge_list, false);
         assert_eq!(edge_list.threshold, 0.0);
         assert!(edge_list.edges.is_empty());
         assert!(edge_list.sorted);
@@ -253,10 +260,10 @@ mod tests {
                 points.push(y as f32);
             }
         }
-        let mut edge_list = EdgeList::from_points(&points, 9, 2, f32::INFINITY);
+        let mut edge_list = EdgeList::from_points(&points, 9, 2, f32::INFINITY, false);
         let center = edge_list.center;
         let initial_threshold = edge_list.threshold;
-        peel(&mut edge_list);
+        peel(&mut edge_list, false);
         assert!(edge_list.threshold.is_finite() && edge_list.threshold >= 0.0);
         assert_finalized(&edge_list, center, initial_threshold);
     }
@@ -269,7 +276,7 @@ mod tests {
         let matrix = square_from_lower_tri(5, &lower);
         let mut edge_list = EdgeList::from_distance_matrix(&matrix, 5, 1.5);
         let center = edge_list.center;
-        peel(&mut edge_list);
+        peel(&mut edge_list, false);
 
         assert_eq!(center, 0);
         assert!(
@@ -286,10 +293,10 @@ mod tests {
             0.0, 0.0, 0.1, 0.0, 0.0, 0.1, 0.1, 0.1, 0.05, 0.05, 0.2, 0.05, 0.05, 0.2,
         ];
         let n = points.len() / 2;
-        let mut edge_list = EdgeList::from_points(&points, n, 2, f32::INFINITY);
+        let mut edge_list = EdgeList::from_points(&points, n, 2, f32::INFINITY, false);
         let center = edge_list.center;
         let initial_threshold = edge_list.threshold;
-        peel(&mut edge_list);
+        peel(&mut edge_list, false);
 
         assert!(edge_list.threshold.is_finite() && edge_list.threshold >= 0.0);
         assert_finalized(&edge_list, center, initial_threshold);

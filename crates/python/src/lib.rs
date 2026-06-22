@@ -14,7 +14,7 @@
 //!         essential classes carry `death = inf`).
 //!
 //!   * `filtration_size(data, max_dim=1, threshold=None, distance_matrix=False,
-//!                      quotient=False, peel=False)`
+//!                      quotient=False, peel=False, parallel=True)`
 //!       → int, the simplex count of the filtered complex (dimension ≤ max_dim).
 //!
 //! When `data` is square and `distance_matrix=False`, the input is ambiguous
@@ -130,7 +130,7 @@ fn persistent_homology<'py>(
 
 /// Truncated Vietoris–Rips filtration size (simplices of dimension ≤ max_dim).
 #[pyfunction]
-#[pyo3(signature = (data, max_dim=1, threshold=None, distance_matrix=false, quotient=false, peel=false))]
+#[pyo3(signature = (data, max_dim=1, threshold=None, distance_matrix=false, quotient=false, peel=false, parallel=true))]
 fn filtration_size<'py>(
     py: Python<'py>,
     data: PyReadonlyArray2<'py, f32>,
@@ -139,6 +139,7 @@ fn filtration_size<'py>(
     distance_matrix: bool,
     quotient: bool,
     peel: bool,
+    parallel: bool,
 ) -> PyResult<usize> {
     let (flat, rows, cols) = flatten(&data);
 
@@ -152,6 +153,7 @@ fn filtration_size<'py>(
         distance_matrix,
         quotient,
         peel,
+        parallel,
     )
     .map_err(to_py_err)
 }

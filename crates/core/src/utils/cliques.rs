@@ -17,6 +17,10 @@
 //! reused by recursion depth, and the deepest level is counted by `popcount`.
 
 use crate::preprocess::edgelist::EdgeList;
+use rayon::prelude::*;
+
+const PARALLEL_CLIQUE_MIN_ROOTS: usize = 128;
+const PARALLEL_CLIQUE_MIN_EDGES: usize = 4096;
 
 /// Set bit `v` in a dynamically-sized bit vector, growing it if needed.
 #[inline]
@@ -100,7 +104,7 @@ fn extend(
 }
 
 /// Number of cliques of size `1..=max_size` in a truncated weighted graph.
-pub(crate) fn count_cliques(edge_list: EdgeList, max_size: usize) -> usize {
+pub(crate) fn count_cliques(edge_list: EdgeList, max_size: usize, parallel: bool) -> usize {
     let EdgeList { n, edges, .. } = edge_list;
     // No clique can exceed n vertices; clamp so absurd max_size neither
     // over-allocates scratch nor over-grows the recursion.
@@ -115,6 +119,7 @@ pub(crate) fn count_cliques(edge_list: EdgeList, max_size: usize) -> usize {
     }
 
     // Lower-neighbor adjacency: every edge is canonical with u > v.
+    let edge_count = edges.len();
     let mut adj: Vec<Vec<u64>> = vec![Vec::new(); n];
     for edge in edges {
         let u = edge.u as usize;
@@ -123,19 +128,35 @@ pub(crate) fn count_cliques(edge_list: EdgeList, max_size: usize) -> usize {
         set_bit(&mut adj[u], v);
     }
 
-    let mut count = n; // size-1 simplices (vertices)
-
-    // One reusable candidate buffer per interior recursion depth. A clique of
-    // size k is formed at depth k-2, and only sizes < max_size recurse, so the
-    // deepest interior level is k = max_size-1 → max_size-2 buffers.
-    let mut scratch: Vec<Vec<u64>> = (0..max_size - 2).map(|_| Vec::new()).collect();
-
-    for u in 0..n {
-        if !adj[u].is_empty() {
-            extend(&adj, &adj[u], 1, max_size, &mut scratch, &mut count);
+    let use_parallel =
+        parallel && n >= PARALLEL_CLIQUE_MIN_ROOTS && edge_count >= PARALLEL_CLIQUE_MIN_EDGES;
+    let rooted_count = if use_parallel {
+        adj.par_iter()
+            .map_init(
+                || (0..max_size - 2).map(|_| Vec::new()).collect::<Vec<_>>(),
+                |scratch, cand| {
+                    let mut count = 0;
+                    if !cand.is_empty() {
+                        extend(&adj, cand, 1, max_size, scratch, &mut count);
+                    }
+                    count
+                },
+            )
+            .sum()
+    } else {
+        // One reusable candidate buffer per interior recursion depth. A clique of
+        // size k is formed at depth k-2, and only sizes < max_size recurse, so the
+        // deepest interior level is k = max_size-1 → max_size-2 buffers.
+        let mut scratch: Vec<Vec<u64>> = (0..max_size - 2).map(|_| Vec::new()).collect();
+        let mut count = 0;
+        for cand in &adj {
+            if !cand.is_empty() {
+                extend(&adj, cand, 1, max_size, &mut scratch, &mut count);
+            }
         }
-    }
-    count
+        count
+    };
+    n + rooted_count
 }
 
 #[cfg(test)]
@@ -196,17 +217,17 @@ mod tests {
                 })
             })
             .collect();
-        assert_eq!(count_cliques(edge_list(4, edges.clone()), 1), 4);
-        assert_eq!(count_cliques(edge_list(4, edges.clone()), 2), 10);
-        assert_eq!(count_cliques(edge_list(4, edges.clone()), 3), 14);
-        assert_eq!(count_cliques(edge_list(4, edges.clone()), 4), 15);
-        assert_eq!(count_cliques(edge_list(4, edges), 9), 15);
-        assert_eq!(count_cliques(edge_list(4, Vec::new()), 4), 4);
+        assert_eq!(count_cliques(edge_list(4, edges.clone()), 1, false), 4);
+        assert_eq!(count_cliques(edge_list(4, edges.clone()), 2, false), 10);
+        assert_eq!(count_cliques(edge_list(4, edges.clone()), 3, false), 14);
+        assert_eq!(count_cliques(edge_list(4, edges.clone()), 4, false), 15);
+        assert_eq!(count_cliques(edge_list(4, edges), 9, false), 15);
+        assert_eq!(count_cliques(edge_list(4, Vec::new()), 4, false), 4);
     }
 
     #[test]
     fn single_point() {
-        assert_eq!(count_cliques(edge_list(1, Vec::new()), 3), 1);
+        assert_eq!(count_cliques(edge_list(1, Vec::new()), 3, false), 1);
     }
 
     #[test]
@@ -237,7 +258,7 @@ mod tests {
                     }
                     for max_size in 1..=n {
                         assert_eq!(
-                            count_cliques(edge_list(n, edges.clone()), max_size),
+                            count_cliques(edge_list(n, edges.clone()), max_size, false),
                             brute(n, &edges, max_size),
                             "n={n} thr={thr} max_size={max_size}"
                         );
@@ -245,5 +266,23 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn parallel_matches_sequential() {
+        let n = 96u16;
+        let edges: Vec<Edge> = (1..n)
+            .flat_map(|u| {
+                (0..u).map(move |v| Edge {
+                    u,
+                    v,
+                    distance: 1.0,
+                })
+            })
+            .collect();
+
+        let sequential = count_cliques(edge_list(n as usize, edges.clone()), 4, false);
+        let parallel = count_cliques(edge_list(n as usize, edges), 4, true);
+        assert_eq!(sequential, parallel);
     }
 }

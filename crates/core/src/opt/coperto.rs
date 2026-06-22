@@ -41,6 +41,7 @@ use std::collections::HashMap;
 use std::hash::{BuildHasherDefault, Hasher};
 
 use crate::preprocess::edgelist::{Edge, EdgeList};
+use rayon::prelude::*;
 
 /// FxHash-style hasher specialised for the `u32` cluster-root keys. No dependency.
 #[derive(Default)]
@@ -94,7 +95,7 @@ fn push_edge(out: &mut Vec<Edge>, a: u32, b: u32, distance: f32) {
 /// filtration. `n`, `center`, and `threshold` are preserved (every emitted edge
 /// is born at a scale `<= threshold`); the edge set is replaced and the list is
 /// marked unsorted.
-pub(crate) fn cone_in_place(edge_list: &mut EdgeList) {
+pub(crate) fn cone_in_place(edge_list: &mut EdgeList, parallel: bool) {
     let n = edge_list.n;
     if n <= 1 || edge_list.edges.is_empty() {
         return;
@@ -103,7 +104,11 @@ pub(crate) fn cone_in_place(edge_list: &mut EdgeList) {
     // Ascending (distance, endpoints). Reuses peel's sort when it already ran.
     let mut input = std::mem::take(&mut edge_list.edges);
     if !edge_list.sorted {
-        input.sort_unstable_by_key(|edge| (edge.distance.to_bits(), edge.u, edge.v));
+        if parallel {
+            input.par_sort_unstable_by_key(|edge| (edge.distance.to_bits(), edge.u, edge.v));
+        } else {
+            input.sort_unstable_by_key(|edge| (edge.distance.to_bits(), edge.u, edge.v));
+        }
     }
 
     // Union-find over cluster roots; roots are original vertex ids in `0..n`.
@@ -232,8 +237,8 @@ mod tests {
 
     #[test]
     fn trivial_input_is_a_noop() {
-        let mut e = EdgeList::from_points(&[0.0, 0.0], 1, 2, f32::INFINITY);
-        cone_in_place(&mut e);
+        let mut e = EdgeList::from_points(&[0.0, 0.0], 1, 2, f32::INFINITY, false);
+        cone_in_place(&mut e, false);
         assert!(e.edges.is_empty());
     }
 
@@ -244,7 +249,7 @@ mod tests {
         let n = 4;
         let matrix = square_from_lower_tri(n, &[1.0; 6]);
         let mut e = EdgeList::from_distance_matrix(&matrix, n, f32::INFINITY);
-        cone_in_place(&mut e);
+        cone_in_place(&mut e, false);
         assert_clean(&e);
         assert_eq!(e.edges.len(), n - 1);
         assert!(e.edges.iter().all(|edge| edge.distance == 1.0));
@@ -260,7 +265,7 @@ mod tests {
             .len();
 
         let mut quot = EdgeList::from_distance_matrix(&matrix, n, f32::INFINITY);
-        cone_in_place(&mut quot);
+        cone_in_place(&mut quot, false);
         assert_clean(&quot);
         assert!(quot.edges.len() < vr_edges);
     }
@@ -271,10 +276,10 @@ mod tests {
         let points = [0.0, 0.0, 1.0, 0.0, 1.0, 1.0, 0.0, 1.0];
         let matrix = square_from_lower_tri(4, &[1.0, s, 1.0, 1.0, s, 1.0]);
 
-        let mut from_points = EdgeList::from_points(&points, 4, 2, f32::INFINITY);
+        let mut from_points = EdgeList::from_points(&points, 4, 2, f32::INFINITY, false);
         let mut from_matrix = EdgeList::from_distance_matrix(&matrix, 4, f32::INFINITY);
-        cone_in_place(&mut from_points);
-        cone_in_place(&mut from_matrix);
+        cone_in_place(&mut from_points, false);
+        cone_in_place(&mut from_matrix, false);
 
         assert_eq!(edge_set(&from_points), edge_set(&from_matrix));
     }
@@ -293,8 +298,8 @@ mod tests {
             .sort_unstable_by_key(|e| (e.distance.to_bits(), e.u, e.v));
         presorted.sorted = true;
 
-        cone_in_place(&mut unsorted);
-        cone_in_place(&mut presorted);
+        cone_in_place(&mut unsorted, false);
+        cone_in_place(&mut presorted, false);
         assert_eq!(edge_set(&unsorted), edge_set(&presorted));
     }
 }
