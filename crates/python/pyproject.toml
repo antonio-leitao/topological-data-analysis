@@ -4,25 +4,29 @@ build-backend = "maturin"
 
 [project]
 name = "tda"
-version = "0.2.1"
-requires-python = ">=3.8"
+version = "0.3.0"
+requires-python = ">=3.11"
 description = "Topological Data Analysis in Python, written in Rust. Not limited to H0 and H1."
 readme = "../../README.md"
-license = { text = "MIT" }
+license = "MIT"
+license-files = ["LICENSE.md"]
 authors = [
   { name = "António Leitão", email = "aleitao@novaims.unl.pt" },
 ]
 keywords = ["topology", "homology", "tda", "persistent-homology", "ripser"]
 classifiers = [
     "Development Status :: 3 - Alpha",
-    "License :: OSI Approved :: MIT License",
-    "Operating System :: OS Independent",
     "Programming Language :: Rust",
     "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
     "Programming Language :: Python :: Implementation :: CPython",
     "Programming Language :: Python :: Implementation :: PyPy",
     "Topic :: Scientific/Engineering :: Mathematics",
 ]
+dependencies = ["numpy>=1.23"]
 
 [project.urls]
 Homepage = "https://github.com/antonio-leitao/topological-data-analysis"
@@ -30,7 +34,7 @@ Repository = "https://github.com/antonio-leitao/topological-data-analysis"
 Issues = "https://github.com/antonio-leitao/topological-data-analysis/issues"
 
 [project.optional-dependencies]
-dev = ["maturin", "ripser", "gudhi","numpy", "pandas"]
+dev = ["maturin", "ripser", "gudhi", "pandas"]
 
 [tool.maturin]
 features = ["pyo3/extension-module"]
