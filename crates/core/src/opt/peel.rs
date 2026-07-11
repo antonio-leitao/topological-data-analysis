@@ -84,6 +84,15 @@ pub(crate) fn peel(edge_list: &mut EdgeList, parallel: bool) {
         nbr_bits[v * nw + (v >> 6)] |= 1u64 << (v & 63);
     }
 
+    // Closed-neighborhood sizes for the O(1) domination precheck:
+    // N[w] ⊆ N[z] requires |N[w]| <= |N[z]|. Kept exact under edge removals,
+    // so the precheck only ever skips subset tests that would fail.
+    let mut deg: Vec<u32> = vec![1; n];
+    for edge in &edge_list.edges {
+        deg[edge.u as usize] += 1;
+        deg[edge.v as usize] += 1;
+    }
+
     let mut dirty: Vec<u32> = Vec::with_capacity(n);
     let mut in_dirty = vec![false; n];
     for x in 0..n {
@@ -118,6 +127,7 @@ pub(crate) fn peel(edge_list: &mut EdgeList, parallel: bool) {
             if cached >= 0 {
                 let z = cached as usize;
                 if bit_set(&ball_bits, z)
+                    && deg[z] >= deg[w]
                     && is_subset(
                         &nbr_bits[w * nw..w * nw + nw],
                         &nbr_bits[z * nw..z * nw + nw],
@@ -139,10 +149,12 @@ pub(crate) fn peel(edge_list: &mut EdgeList, parallel: bool) {
                     let bit = bits.trailing_zeros() as usize;
                     bits &= bits - 1;
                     let z = (word_idx << 6) | bit;
-                    if is_subset(
-                        &nbr_bits[w * nw..w * nw + nw],
-                        &nbr_bits[z * nw..z * nw + nw],
-                    ) {
+                    if deg[z] >= deg[w]
+                        && is_subset(
+                            &nbr_bits[w * nw..w * nw + nw],
+                            &nbr_bits[z * nw..z * nw + nw],
+                        )
+                    {
                         dominator[w] = z as i32;
                         users[z].push(w as u32);
                         found = true;
@@ -166,6 +178,8 @@ pub(crate) fn peel(edge_list: &mut EdgeList, parallel: bool) {
 
             nbr_bits[a * nw + (b >> 6)] &= !(1u64 << (b & 63));
             nbr_bits[b * nw + (a >> 6)] &= !(1u64 << (a & 63));
+            deg[a] -= 1;
+            deg[b] -= 1;
 
             for &w_u32 in &users[a] {
                 let w = w_u32 as usize;

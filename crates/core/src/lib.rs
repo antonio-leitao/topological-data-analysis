@@ -290,6 +290,55 @@ mod pipeline_tests {
         assert_same_barcode(&plain, &peeled);
     }
 
+    /// REGRESSION (disconnected enclosing radius): the H1 bar of the far
+    /// component must DIE at 2.0, not be truncated into an essential class by
+    /// the near component's smaller enclosing radius.
+    #[test]
+    fn disconnected_matrix_preserves_late_h1_death() {
+        // Component A: unit 4-cycle (0-1-2-3) with diagonals 2.0 → H1 [1, 2).
+        // Component B: pair (4, 5) at distance 1.0 (enclosing radius 1.0).
+        let n = 6;
+        let mut d = vec![f32::INFINITY; n * n];
+        for i in 0..n {
+            d[i * n + i] = 0.0;
+        }
+        for &(a, b, v) in &[
+            (0usize, 1usize, 1.0f32),
+            (1, 2, 1.0),
+            (2, 3, 1.0),
+            (0, 3, 1.0),
+            (0, 2, 2.0),
+            (1, 3, 2.0),
+            (4, 5, 1.0),
+        ] {
+            d[a * n + b] = v;
+            d[b * n + a] = v;
+        }
+
+        let bc = persistent_homology(&d, n, 1, None, true, false, false, false).unwrap();
+
+        // H0: exactly two essential components.
+        let h0_essential = bc.intervals[0]
+            .iter()
+            .filter(|iv| iv.death.is_infinite())
+            .count();
+        assert_eq!(h0_essential, 2);
+
+        // H1: exactly one bar, [1, 2), finite.
+        assert_eq!(bc.intervals[1].len(), 1, "H1 = {:?}", bc.intervals[1]);
+        let h1 = &bc.intervals[1][0];
+        assert!((h1.birth - 1.0).abs() < 1e-6, "H1 birth = {}", h1.birth);
+        assert!(
+            h1.death.is_finite() && (h1.death - 2.0).abs() < 1e-6,
+            "H1 death = {} (truncated to essential = the old bug)",
+            h1.death
+        );
+
+        // Peel must remain barcode-preserving on disconnected inputs.
+        let peeled = persistent_homology(&d, n, 1, None, true, false, true, false).unwrap();
+        assert_same_barcode(&bc, &peeled);
+    }
+
     #[test]
     fn parallel_flag_preserves_barcode() {
         // The new flag must be behaviour-neutral: seq and par assembly agree.

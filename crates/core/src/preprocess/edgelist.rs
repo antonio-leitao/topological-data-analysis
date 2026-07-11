@@ -91,10 +91,20 @@ impl EdgeList {
             };
         }
 
+        // One pass over the strict lower triangle: per-row max over FINITE
+        // entries, per-row finite-entry count, and union-find components over
+        // the finite-distance relation. Finite entries exist only within a
+        // component (by construction of the components), so `max_dist[i]` is
+        // vertex i's intra-component eccentricity and `finite_count[i]` tells
+        // us whether i sees its whole component.
         let mut max_dist = vec![f32::NEG_INFINITY; n];
+        let mut finite_count = vec![0u32; n];
+        let mut parent: Vec<u32> = (0..n as u32).collect();
+        let mut comp_size = vec![1u32; n]; // meaningful at roots only
         for i in 1..n {
             let row_base = i * n;
             let mut row_max = max_dist[i];
+            let mut row_finite = 0u32;
             for j in 0..i {
                 let distance = mat[row_base + j];
                 if distance < NO_EDGE {
@@ -104,12 +114,27 @@ impl EdgeList {
                     if distance > max_dist[j] {
                         max_dist[j] = distance;
                     }
+                    row_finite += 1;
+                    finite_count[j] += 1;
+                    let ri = uf_find(&mut parent, i as u32);
+                    let rj = uf_find(&mut parent, j as u32);
+                    if ri != rj {
+                        let (big, small) = if comp_size[ri as usize] >= comp_size[rj as usize] {
+                            (ri, rj)
+                        } else {
+                            (rj, ri)
+                        };
+                        parent[small as usize] = big;
+                        comp_size[big as usize] += comp_size[small as usize];
+                    }
                 }
             }
             max_dist[i] = row_max;
+            finite_count[i] += row_finite;
         }
 
-        let (center, r_cheb) = reduce_minimax_disconnected(&max_dist);
+        let (center, r_cheb) =
+            per_component_minimax(&mut parent, &comp_size, &finite_count, &max_dist);
         let effective = threshold.min(r_cheb);
         let mut edges = Vec::new();
         for i in 1..n {
@@ -387,17 +412,81 @@ fn reduce_minimax(max_dist: &[f32]) -> (usize, f32) {
     (center, radius)
 }
 
+/// Union-find lookup with path halving (parents are vertex ids in `0..n`).
 #[inline]
-fn reduce_minimax_disconnected(max_dist: &[f32]) -> (usize, f32) {
-    let mut center = 0usize;
-    let mut radius = f32::INFINITY;
-    for (i, &distance) in max_dist.iter().enumerate() {
-        if distance > f32::NEG_INFINITY && distance < radius {
-            radius = distance;
-            center = i;
+fn uf_find(parent: &mut [u32], mut i: u32) -> u32 {
+    while parent[i as usize] != i {
+        let grand = parent[parent[i as usize] as usize];
+        parent[i as usize] = grand;
+        i = grand;
+    }
+    i
+}
+
+/// Sound truncation radius for a possibly-disconnected distance matrix.
+///
+/// VR of a disjoint union is the disjoint union of the VRs, so every component
+/// is coned independently by its own apex — a vertex with a finite entry to
+/// every OTHER member of its component. The certified global cutoff is the MAX
+/// over components of the per-component minimax radius; a component with no
+/// valid apex contributes infinity (no finite certificate exists for it).
+///
+/// A global minimax over finite row maxima would understate rows that are
+/// missing entries and unsoundly truncate late features in other components.
+///
+/// Returns `(center, radius)`: the apex realising the winning component's
+/// radius (downstream, peel's cone apex) and the cutoff itself. Singleton
+/// components are cones of radius 0.
+fn per_component_minimax(
+    parent: &mut [u32],
+    comp_size: &[u32],
+    finite_count: &[u32],
+    max_dist: &[f32],
+) -> (usize, f32) {
+    let n = max_dist.len();
+    let mut r_enc = vec![f32::INFINITY; n]; // indexed by component root
+    let mut apex = vec![0u32; n];
+    for i in 0..n {
+        let root = uf_find(parent, i as u32) as usize;
+        if finite_count[i] == comp_size[root] - 1 {
+            // Valid apex: i sees its whole component. (For singletons,
+            // max_dist is still the -inf sentinel; their cone radius is 0.)
+            let radius = if comp_size[root] == 1 {
+                0.0
+            } else {
+                max_dist[i]
+            };
+            if radius < r_enc[root] {
+                r_enc[root] = radius;
+                apex[root] = i as u32;
+            }
         }
     }
-    (center, radius)
+
+    let mut r_cheb = f32::NEG_INFINITY;
+    let mut center = 0usize;
+    for v in 0..n {
+        if parent[v] as usize != v {
+            continue; // roots only
+        }
+        let radius = r_enc[v];
+        // A component with no valid apex has no apex to offer; any of its
+        // vertices is a sound (if unhelpful) peel center.
+        let candidate = if radius.is_finite() {
+            apex[v] as usize
+        } else {
+            v
+        };
+        if radius > r_cheb {
+            r_cheb = radius;
+            center = candidate;
+        }
+    }
+    debug_assert!(
+        r_cheb > f32::NEG_INFINITY,
+        "n >= 2 guarantees at least one component root"
+    );
+    (center, r_cheb)
 }
 
 fn points_single_pass(data: &[f32], n: usize, d: usize, threshold: f32) -> EdgeList {
@@ -598,6 +687,80 @@ mod tests {
     #[test]
     fn edge_is_eight_bytes() {
         assert_eq!(std::mem::size_of::<Edge>(), 8);
+    }
+
+    fn set_sym(d: &mut [f32], n: usize, i: usize, j: usize, v: f32) {
+        d[i * n + j] = v;
+        d[j * n + i] = v;
+    }
+
+    /// REGRESSION (disconnected enclosing radius): a global minimax over
+    /// finite row maxima would truncate at the SMALLEST component's radius
+    /// (1.0 here) and drop component A's diagonals. The sound cutoff is the
+    /// per-component maximum.
+    #[test]
+    fn disconnected_truncation_uses_max_component_radius() {
+        // Component A: unit 4-cycle (0-1-2-3) with diagonals 2.0 => r_enc = 2.
+        // Component B: pair (4, 5) at distance 1.0 => r_enc = 1.
+        let n = 6;
+        let mut d = vec![f32::INFINITY; n * n];
+        for i in 0..n {
+            d[i * n + i] = 0.0;
+        }
+        set_sym(&mut d, n, 0, 1, 1.0);
+        set_sym(&mut d, n, 1, 2, 1.0);
+        set_sym(&mut d, n, 2, 3, 1.0);
+        set_sym(&mut d, n, 0, 3, 1.0);
+        set_sym(&mut d, n, 0, 2, 2.0);
+        set_sym(&mut d, n, 1, 3, 2.0);
+        set_sym(&mut d, n, 4, 5, 1.0);
+
+        let e = EdgeList::from_distance_matrix(&d, n, f32::INFINITY);
+        assert_eq!(e.threshold, 2.0, "cutoff must be max over components");
+        assert_eq!(e.edges.len(), 7, "4 sides + 2 diagonals + 1 pair");
+        assert!(e.center < 4, "apex must lie in the winning component");
+    }
+
+    #[test]
+    fn isolated_vertex_does_not_affect_truncation() {
+        // Unit triangle (0,1,2) plus a fully-isolated vertex 3: the singleton
+        // is a cone of radius 0 and must not push the cutoff to infinity.
+        let n = 4;
+        let mut d = vec![f32::INFINITY; n * n];
+        for i in 0..n {
+            d[i * n + i] = 0.0;
+        }
+        set_sym(&mut d, n, 0, 1, 1.0);
+        set_sym(&mut d, n, 0, 2, 1.0);
+        set_sym(&mut d, n, 1, 2, 1.0);
+
+        let e = EdgeList::from_distance_matrix(&d, n, f32::INFINITY);
+        assert_eq!(e.threshold, 1.0);
+        assert_eq!(e.edges.len(), 3);
+    }
+
+    /// A component in which NO vertex sees every other member admits no
+    /// finite cone certificate: the cutoff must fall back to the user
+    /// threshold (here infinity), keeping every finite edge.
+    #[test]
+    fn component_without_apex_disables_truncation() {
+        // 4-cycle with BOTH diagonal entries missing: every row is incomplete
+        // (each vertex sees 2 of its 3 co-members), so there is no apex.
+        // Note a star center WOULD be a valid apex even with missing entries
+        // elsewhere — the cone argument only needs the apex row complete.
+        let n = 4;
+        let mut d = vec![f32::INFINITY; n * n];
+        for i in 0..n {
+            d[i * n + i] = 0.0;
+        }
+        set_sym(&mut d, n, 0, 1, 1.0);
+        set_sym(&mut d, n, 1, 2, 1.0);
+        set_sym(&mut d, n, 2, 3, 1.0);
+        set_sym(&mut d, n, 0, 3, 1.0);
+
+        let e = EdgeList::from_distance_matrix(&d, n, f32::INFINITY);
+        assert_eq!(e.threshold, f32::INFINITY);
+        assert_eq!(e.edges.len(), 4);
     }
 
     #[test]
