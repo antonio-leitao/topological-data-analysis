@@ -1,4 +1,4 @@
-.PHONY: help install build-py build-rust test test-core test-python bench bench-peel bench-quot profile profile-build profile-all release-py publish-rust clean
+.PHONY: help install build-py build-rust test test-core test-python bench bench-peel bench-quot bench-clps profile profile-build profile-all release-py publish-rust clean
 .DEFAULT_GOAL := help
 
 # ── Colors ────────────────────────────────────────────────────────────────
@@ -19,7 +19,6 @@ VARIANT ?= vanilla
 PROFILE_RATE ?= 1000
 # Outside target/ so `cargo clean` keeps profiles (gitignored).
 PROFILE_DIR ?= profiles
-PROFILE_H2_LAST_DATASET ?= hiv1.txt
 PROFILE_REPEATS ?= 1
 PROFILE_PROFILE     ?= profiling
 PROFILE_TARGET_DIR  ?= target/$(PROFILE_PROFILE)
@@ -68,6 +67,9 @@ bench-peel: ## Benchmark the vanilla pipeline + peel
 
 bench-quot: ## Benchmark the vanilla pipeline + quotient
 	@$(MAKE) bench VARIANT=quot
+
+bench-clps: ## Benchmark the vanilla pipeline + edge collapse
+	@$(MAKE) bench VARIANT=clps
 
 
 profile-build: ## Build the single-run profiling runner (optimized + line info)

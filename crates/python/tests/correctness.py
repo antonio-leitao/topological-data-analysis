@@ -13,7 +13,6 @@ import tda
 
 ROOT = Path(__file__).resolve().parents[3]
 DATA_DIR = ROOT / "data"
-H2_LAST_DATASET = "hiv1.txt"
 REFERENCE_TOL = 3e-3
 # The quotient (coperto) filtration is multiplicatively 3-interleaved with VR,
 # i.e. additively log(3)-interleaved in log scale, so by stability the
@@ -29,16 +28,14 @@ def default_max_dim():
     return value
 
 
-def dataset_files(max_dim):
+def dataset_files():
+    """The datasets to run are controlled by data/datasets.txt (order included)."""
     manifest = DATA_DIR / "datasets.txt"
-    files = [
+    return [
         line.strip()
         for line in manifest.read_text().splitlines()
         if line.strip() and not line.startswith("#")
     ]
-    if max_dim == 2:
-        return files[: files.index(H2_LAST_DATASET) + 1]
-    return files
 
 
 def load_points(file):
@@ -55,6 +52,10 @@ def run_tda_peel(data, max_dim):
 
 def run_tda_quotient(data, max_dim):
     return tda.persistent_homology(data, max_dim=max_dim, quotient=True)
+
+
+def run_tda_collapse(data, max_dim):
+    return tda.persistent_homology(data, max_dim=max_dim, collapse=True)
 
 
 def gudhi_reference(data, max_dim):
@@ -119,17 +120,19 @@ def main():
     print(f"Python correctness: BitCSR H0..H{args.max_dim} vs GUDHI")
     print(
         f"  {'dataset':<24} {'status':<6} "
-        f"{'tda':>10} {'peel':>10} {'quot':>10} {'gudhi':>10}"
+        f"{'tda':>10} {'peel':>10} {'quot':>10} {'clps':>10} {'gudhi':>10}"
     )
-    for file in dataset_files(args.max_dim):
+    for file in dataset_files():
         data = load_points(file)
         got, tda_time = timed(run_tda, data, args.max_dim)
         peeled, peel_time = timed(run_tda_peel, data, args.max_dim)
         quot, quot_time = timed(run_tda_quotient, data, args.max_dim)
+        clps, clps_time = timed(run_tda_collapse, data, args.max_dim)
         ref, gudhi_time = timed(gudhi_reference, data, args.max_dim)
 
-        # Plain and peel must both match GUDHI exactly: peel is barcode-preserving.
-        for label, dgms in (("plain", got), ("peel", peeled)):
+        # Plain, peel, and collapse must all match GUDHI exactly: peel and
+        # edge collapse are barcode-preserving.
+        for label, dgms in (("plain", got), ("peel", peeled), ("collapse", clps)):
             ok, dim, bd, n_got, n_ref = bottleneck_ok(
                 dgms, ref, args.max_dim, REFERENCE_TOL
             )
@@ -149,7 +152,8 @@ def main():
 
         print(
             f"  {file:<24} {'ok':<6} "
-            f"{tda_time:9.3f}s {peel_time:9.3f}s {quot_time:9.3f}s {gudhi_time:9.3f}s"
+            f"{tda_time:9.3f}s {peel_time:9.3f}s {quot_time:9.3f}s "
+            f"{clps_time:9.3f}s {gudhi_time:9.3f}s"
         )
 
 

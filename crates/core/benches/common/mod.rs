@@ -6,8 +6,6 @@ use std::path::{Path, PathBuf};
 
 use tda_core::{persistent_homology, BarcodeResult};
 
-const H2_LAST_DATASET: &str = "hiv1.txt";
-
 pub struct Dataset {
     pub name: String,
     pub points: Vec<f32>,
@@ -30,12 +28,14 @@ pub struct Variant {
     pub name: &'static str,
     pub peel: bool,
     pub quotient: bool,
+    pub collapse: bool,
 }
 
 pub const VANILLA: Variant = Variant {
     name: "vanilla",
     peel: false,
     quotient: false,
+    collapse: false,
 };
 
 pub fn parse_variant(value: &str) -> Result<Variant, String> {
@@ -45,19 +45,27 @@ pub fn parse_variant(value: &str) -> Result<Variant, String> {
             name: "peel",
             peel: true,
             quotient: false,
+            collapse: false,
         }),
         "quot" => Ok(Variant {
             name: "quot",
             peel: false,
             quotient: true,
+            collapse: false,
         }),
-        other => Err(format!("variant must be vanilla|peel|quot, got {other}")),
+        "clps" => Ok(Variant {
+            name: "clps",
+            peel: false,
+            quotient: false,
+            collapse: true,
+        }),
+        other => Err(format!("variant must be vanilla|peel|quot|clps, got {other}")),
     }
 }
 
 pub fn variant_from_env() -> Variant {
     parse_variant(env::var("TDA_VARIANT").ok().as_deref().unwrap_or("vanilla"))
-        .expect("TDA_VARIANT must be vanilla, peel, or quot")
+        .expect("TDA_VARIANT must be vanilla, peel, quot, or clps")
 }
 
 /// Group / directory label: the historical `bitcsr_h{d}` for vanilla (keeps
@@ -78,22 +86,15 @@ pub fn parse_max_dim(value: &str) -> Result<usize, String> {
     }
 }
 
-pub fn dataset_files(max_dim: usize) -> Vec<String> {
-    let mut files: Vec<String> = fs::read_to_string(data_dir().join("datasets.txt"))
+/// The datasets to run are controlled by data/datasets.txt (order included).
+pub fn dataset_files() -> Vec<String> {
+    fs::read_to_string(data_dir().join("datasets.txt"))
         .expect("failed to read data/datasets.txt")
         .lines()
         .map(str::trim)
         .filter(|line| !line.is_empty() && !line.starts_with('#'))
         .map(str::to_owned)
-        .collect();
-    if max_dim == 2 {
-        let end = files
-            .iter()
-            .position(|file| file == H2_LAST_DATASET)
-            .expect("H2 cutoff dataset is missing from data/datasets.txt");
-        files.truncate(end + 1);
-    }
-    files
+        .collect()
 }
 
 pub fn dataset_name(file: &Path) -> String {
@@ -160,6 +161,7 @@ pub fn run_once(
         false,
         variant.quotient,
         variant.peel,
+        variant.collapse,
         false, //benches should not be parallel
     )
 }

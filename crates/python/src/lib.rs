@@ -8,14 +8,19 @@
 //!
 //!   * `persistent_homology(data, max_dim=1, threshold=None,
 //!                          distance_matrix=False, quotient=False, peel=False,
-//!                          parallel=True)`
+//!                          collapse=False, parallel=True)`
 //!       → list of `(k, 2)` float32 arrays `[[birth, death], …]`, one per
 //!         homology dimension `0..=max_dim` (Ripser-compatible `dgms` layout;
 //!         essential classes carry `death = inf`).
 //!
 //!   * `filtration_size(data, max_dim=1, threshold=None, distance_matrix=False,
-//!                      quotient=False, peel=False, parallel=True)`
+//!                      quotient=False, peel=False, collapse=False,
+//!                      parallel=True)`
 //!       → int, the simplex count of the filtered complex (dimension ≤ max_dim).
+//!
+//! `peel` (exact truncation) and `collapse` (exact edge collapse) preserve the
+//! barcode; `quotient` is a log(3)-interleaved approximation. Applied in the
+//! canonical order peel → quotient → collapse.
 //!
 //! When `data` is square and `distance_matrix=False`, the input is ambiguous
 //! (square point cloud vs. distance matrix); a `UserWarning` is emitted naming
@@ -98,7 +103,7 @@ fn check_input(py: Python<'_>, rows: usize, cols: usize, distance_matrix: bool) 
 }
 /// Vietoris–Rips persistent homology.
 #[pyfunction]
-#[pyo3(signature = (data, max_dim=1, threshold=None, distance_matrix=false, quotient=false, peel=false, parallel=true))]
+#[pyo3(signature = (data, max_dim=1, threshold=None, distance_matrix=false, quotient=false, peel=false, collapse=false, parallel=true))]
 fn persistent_homology<'py>(
     py: Python<'py>,
     data: PyReadonlyArray2<'py, f32>,
@@ -107,6 +112,7 @@ fn persistent_homology<'py>(
     distance_matrix: bool,
     quotient: bool,
     peel: bool,
+    collapse: bool,
     parallel: bool,
 ) -> PyResult<Vec<Bound<'py, PyArray2<f32>>>> {
     let (flat, rows, cols) = flatten(&data);
@@ -121,6 +127,7 @@ fn persistent_homology<'py>(
         distance_matrix,
         quotient,
         peel,
+        collapse,
         parallel,
     )
     .map_err(to_py_err)?;
@@ -130,7 +137,7 @@ fn persistent_homology<'py>(
 
 /// Truncated Vietoris–Rips filtration size (simplices of dimension ≤ max_dim).
 #[pyfunction]
-#[pyo3(signature = (data, max_dim=1, threshold=None, distance_matrix=false, quotient=false, peel=false, parallel=true))]
+#[pyo3(signature = (data, max_dim=1, threshold=None, distance_matrix=false, quotient=false, peel=false, collapse=false, parallel=true))]
 fn filtration_size<'py>(
     py: Python<'py>,
     data: PyReadonlyArray2<'py, f32>,
@@ -139,6 +146,7 @@ fn filtration_size<'py>(
     distance_matrix: bool,
     quotient: bool,
     peel: bool,
+    collapse: bool,
     parallel: bool,
 ) -> PyResult<usize> {
     let (flat, rows, cols) = flatten(&data);
@@ -153,6 +161,7 @@ fn filtration_size<'py>(
         distance_matrix,
         quotient,
         peel,
+        collapse,
         parallel,
     )
     .map_err(to_py_err)
