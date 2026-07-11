@@ -127,21 +127,27 @@ fn init_coboundary_and_get_pivot(
 // compute_pairs — the main reduction loop
 // ═══════════════════════════════════════════════════════════════════════════════
 
+/// Reduce `columns`, appending intervals to `dim_intervals`. Returns the
+/// pivot → column-index map; its key set is exactly the pivots recorded this
+/// dimension, which the caller feeds to `assemble_candidates` as the clearing
+/// set (avoiding a second, duplicate hash table).
 pub fn compute_pairs(
     columns: &[Simplex128],
     dist: &BitCsrDistanceMatrix,
     dim_intervals: &mut Vec<PersistenceInterval>,
-    cleared_pivots: &mut FxHashMap<Simplex128, ()>,
-) {
+) -> FxHashMap<Simplex128, usize> {
+    let mut pivot_column_index: FxHashMap<Simplex128, usize> =
+        FxHashMap::with_capacity_and_hasher(columns.len(), Default::default());
     if columns.is_empty() {
-        return;
+        return pivot_column_index;
     }
 
     let mut v_matrix = CompressedSparseMatrix::new();
-    let mut pivot_column_index: FxHashMap<Simplex128, usize> =
-        FxHashMap::with_capacity_and_hasher(columns.len(), Default::default());
 
-    let cap = (columns.len() * 4).max(1024);
+    // Working buffers grow on demand; the prealloc is a warm start, not a bound.
+    // Cap it so huge column counts don't reserve gigabytes speculatively
+    // (2 buffers x 16 B/entry: the cap bounds the upfront cost to ~16 MiB each).
+    let cap = (columns.len() * 4).clamp(1024, 1 << 20);
     let mut working_v: Vec<Simplex128> = Vec::with_capacity(cap);
     let mut working_coboundary = FastHeap::with_capacity(cap);
 
@@ -166,7 +172,6 @@ pub fn compute_pairs(
                     });
                 }
                 pivot_column_index.insert(tau, j);
-                cleared_pivots.insert(tau, ());
                 continue;
             }
             dim_intervals.push(PersistenceInterval {
@@ -212,7 +217,6 @@ pub fn compute_pairs(
                         });
                     }
                     pivot_column_index.insert(tau, j);
-                    cleared_pivots.insert(tau, ());
 
                     // Sort and Z/2-cancel, then drain into the reduction matrix.
                     // Since elements may appear with multiplicity, equal pairs cancel.
@@ -232,4 +236,6 @@ pub fn compute_pairs(
             }
         }
     }
+
+    pivot_column_index
 }

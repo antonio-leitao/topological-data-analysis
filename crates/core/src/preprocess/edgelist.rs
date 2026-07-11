@@ -181,12 +181,8 @@ fn pack_panel(
 }
 
 #[inline(always)]
-fn tile_dist(tile: &[[f32; NR]; MR], m: usize, n: usize, full: bool) -> f32 {
-    if full {
-        ((tile[m][n] as f64).sqrt()) as f32
-    } else {
-        tile[m][n].sqrt()
-    }
+fn tile_dist(tile: &[[f32; NR]; MR], m: usize, n: usize) -> f32 {
+    tile[m][n].sqrt()
 }
 
 fn alloc_panels(d: usize) -> (Vec<f32>, Vec<f32>) {
@@ -256,7 +252,7 @@ impl PointWorker {
                     for nn in 0..nr_eff {
                         let j = j_min + nn;
                         if full || i > j {
-                            let distance = tile_dist(&tile, m, nn, full);
+                            let distance = tile_dist(&tile, m, nn);
                             if TRACK_MAX {
                                 if distance > row_max {
                                     row_max = distance;
@@ -422,7 +418,7 @@ fn points_single_pass(data: &[f32], n: usize, d: usize, threshold: f32) -> EdgeL
                 for nn in 0..nr {
                     let j = j_min + nn;
                     if full || i > j {
-                        let distance = tile_dist(tile, m, nn, full);
+                        let distance = tile_dist(tile, m, nn);
                         if distance > row_max {
                             row_max = distance;
                         }
@@ -447,6 +443,9 @@ fn points_single_pass(data: &[f32], n: usize, d: usize, threshold: f32) -> EdgeL
     let effective = threshold.min(r_cheb);
     if effective < threshold {
         edges.retain(|edge| edge.distance <= effective);
+        // The staging buffer was sized for the pre-tightening threshold; release
+        // the dead capacity so it doesn't ride along through peel/coperto/BitCSR.
+        edges.shrink_to_fit();
     }
 
     EdgeList {
@@ -469,6 +468,9 @@ fn points_single_pass_parallel(data: &[f32], n: usize, d: usize, threshold: f32)
     let effective = threshold.min(r_cheb);
     if effective < threshold {
         edges.retain(|edge| edge.distance <= effective);
+        // The staging buffer was sized for the pre-tightening threshold; release
+        // the dead capacity so it doesn't ride along through peel/coperto/BitCSR.
+        edges.shrink_to_fit();
     }
 
     EdgeList {
@@ -497,7 +499,7 @@ fn points_two_pass(data: &[f32], n: usize, d: usize, threshold: f32) -> EdgeList
                 for nn in 0..nr {
                     let j = j_min + nn;
                     if full || i > j {
-                        let distance = tile_dist(tile, m, nn, full);
+                        let distance = tile_dist(tile, m, nn);
                         if distance > row_max {
                             row_max = distance;
                         }
@@ -527,7 +529,7 @@ fn points_two_pass(data: &[f32], n: usize, d: usize, threshold: f32) -> EdgeList
                 for nn in 0..nr {
                     let j = j_min + nn;
                     if full || i > j {
-                        let distance = tile_dist(tile, m, nn, full);
+                        let distance = tile_dist(tile, m, nn);
                         if distance <= effective {
                             edges.push(Edge {
                                 u: i as u16,

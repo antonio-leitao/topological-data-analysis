@@ -88,7 +88,10 @@ pub fn filtration_size(
         peel,
         parallel,
     )?;
-    Ok(utils::cliques::count_cliques(edges, max_dim + 2, parallel))
+    // `max_dim` is a simplex dimension; `count_cliques` is clique-size oriented.
+    // A simplex of dimension d is a clique of size d + 1, so counting simplices
+    // of dimension <= max_dim means cliques of size <= max_dim + 1.
+    Ok(utils::cliques::count_cliques(edges, max_dim + 1, parallel))
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════

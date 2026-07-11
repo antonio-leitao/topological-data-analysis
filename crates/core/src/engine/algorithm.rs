@@ -12,11 +12,9 @@
 // operations (`for_each_common_neighbor`, `edge_dist`, …); the `BitCsr` type
 // exposes no Ripser concepts.
 
-use std::collections::HashMap;
-
 use crate::engine::bitcsr::BitCsrDistanceMatrix;
 use crate::engine::reduction::compute_pairs;
-use crate::engine::simplex::{encode_filtration, FxBuildHasher, FxHashMap, Simplex128};
+use crate::engine::simplex::{encode_filtration, FxHashMap, Simplex128};
 use crate::types::{BarcodeResult, PersistenceInterval};
 
 /// Minimum number of input simplices before `assemble_candidates` uses rayon.
@@ -299,6 +297,7 @@ fn zero_apparent_cofacet(dist: &BitCsrDistanceMatrix, sigma: Simplex128) -> Opti
 fn compute_h0(
     dist: &BitCsrDistanceMatrix,
     intervals: &mut Vec<PersistenceInterval>,
+    parallel: bool,
 ) -> (Vec<Simplex128>, Vec<Simplex128>) {
     let n = dist.n();
 
@@ -310,11 +309,19 @@ fn compute_h0(
 
     // Kruskal needs SMALLEST DIAMETER FIRST (= oldest-first). Under the
     // Ripser-compatible Ord, oldest is "greater", so descending sort gives
-    // oldest-first iteration here.
-    edges.sort_unstable_by(|a, b| b.cmp(a));
+    // oldest-first iteration here. Keys are distinct (one per edge), so the
+    // parallel unstable sort is deterministic.
+    if parallel {
+        use rayon::prelude::*;
+        edges.par_sort_unstable_by(|a, b| b.cmp(a));
+    } else {
+        edges.sort_unstable_by(|a, b| b.cmp(a));
+    }
 
     let mut uf = UnionFind::new(n);
-    let mut columns_to_reduce = Vec::with_capacity(edges.len());
+    // No prealloc: only non-merging, non-apparent edges land here (usually a
+    // small fraction), and a full-edge-count reservation would dwarf the result.
+    let mut columns_to_reduce = Vec::new();
 
     let mut num_merges: usize = 0;
     for &edge in &edges {
@@ -350,6 +357,9 @@ fn compute_h0(
         });
     }
 
+    // Release growth slack: this vector stays alive through the whole H1
+    // reduction, so dead capacity here is a long-lived cost.
+    columns_to_reduce.shrink_to_fit();
     columns_to_reduce.reverse();
     (edges, columns_to_reduce)
 }
@@ -373,7 +383,7 @@ fn compute_h0(
 pub(crate) fn assemble_candidates(
     dist: &BitCsrDistanceMatrix,
     simplices: &mut Vec<Simplex128>,
-    cleared_pivots: &FxHashMap<Simplex128, ()>,
+    cleared_pivots: &FxHashMap<Simplex128, usize>,
     build_pool: bool,
     parallel: bool,
 ) -> Vec<Simplex128> {
@@ -385,7 +395,9 @@ pub(crate) fn assemble_candidates(
 
     let (next_simplices, mut columns_to_reduce) = if use_par {
         use rayon::prelude::*;
-        simplices
+        // Collect per-worker buffers, then merge once with an exact reservation.
+        // (A tree reduce would recopy each element O(log workers) times.)
+        let workers: Vec<(Vec<Simplex128>, Vec<Simplex128>)> = simplices
             .par_iter()
             .fold(
                 || (Vec::new(), Vec::new()),
@@ -401,14 +413,19 @@ pub(crate) fn assemble_candidates(
                     (next_local, cols_local)
                 },
             )
-            .reduce(
-                || (Vec::new(), Vec::new()),
-                |(mut na, mut ca), (nb, cb)| {
-                    na.extend(nb);
-                    ca.extend(cb);
-                    (na, ca)
-                },
-            )
+            .collect();
+
+        let total_next: usize = workers.iter().map(|(next, _)| next.len()).sum();
+        let total_cols: usize = workers.iter().map(|(_, cols)| cols.len()).sum();
+        let mut workers = workers.into_iter();
+        let (mut next, mut cols) = workers.next().unwrap_or_default();
+        next.reserve_exact(total_next - next.len());
+        cols.reserve_exact(total_cols - cols.len());
+        for (next_local, cols_local) in workers {
+            next.extend(next_local);
+            cols.extend(cols_local);
+        }
+        (next, cols)
     } else {
         let mut next_simplices: Vec<Simplex128> = if build_pool {
             Vec::with_capacity(simplices.len() * 2)
@@ -445,7 +462,7 @@ pub(crate) fn assemble_candidates(
 fn assemble_one(
     dist: &BitCsrDistanceMatrix,
     sigma: Simplex128,
-    cleared_pivots: &FxHashMap<Simplex128, ()>,
+    cleared_pivots: &FxHashMap<Simplex128, usize>,
     build_pool: bool,
     next_simplices: &mut Vec<Simplex128>,
     columns_to_reduce: &mut Vec<Simplex128>,
@@ -475,7 +492,7 @@ fn assemble_one(
 fn assemble_edge_candidates(
     dist: &BitCsrDistanceMatrix,
     sigma: Simplex128,
-    cleared_pivots: &FxHashMap<Simplex128, ()>,
+    cleared_pivots: &FxHashMap<Simplex128, usize>,
     build_pool: bool,
     next_simplices: &mut Vec<Simplex128>,
     columns_to_reduce: &mut Vec<Simplex128>,
@@ -520,7 +537,7 @@ fn assemble_edge_candidates(
 fn assemble_generic_candidates(
     dist: &BitCsrDistanceMatrix,
     sigma: Simplex128,
-    cleared_pivots: &FxHashMap<Simplex128, ()>,
+    cleared_pivots: &FxHashMap<Simplex128, usize>,
     build_pool: bool,
     next_simplices: &mut Vec<Simplex128>,
     columns_to_reduce: &mut Vec<Simplex128>,
@@ -685,34 +702,34 @@ pub fn compute(dist: &BitCsrDistanceMatrix, max_dim: usize, parallel: bool) -> B
 
     // H0: union-find. No clearing input needed (no previous dim).
     let mut h0 = Vec::new();
-    let (mut simplices, mut columns_to_reduce) = compute_h0(dist, &mut h0);
+    let (mut simplices, mut columns_to_reduce) = compute_h0(dist, &mut h0, parallel);
     intervals.push(h0);
 
-    // Cleared-pivot set for the clearing optimization. Populated by
-    // compute_pairs at dim d, consumed by assemble_candidates at dim d+1.
-    let mut cleared_pivots: FxHashMap<Simplex128, ()> =
-        HashMap::with_hasher(FxBuildHasher::default());
+    if max_dim <= 1 {
+        // The edge pool only feeds assemble_candidates (max_dim >= 2); free it
+        // before the H1 reduction rather than carrying it through.
+        simplices = Vec::new();
+    }
 
     // H1 .. H_{max_dim}
     for dim in 1..=max_dim {
         let mut dim_intervals = Vec::new();
 
-        // Reduce this dimension's columns. Clear cleared_pivots first so it
-        // captures only pivots from THIS dimension (used by assemble_candidates
-        // for dim+1).
-        cleared_pivots.clear();
-        compute_pairs(
-            &columns_to_reduce,
-            dist,
-            &mut dim_intervals,
-            &mut cleared_pivots,
-        );
+        // Reduce this dimension's columns. The returned pivot map holds exactly
+        // the pivots recorded at THIS dimension; its key set is the clearing
+        // set consumed by assemble_candidates for dim+1.
+        let pivots = compute_pairs(&columns_to_reduce, dist, &mut dim_intervals);
         intervals.push(dim_intervals);
 
         if dim < max_dim {
             let build_pool = dim + 1 < max_dim;
             columns_to_reduce =
-                assemble_candidates(dist, &mut simplices, &cleared_pivots, build_pool, parallel);
+                assemble_candidates(dist, &mut simplices, &pivots, build_pool, parallel);
+            if !build_pool {
+                // Last assembly: the d-simplex pool is dead weight from here on;
+                // free it before the final (largest) reduction.
+                simplices = Vec::new();
+            }
         }
     }
 
