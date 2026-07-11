@@ -3,27 +3,125 @@
 //! [`peel`] sorts and tightens an [`EdgeList`] in place. If its cutoff is `R`,
 //! the resulting cutoff `R' <= R` is certified so that `VR(X, t)` is
 //! contractible for every `t >= R'`.
+//!
+//! Neighborhoods are stored as block-sparse bitset rows ([`SparseRows`]):
+//! O(E) memory instead of the dense n²/64 bytes, with the same word-parallel
+//! subset/intersection walks over the occupied 64-bit blocks.
 
-use crate::preprocess::edgelist::EdgeList;
+use crate::preprocess::edgelist::{Edge, EdgeList};
 use rayon::prelude::*;
-
-#[inline(always)]
-fn is_subset(a: &[u64], b: &[u64]) -> bool {
-    debug_assert_eq!(a.len(), b.len());
-    for k in 0..a.len() {
-        // SAFETY: same-length slices, k in bounds.
-        unsafe {
-            if *a.get_unchecked(k) & !*b.get_unchecked(k) != 0 {
-                return false;
-            }
-        }
-    }
-    true
-}
 
 #[inline(always)]
 fn bit_set(bits: &[u64], i: usize) -> bool {
     (bits[i >> 6] >> (i & 63)) & 1 == 1
+}
+
+/// Block-sparse closed neighborhoods: per vertex, the sorted nonzero 64-bit
+/// blocks of its adjacency bitset (self bit included), flattened CSR-style.
+/// After construction bits are only ever CLEARED, so the block skeleton is
+/// immutable; emptied words stay as zeros and are skipped by the walks.
+struct SparseRows {
+    row_ptr: Vec<u32>,
+    block_ids: Vec<u16>,
+    words: Vec<u64>,
+}
+
+impl SparseRows {
+    /// Build from a canonical edge list. `deg` are closed-neighborhood sizes
+    /// (self included), as maintained by the caller for the precheck.
+    fn build(n: usize, edges: &[Edge], deg: &[u32]) -> Self {
+        // Transient CSR neighbor lists (2 B per directed edge).
+        let mut adj_ptr = vec![0u32; n + 1];
+        for v in 0..n {
+            adj_ptr[v + 1] = adj_ptr[v] + (deg[v] - 1);
+        }
+        let mut adj = vec![0u16; adj_ptr[n] as usize];
+        let mut fill: Vec<u32> = adj_ptr.clone();
+        for edge in edges {
+            adj[fill[edge.u as usize] as usize] = edge.v;
+            fill[edge.u as usize] += 1;
+            adj[fill[edge.v as usize] as usize] = edge.u;
+            fill[edge.v as usize] += 1;
+        }
+
+        // Scatter each row into a dense scratch row, then harvest the touched
+        // blocks in sorted order. O(deg) per row, one nw-word scratch total.
+        let nw = (n + 63) >> 6;
+        let mut scratch = vec![0u64; nw];
+        let mut touched: Vec<u16> = Vec::new();
+        let mut row_ptr = Vec::with_capacity(n + 1);
+        row_ptr.push(0u32);
+        let mut block_ids: Vec<u16> = Vec::new();
+        let mut words: Vec<u64> = Vec::new();
+
+        for v in 0..n {
+            touched.clear();
+            for id in std::iter::once(v as u16).chain(
+                adj[adj_ptr[v] as usize..adj_ptr[v + 1] as usize]
+                    .iter()
+                    .copied(),
+            ) {
+                let b = (id >> 6) as usize;
+                if scratch[b] == 0 {
+                    touched.push(b as u16);
+                }
+                scratch[b] |= 1u64 << (id & 63);
+            }
+            touched.sort_unstable();
+            for &b in &touched {
+                block_ids.push(b);
+                words.push(scratch[b as usize]);
+                scratch[b as usize] = 0;
+            }
+            debug_assert!(block_ids.len() <= u32::MAX as usize);
+            row_ptr.push(block_ids.len() as u32);
+        }
+
+        Self {
+            row_ptr,
+            block_ids,
+            words,
+        }
+    }
+
+    #[inline(always)]
+    fn range(&self, v: usize) -> std::ops::Range<usize> {
+        self.row_ptr[v] as usize..self.row_ptr[v + 1] as usize
+    }
+
+    /// N[w] ⊆ N[z], via a two-pointer walk over the sorted block ids.
+    #[inline]
+    fn is_subset(&self, w: usize, z: usize) -> bool {
+        let rw = self.range(w);
+        let rz = self.range(z);
+        let (wb, ww) = (&self.block_ids[rw.clone()], &self.words[rw]);
+        let (zb, zw) = (&self.block_ids[rz.clone()], &self.words[rz]);
+        let mut zi = 0usize;
+        for (i, &b) in wb.iter().enumerate() {
+            let word = ww[i];
+            if word == 0 {
+                continue; // fully-removed block
+            }
+            while zi < zb.len() && zb[zi] < b {
+                zi += 1;
+            }
+            if zi == zb.len() || zb[zi] != b || word & !zw[zi] != 0 {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// Clear neighbor bit `u` in row `v`. The block exists by construction.
+    #[inline]
+    fn clear(&mut self, v: usize, u: usize) {
+        let r = self.range(v);
+        let block = (u >> 6) as u16;
+        let idx = self.block_ids[r.clone()]
+            .binary_search(&block)
+            .expect("clearing an edge that was never stored");
+        self.words[r.start + idx] &= !(1u64 << (u & 63));
+    }
 }
 
 /// Tighten an edge list's cutoff via sound strong-collapse peeling.
@@ -61,16 +159,21 @@ pub(crate) fn peel(edge_list: &mut EdgeList, parallel: bool) {
 
     let nw = (n + 63) >> 6;
 
-    // Neighborhoods at the current cutoff, including the diagonal.
-    let mut nbr_bits = vec![0u64; n * nw];
+    // Center ball at the starting cutoff. One dense row of n bits is cheap;
+    // only the per-vertex neighborhoods need the sparse representation.
     let mut ball_bits = vec![0u64; nw];
     ball_bits[center >> 6] |= 1u64 << (center & 63);
 
+    // Closed-neighborhood sizes, used both to size the sparse rows and for the
+    // O(1) domination precheck: N[w] ⊆ N[z] requires |N[w]| <= |N[z]|. Kept
+    // exact under edge removals, so the precheck only ever skips subset tests
+    // that would fail.
+    let mut deg: Vec<u32> = vec![1; n];
     for edge in &edge_list.edges {
         let u = edge.u as usize;
         let v = edge.v as usize;
-        nbr_bits[u * nw + (v >> 6)] |= 1u64 << (v & 63);
-        nbr_bits[v * nw + (u >> 6)] |= 1u64 << (u & 63);
+        deg[u] += 1;
+        deg[v] += 1;
 
         // At the starting cutoff, the center ball is exactly the center and its
         // present neighbors. Missing center edges are outside the ball.
@@ -80,18 +183,9 @@ pub(crate) fn peel(edge_list: &mut EdgeList, parallel: bool) {
             ball_bits[u >> 6] |= 1u64 << (u & 63);
         }
     }
-    for v in 0..n {
-        nbr_bits[v * nw + (v >> 6)] |= 1u64 << (v & 63);
-    }
 
-    // Closed-neighborhood sizes for the O(1) domination precheck:
-    // N[w] ⊆ N[z] requires |N[w]| <= |N[z]|. Kept exact under edge removals,
-    // so the precheck only ever skips subset tests that would fail.
-    let mut deg: Vec<u32> = vec![1; n];
-    for edge in &edge_list.edges {
-        deg[edge.u as usize] += 1;
-        deg[edge.v as usize] += 1;
-    }
+    // Neighborhoods at the current cutoff, including the diagonal.
+    let mut rows = SparseRows::build(n, &edge_list.edges, &deg);
 
     let mut dirty: Vec<u32> = Vec::with_capacity(n);
     let mut in_dirty = vec![false; n];
@@ -126,35 +220,26 @@ pub(crate) fn peel(edge_list: &mut EdgeList, parallel: bool) {
             let cached = dominator[w];
             if cached >= 0 {
                 let z = cached as usize;
-                if bit_set(&ball_bits, z)
-                    && deg[z] >= deg[w]
-                    && is_subset(
-                        &nbr_bits[w * nw..w * nw + nw],
-                        &nbr_bits[z * nw..z * nw + nw],
-                    )
-                {
+                if bit_set(&ball_bits, z) && deg[z] >= deg[w] && rows.is_subset(w, z) {
                     continue;
                 }
             }
 
-            let w_word = w >> 6;
+            // Candidates z ∈ N(w) ∩ ball, ascending id over w's occupied blocks.
+            let w_block = (w >> 6) as u16;
             let w_mask = !(1u64 << (w & 63));
             let mut found = false;
-            'search: for word_idx in 0..nw {
-                let mut bits = nbr_bits[w * nw + word_idx] & ball_bits[word_idx];
-                if word_idx == w_word {
+            'search: for i in rows.range(w) {
+                let block = rows.block_ids[i];
+                let mut bits = rows.words[i] & ball_bits[block as usize];
+                if block == w_block {
                     bits &= w_mask;
                 }
                 while bits != 0 {
                     let bit = bits.trailing_zeros() as usize;
                     bits &= bits - 1;
-                    let z = (word_idx << 6) | bit;
-                    if deg[z] >= deg[w]
-                        && is_subset(
-                            &nbr_bits[w * nw..w * nw + nw],
-                            &nbr_bits[z * nw..z * nw + nw],
-                        )
-                    {
+                    let z = ((block as usize) << 6) | bit;
+                    if deg[z] >= deg[w] && rows.is_subset(w, z) {
                         dominator[w] = z as i32;
                         users[z].push(w as u32);
                         found = true;
@@ -176,8 +261,8 @@ pub(crate) fn peel(edge_list: &mut EdgeList, parallel: bool) {
             let a = edge_list.edges[top].u as usize;
             let b = edge_list.edges[top].v as usize;
 
-            nbr_bits[a * nw + (b >> 6)] &= !(1u64 << (b & 63));
-            nbr_bits[b * nw + (a >> 6)] &= !(1u64 << (a & 63));
+            rows.clear(a, b);
+            rows.clear(b, a);
             deg[a] -= 1;
             deg[b] -= 1;
 
@@ -227,6 +312,91 @@ pub(crate) fn peel(edge_list: &mut EdgeList, parallel: bool) {
 mod tests {
     use super::*;
     use crate::preprocess::edgelist::EdgeList;
+
+    fn unit_edge(u: u16, v: u16) -> Edge {
+        Edge {
+            u,
+            v,
+            distance: 1.0,
+        }
+    }
+
+    #[test]
+    fn sparse_rows_subset_and_clear() {
+        // Triangle 0-1-2 plus pendant 3 attached to 0.
+        let edges = vec![
+            unit_edge(1, 0),
+            unit_edge(2, 0),
+            unit_edge(2, 1),
+            unit_edge(3, 0),
+        ];
+        let mut deg = vec![1u32; 4];
+        for e in &edges {
+            deg[e.u as usize] += 1;
+            deg[e.v as usize] += 1;
+        }
+        let mut rows = SparseRows::build(4, &edges, &deg);
+
+        // N[1] = {0,1,2} ⊆ N[0] = {0,1,2,3}; the converse fails.
+        assert!(rows.is_subset(1, 0));
+        assert!(!rows.is_subset(0, 1));
+        // Pendant: N[3] = {0,3} ⊆ N[0].
+        assert!(rows.is_subset(3, 0));
+
+        // Remove edge (2,1): N[1] = {0,1} and N[2] = {0,2}, both still ⊆ N[0].
+        rows.clear(2, 1);
+        rows.clear(1, 2);
+        assert!(rows.is_subset(1, 0));
+        assert!(rows.is_subset(2, 0));
+        assert!(!rows.is_subset(0, 2));
+    }
+
+    #[test]
+    fn sparse_rows_cross_block_ids() {
+        // Star centered at 100 with leaves straddling three 64-bit blocks.
+        let n = 200usize;
+        let leaves = [3u16, 63, 64, 65, 127, 128, 199];
+        let edges: Vec<Edge> = leaves
+            .iter()
+            .map(|&l| {
+                let (u, v) = if l > 100 { (l, 100) } else { (100, l) };
+                unit_edge(u, v)
+            })
+            .collect();
+        let mut deg = vec![1u32; n];
+        for e in &edges {
+            deg[e.u as usize] += 1;
+            deg[e.v as usize] += 1;
+        }
+        let rows = SparseRows::build(n, &edges, &deg);
+
+        for &l in &leaves {
+            assert!(rows.is_subset(l as usize, 100), "leaf {l} ⊆ center");
+            assert!(!rows.is_subset(100, l as usize), "center ⊄ leaf {l}");
+        }
+        // Distinct leaves are incomparable (each contains itself).
+        assert!(!rows.is_subset(3, 199));
+        assert!(!rows.is_subset(199, 3));
+    }
+
+    /// End-to-end peel on a point cloud large enough that rows span multiple
+    /// 64-bit blocks (n = 144 > 128).
+    #[test]
+    fn multi_block_grid_peels_soundly() {
+        let mut points = Vec::new();
+        for x in 0..12 {
+            for y in 0..12 {
+                points.push(x as f32);
+                points.push(y as f32);
+            }
+        }
+        let mut edge_list = EdgeList::from_points(&points, 144, 2, f32::INFINITY, false);
+        let center = edge_list.center;
+        let initial = edge_list.threshold;
+        peel(&mut edge_list, false);
+        assert!(edge_list.threshold.is_finite() && edge_list.threshold >= 0.0);
+        assert_finalized(&edge_list, center, initial);
+    }
 
     fn square_from_lower_tri(n: usize, lower: &[f32]) -> Vec<f32> {
         assert_eq!(lower.len(), n * (n - 1) / 2);

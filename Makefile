@@ -1,4 +1,4 @@
-.PHONY: help install build-py build-rust test test-core test-python bench profile profile-build profile-all release-py publish-rust clean
+.PHONY: help install build-py build-rust test test-core test-python bench bench-peel bench-quot profile profile-build profile-all release-py publish-rust clean
 .DEFAULT_GOAL := help
 
 # ── Colors ────────────────────────────────────────────────────────────────
@@ -15,8 +15,10 @@ PYTHON      := crates/python/.venv/bin/python
 MATURIN     := crates/python/.venv/bin/maturin
 BENCH_FILTER ?=
 MAX_DIM ?= 2
+VARIANT ?= vanilla
 PROFILE_RATE ?= 1000
-PROFILE_DIR ?= target/profiles
+# Outside target/ so `cargo clean` keeps profiles (gitignored).
+PROFILE_DIR ?= profiles
 PROFILE_H2_LAST_DATASET ?= hiv1.txt
 PROFILE_REPEATS ?= 1
 PROFILE_PROFILE     ?= profiling
@@ -57,32 +59,38 @@ test: test-core test-python ## Run all correctness tests
 
 # ── Bench ─────────────────────────────────────────────────────────────────
 
-bench: ## Run BitCSR Rust core benchmarks
-	@echo "$(CYAN)📊 Running BitCSR Rust core benchmarks...$(RESET)"
-	@TDA_MAX_DIM=$(MAX_DIM) cargo bench -p $(BENCH_CRATE) --bench $(BENCH_NAME)
+bench: ## Run BitCSR core benchmarks (VARIANT=vanilla|peel|quot)
+	@echo "$(CYAN)📊 Running BitCSR benchmarks ($(VARIANT))...$(RESET)"
+	@TDA_MAX_DIM=$(MAX_DIM) TDA_VARIANT=$(VARIANT) cargo bench -p $(BENCH_CRATE) --bench $(BENCH_NAME)
+
+bench-peel: ## Benchmark the vanilla pipeline + peel
+	@$(MAKE) bench VARIANT=peel
+
+bench-quot: ## Benchmark the vanilla pipeline + quotient
+	@$(MAKE) bench VARIANT=quot
 
 
 profile-build: ## Build the single-run profiling runner (optimized + line info)
 	@echo "$(CYAN)📦 Building profiling runner...$(RESET)"
 	@cargo build --profile $(PROFILE_PROFILE) -p $(BENCH_CRATE) --example profile_runner
 
-profile: profile-build ## Profile one dataset with samply (DATASET=dragon_2000.txt)
+profile: profile-build ## Profile one dataset with samply (DATASET=dragon_2000.txt VARIANT=vanilla|peel|quot)
 	@if [ -z "$(DATASET)" ]; then \
-		echo "$(RED)Usage: make profile DATASET=dragon_2000.txt$(RESET)"; \
+		echo "$(RED)Usage: make profile DATASET=dragon_2000.txt [VARIANT=peel]$(RESET)"; \
 		exit 1; \
 	fi
 	@file="$(DATASET)"; \
 	name=$$(basename "$$file" .txt); \
-	OUT_DIR="$(PROFILE_DIR)/bitcsr_h$(MAX_DIM)"; \
+	OUT_DIR="$(PROFILE_DIR)/$(VARIANT)_h$(MAX_DIM)"; \
 	mkdir -p "$$OUT_DIR"; \
 	out="$$OUT_DIR/$$name.json.gz"; \
-	echo "$(CYAN)📊 Profiling bitcsr_h$(MAX_DIM)/$$name...$(RESET)"; \
+	echo "$(CYAN)📊 Profiling $(VARIANT)_h$(MAX_DIM)/$$name...$(RESET)"; \
 	$(SAMPLY) record \
 		--save-only \
 		--unstable-presymbolicate \
 		--rate $(PROFILE_RATE) \
 		-o "$$out" \
-		-- $(PROFILE_TARGET_DIR)/examples/profile_runner "$(MAX_DIM)" "$$file" "$(PROFILE_REPEATS)"; \
+		-- $(PROFILE_TARGET_DIR)/examples/profile_runner "$(MAX_DIM)" "$$file" "$(PROFILE_REPEATS)" "$(VARIANT)"; \
 	echo "$(GREEN)✅ Profile written to $$out.$(RESET)"
 
 # ── Publish ───────────────────────────────────────────────────────────────

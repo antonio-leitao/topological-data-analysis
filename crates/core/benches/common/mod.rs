@@ -24,6 +24,52 @@ pub fn max_dim_from_env() -> usize {
         .expect("TDA_MAX_DIM must be 1 or 2")
 }
 
+/// Which optional preprocessing to exercise on top of the vanilla pipeline.
+#[derive(Clone, Copy)]
+pub struct Variant {
+    pub name: &'static str,
+    pub peel: bool,
+    pub quotient: bool,
+}
+
+pub const VANILLA: Variant = Variant {
+    name: "vanilla",
+    peel: false,
+    quotient: false,
+};
+
+pub fn parse_variant(value: &str) -> Result<Variant, String> {
+    match value {
+        "" | "vanilla" => Ok(VANILLA),
+        "peel" => Ok(Variant {
+            name: "peel",
+            peel: true,
+            quotient: false,
+        }),
+        "quot" => Ok(Variant {
+            name: "quot",
+            peel: false,
+            quotient: true,
+        }),
+        other => Err(format!("variant must be vanilla|peel|quot, got {other}")),
+    }
+}
+
+pub fn variant_from_env() -> Variant {
+    parse_variant(env::var("TDA_VARIANT").ok().as_deref().unwrap_or("vanilla"))
+        .expect("TDA_VARIANT must be vanilla, peel, or quot")
+}
+
+/// Group / directory label: the historical `bitcsr_h{d}` for vanilla (keeps
+/// existing criterion baselines comparable), `bitcsr_h{d}_{variant}` otherwise.
+pub fn group_name(max_dim: usize, variant: Variant) -> String {
+    if variant.peel || variant.quotient {
+        format!("bitcsr_h{max_dim}_{}", variant.name)
+    } else {
+        format!("bitcsr_h{max_dim}")
+    }
+}
+
 pub fn parse_max_dim(value: &str) -> Result<usize, String> {
     match value {
         "" | "1" => Ok(1),
@@ -99,15 +145,21 @@ pub fn load_dataset(file: &str) -> Dataset {
     }
 }
 
-pub fn run_once(dataset: &Dataset, max_dim: usize) -> tda_core::Result<BarcodeResult> {
+/// One full end-to-end run (preprocessing included, so a variant's own cost is
+/// charged against its engine savings).
+pub fn run_once(
+    dataset: &Dataset,
+    max_dim: usize,
+    variant: Variant,
+) -> tda_core::Result<BarcodeResult> {
     persistent_homology(
         &dataset.points,
         dataset.n,
         max_dim,
         None,
         false,
-        false,
-        false,
+        variant.quotient,
+        variant.peel,
         false, //benches should not be parallel
     )
 }
