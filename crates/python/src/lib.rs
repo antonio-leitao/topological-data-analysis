@@ -216,6 +216,61 @@ fn persistent_homology<'py>(
     barcode_to_py(py, barcode)
 }
 
+/// Representative in transit to Python: (birth, death, cocycle) as vertex-id
+/// lists. Converted to the `tda.Representative` dataclass on the Python side.
+type PyRep = (Vec<u16>, Option<Vec<u16>>, Vec<Vec<u16>>);
+
+fn reps_to_py(reps: Vec<Vec<tda_core::Representative>>) -> Vec<Vec<PyRep>> {
+    reps.into_iter()
+        .map(|dim| {
+            dim.into_iter()
+                .map(|r| (r.birth, r.death, r.cocycle))
+                .collect()
+        })
+        .collect()
+}
+
+/// Vietoris–Rips persistent homology with cocycle representatives. Returns
+/// `(dgms, reps)`; `reps[d][i]` corresponds to `dgms[d][i]`. Wrapped by
+/// `tda.persistent_homology(..., representatives=True)`.
+#[pyfunction]
+#[pyo3(signature = (data, max_dim=1, threshold=None, distance_matrix=false, quotient=false, peel=true, collapse=false, parallel=true))]
+#[allow(clippy::too_many_arguments)]
+fn persistent_homology_reps<'py>(
+    py: Python<'py>,
+    data: &Bound<'py, PyAny>,
+    max_dim: usize,
+    threshold: Option<f32>,
+    distance_matrix: bool,
+    quotient: bool,
+    peel: bool,
+    collapse: bool,
+    parallel: bool,
+) -> PyResult<(Vec<Bound<'py, PyArray2<f32>>>, Vec<Vec<PyRep>>)> {
+    let config = tda_core::Config {
+        distance_matrix,
+        threshold,
+        peel,
+        quotient,
+        collapse,
+        parallel,
+    };
+
+    if let Some((rows, cols, vals, n)) = extract_coo(data)? {
+        let rb =
+            tda_core::persistent_homology_sparse_reps_with(&rows, &cols, &vals, n, max_dim, &config)
+                .map_err(to_py_err)?;
+        return Ok((barcode_to_py(py, rb.barcode)?, reps_to_py(rb.representatives)));
+    }
+
+    let (flat, rows, cols) = flatten_any(data)?;
+    check_input(py, rows, cols, distance_matrix)?;
+
+    let rb = tda_core::persistent_homology_reps_with(&flat, rows, max_dim, &config)
+        .map_err(to_py_err)?;
+    Ok((barcode_to_py(py, rb.barcode)?, reps_to_py(rb.representatives)))
+}
+
 /// Truncated Vietoris–Rips filtration size (simplices of dimension ≤ max_dim).
 #[pyfunction]
 #[pyo3(signature = (data, max_dim=1, threshold=None, distance_matrix=false, quotient=false, peel=true, collapse=false, parallel=true))]
@@ -254,6 +309,7 @@ fn filtration_size<'py>(
 #[pymodule]
 fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(persistent_homology, m)?)?;
+    m.add_function(wrap_pyfunction!(persistent_homology_reps, m)?)?;
     m.add_function(wrap_pyfunction!(filtration_size, m)?)?;
     Ok(())
 }

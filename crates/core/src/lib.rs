@@ -8,7 +8,7 @@ mod utils;
 use preprocess::edgelist::EdgeList;
 
 pub use error::{Error, Result};
-pub use types::{BarcodeResult, PersistenceInterval};
+pub use types::{BarcodeResult, PersistenceInterval, Representative, RepresentedBarcode};
 
 pub const MAX_POINTS: usize = u16::MAX as usize;
 pub const MAX_DIM: usize = 4;
@@ -121,6 +121,72 @@ pub fn persistent_homology_with(
 ) -> Result<BarcodeResult> {
     let edges = build_edges(data, n, max_dim, config)?;
     Ok(compute_barcode(edges, max_dim, config.parallel))
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Persistent homology with cocycle representatives
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// [`persistent_homology`] plus cocycle representatives, with the default
+/// [`Config`]. See [`persistent_homology_reps_with`].
+pub fn persistent_homology_reps(
+    data: &[f32],
+    n: usize,
+    max_dim: usize,
+) -> Result<RepresentedBarcode> {
+    persistent_homology_reps_with(data, n, max_dim, &Config::default())
+}
+
+/// Vietoris–Rips persistent homology with cocycle representatives.
+///
+/// Same input contract and pipeline as [`persistent_homology_with`]; the
+/// result additionally carries, per emitted interval, its birth simplex, its
+/// death simplex (`None` for essential classes), and a representative
+/// COCYCLE of the class (persistent cohomology, as in Ripser's `do_cocycles`;
+/// homological cycle representatives are future work). Recording is selected
+/// at compile time, so the plain endpoints pay nothing for it.
+///
+/// Composition with the transforms: `peel` is fully transparent (it only
+/// truncates the filtration tail). Under `quotient` the representatives are
+/// simplices of the coned quotient complex — vertex ids are the original ids
+/// of cluster representatives. Under `collapse` they are cocycles of the
+/// (exactly equivalent) collapsed filtration, which may reference shifted
+/// edge values. Essential classes in dimension ≥ 1 arise only under a user
+/// threshold; their cocycles are valid within the truncated complex.
+pub fn persistent_homology_reps_with(
+    data: &[f32],
+    n: usize,
+    max_dim: usize,
+    config: &Config,
+) -> Result<RepresentedBarcode> {
+    let edges = build_edges(data, n, max_dim, config)?;
+    Ok(compute_represented_barcode(edges, max_dim, config.parallel))
+}
+
+/// Sparse (COO) sibling of [`persistent_homology_reps`], with the default
+/// [`Config`]. See [`persistent_homology_sparse_with`] for the input contract.
+pub fn persistent_homology_sparse_reps(
+    rows: &[u32],
+    cols: &[u32],
+    vals: &[f32],
+    n: usize,
+    max_dim: usize,
+) -> Result<RepresentedBarcode> {
+    persistent_homology_sparse_reps_with(rows, cols, vals, n, max_dim, &Config::default())
+}
+
+/// Sparse (COO) sibling of [`persistent_homology_reps_with`]. See
+/// [`persistent_homology_sparse_with`] for the input contract.
+pub fn persistent_homology_sparse_reps_with(
+    rows: &[u32],
+    cols: &[u32],
+    vals: &[f32],
+    n: usize,
+    max_dim: usize,
+    config: &Config,
+) -> Result<RepresentedBarcode> {
+    let edges = build_sparse_edges(rows, cols, vals, n, max_dim, config)?;
+    Ok(compute_represented_barcode(edges, max_dim, config.parallel))
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -311,6 +377,14 @@ fn apply_optimizations(edges: &mut EdgeList, config: &Config) {
 fn compute_barcode(edges: EdgeList, max_dim: usize, parallel: bool) -> BarcodeResult {
     let bitcsr = engine::BitCsrDistanceMatrix::from_edge_list(edges);
     engine::algorithm::compute(&bitcsr, max_dim, parallel)
+}
+
+/// [`compute_barcode`]'s recording sibling: same pipeline, monomorphised with
+/// representative capture enabled.
+#[inline]
+fn compute_represented_barcode(edges: EdgeList, max_dim: usize, parallel: bool) -> RepresentedBarcode {
+    let bitcsr = engine::BitCsrDistanceMatrix::from_edge_list(edges);
+    engine::algorithm::compute_with_representatives(&bitcsr, max_dim, parallel)
 }
 
 /// Recover the ambient dimension of a row-major point cloud from its flat length.
@@ -707,6 +781,77 @@ mod pipeline_tests {
         };
         let count = filtration_size_with(&points, 4, 1, &cfg).unwrap();
         assert_eq!(count, 8);
+    }
+
+    /// Representatives: same barcode as the plain endpoint, 1:1 alignment,
+    /// and the expected shapes on the unit square (known intervals).
+    #[test]
+    fn representatives_align_with_barcode() {
+        let (points, _) = ring_distances();
+        let rb = persistent_homology_reps(&points, 4, 1).unwrap();
+        let plain = persistent_homology(&points, 4, 1).unwrap();
+        assert_same_barcode(&rb.barcode, &plain);
+
+        assert_eq!(rb.representatives.len(), rb.barcode.intervals.len());
+        for d in 0..rb.representatives.len() {
+            assert_eq!(rb.representatives[d].len(), rb.barcode.intervals[d].len());
+        }
+
+        // H0: three finite pairs (vertex, unit edge) and one essential class
+        // named by vertex 0; cocycles empty by contract.
+        for (iv, rep) in rb.barcode.intervals[0].iter().zip(&rb.representatives[0]) {
+            assert_eq!(rep.birth.len(), 1);
+            assert!(rep.cocycle.is_empty());
+            match &rep.death {
+                Some(edge) => {
+                    assert_eq!(edge.len(), 2);
+                    assert!(iv.death.is_finite());
+                }
+                None => {
+                    assert!(iv.death.is_infinite());
+                    assert_eq!(rep.birth, vec![0]);
+                }
+            }
+        }
+
+        // H1: one interval [1, √2); birth is an edge, death a triangle, the
+        // cocycle is a nonempty set of edges containing the birth simplex.
+        assert_eq!(rb.representatives[1].len(), 1);
+        let rep = &rb.representatives[1][0];
+        assert_eq!(rep.birth.len(), 2);
+        assert_eq!(rep.death.as_ref().map(|d| d.len()), Some(3));
+        assert!(!rep.cocycle.is_empty());
+        assert!(rep.cocycle.iter().all(|s| s.len() == 2));
+        assert!(rep.cocycle.contains(&rep.birth));
+    }
+
+    /// The sparse reps endpoint runs the identical pipeline, so intervals AND
+    /// representatives match the dense-matrix reps endpoint exactly.
+    #[test]
+    fn sparse_reps_match_dense_reps() {
+        let (_, distances) = ring_distances();
+        let n = 4;
+        let mut rows = Vec::new();
+        let mut cols = Vec::new();
+        let mut vals = Vec::new();
+        for i in 0..n {
+            for j in 0..n {
+                rows.push(i as u32);
+                cols.push(j as u32);
+                vals.push(distances[i * n + j]);
+            }
+        }
+
+        let base = config(true, false, false, false);
+        let dense_cfg = Config {
+            distance_matrix: true,
+            ..base.clone()
+        };
+        let dense = persistent_homology_reps_with(&distances, n, 1, &dense_cfg).unwrap();
+        let sparse =
+            persistent_homology_sparse_reps_with(&rows, &cols, &vals, n, 1, &base).unwrap();
+        assert_same_barcode(&dense.barcode, &sparse.barcode);
+        assert_eq!(dense.representatives, sparse.representatives);
     }
 
     /// The sparse COO pipeline must produce the same barcode as the dense

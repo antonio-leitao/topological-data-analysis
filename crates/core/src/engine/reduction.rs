@@ -8,6 +8,33 @@ use crate::engine::heap::FastHeap;
 use crate::engine::simplex::{FxHashMap, Simplex128};
 use crate::types::PersistenceInterval;
 
+/// Engine-internal representative for one EMITTED interval: the birth simplex,
+/// the death simplex (`None` for essential classes), and the representative
+/// cocycle — the birth simplex plus the recorded reduction (V) column, over
+/// Z/2. Aligned index-for-index with the emitted intervals of its dimension.
+pub(crate) struct RawRepresentative {
+    pub(crate) birth: Simplex128,
+    pub(crate) death: Option<Simplex128>,
+    pub(crate) cocycle: Vec<Simplex128>,
+}
+
+/// Sort and Z/2-cancel `working_v` in place, emitting each surviving entry.
+/// Since elements may appear with multiplicity, equal pairs cancel.
+#[inline]
+fn for_each_cancelled(working_v: &mut [Simplex128], mut f: impl FnMut(Simplex128)) {
+    working_v.sort_unstable();
+    let mut i = 0;
+    while i < working_v.len() {
+        let s = working_v[i];
+        if i + 1 < working_v.len() && working_v[i + 1] == s {
+            i += 2; // pair cancels in Z/2
+        } else {
+            f(s);
+            i += 1;
+        }
+    }
+}
+
 // ═══════════════════════════════════════════════════════════════════════════════
 // CompressedSparseMatrix — storage for the reduction matrix V
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -131,10 +158,16 @@ fn init_coboundary_and_get_pivot(
 /// pivot → column-index map; its key set is exactly the pivots recorded this
 /// dimension, which the caller feeds to `assemble_candidates` as the clearing
 /// set (avoiding a second, duplicate hash table).
-pub fn compute_pairs(
+///
+/// `RECORD` gates cocycle-representative capture at compile time: the plain
+/// path monomorphises with every recording block removed, so it stays exactly
+/// the hot loop it was. When recording, one `RawRepresentative` is pushed to
+/// `dim_reps` per EMITTED interval, in the same order.
+pub(crate) fn compute_pairs<const RECORD: bool>(
     columns: &[Simplex128],
     dist: &BitCsrDistanceMatrix,
     dim_intervals: &mut Vec<PersistenceInterval>,
+    dim_reps: &mut Vec<RawRepresentative>,
 ) -> FxHashMap<Simplex128, usize> {
     let mut pivot_column_index: FxHashMap<Simplex128, usize> =
         FxHashMap::with_capacity_and_hasher(columns.len(), Default::default());
@@ -170,6 +203,14 @@ pub fn compute_pairs(
                         birth: sigma.filtration(),
                         death: tau.filtration(),
                     });
+                    if RECORD {
+                        // No columns were added: the cocycle is σ alone.
+                        dim_reps.push(RawRepresentative {
+                            birth: sigma,
+                            death: Some(tau),
+                            cocycle: vec![sigma],
+                        });
+                    }
                 }
                 pivot_column_index.insert(tau, j);
                 continue;
@@ -178,6 +219,13 @@ pub fn compute_pairs(
                 birth: sigma.filtration(),
                 death: f32::INFINITY,
             });
+            if RECORD {
+                dim_reps.push(RawRepresentative {
+                    birth: sigma,
+                    death: None,
+                    cocycle: vec![sigma],
+                });
+            }
             continue;
         }
 
@@ -188,6 +236,18 @@ pub fn compute_pairs(
                         birth: sigma.filtration(),
                         death: f32::INFINITY,
                     });
+                    if RECORD {
+                        // Essential class (only reachable under a user
+                        // threshold): the accumulated column is its cocycle
+                        // within the truncated complex.
+                        let mut cocycle = vec![sigma];
+                        for_each_cancelled(&mut working_v, |s| cocycle.push(s));
+                        dim_reps.push(RawRepresentative {
+                            birth: sigma,
+                            death: None,
+                            cocycle,
+                        });
+                    }
                     break;
                 }
                 Some(tau) => {
@@ -210,7 +270,8 @@ pub fn compute_pairs(
                         continue;
                     }
 
-                    if tau.filtration_encoded() != sigma.filtration_encoded() {
+                    let emitted = tau.filtration_encoded() != sigma.filtration_encoded();
+                    if emitted {
                         dim_intervals.push(PersistenceInterval {
                             birth: sigma.filtration(),
                             death: tau.filtration(),
@@ -219,17 +280,20 @@ pub fn compute_pairs(
                     pivot_column_index.insert(tau, j);
 
                     // Sort and Z/2-cancel, then drain into the reduction matrix.
-                    // Since elements may appear with multiplicity, equal pairs cancel.
-                    working_v.sort_unstable();
-                    let mut i = 0;
-                    while i < working_v.len() {
-                        let s = working_v[i];
-                        if i + 1 < working_v.len() && working_v[i + 1] == s {
-                            i += 2; // pair cancels in Z/2
-                        } else {
-                            v_matrix.push(s);
-                            i += 1;
-                        }
+                    for_each_cancelled(&mut working_v, |s| v_matrix.push(s));
+
+                    if RECORD && emitted {
+                        // The cocycle of the class killed by τ: σ plus the
+                        // just-recorded V column.
+                        let column = v_matrix.column(j);
+                        let mut cocycle = Vec::with_capacity(column.len() + 1);
+                        cocycle.push(sigma);
+                        cocycle.extend_from_slice(column);
+                        dim_reps.push(RawRepresentative {
+                            birth: sigma,
+                            death: Some(tau),
+                            cocycle,
+                        });
                     }
                     break;
                 }

@@ -16,6 +16,30 @@ pub struct BarcodeResult {
     /// `intervals[d]` = persistence intervals in dimension d.
     pub intervals: Vec<Vec<PersistenceInterval>>,
 }
+
+/// Cocycle representative for one persistence interval.
+///
+/// Simplices are given as descending vertex-id lists. `death` is `None` for
+/// essential classes. `cocycle` is the representative cocycle of the class —
+/// the birth simplex plus the recorded reduction column, over Z/2 (persistent
+/// COHOMOLOGY representatives, as in Ripser's `do_cocycles`). In dimension 0
+/// it is empty: H0 comes from union-find, and the birth vertex / death edge
+/// pair carries the information.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Representative {
+    pub birth: Vec<u16>,
+    pub death: Option<Vec<u16>>,
+    pub cocycle: Vec<Vec<u16>>,
+}
+
+/// Barcode plus cocycle representatives.
+///
+/// `representatives[d][i]` corresponds to `barcode.intervals[d][i]`.
+#[derive(Debug, Clone)]
+pub struct RepresentedBarcode {
+    pub barcode: BarcodeResult,
+    pub representatives: Vec<Vec<Representative>>,
+}
 impl BarcodeResult {
     /// Consume self, yielding one flat Vec<f32> per dimension.
     /// Zero-copy transmute: PersistenceInterval is #[repr(C)] {f32, f32}.
