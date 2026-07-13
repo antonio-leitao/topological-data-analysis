@@ -34,12 +34,26 @@ pub enum Error {
 
     #[error("threshold must be non-negative (and not NaN), got {0}")]
     InvalidThreshold(f32),
+
     #[error("data length {got} is incompatible with n={n} for {mode} input")]
     ShapeMismatch {
         n: usize,
         got: usize,
         mode: &'static str,
     },
+
+    #[error(
+        "sparse input arrays must have equal lengths, got rows={rows}, \
+         cols={cols}, values={vals}"
+    )]
+    SparseLengthMismatch {
+        rows: usize,
+        cols: usize,
+        vals: usize,
+    },
+
+    #[error("sparse entry ({u}, {v}) is out of range for n={n}")]
+    SparseIndexOutOfRange { u: u32, v: u32, n: usize },
 }
 
 /// Crate-wide `Result` alias.

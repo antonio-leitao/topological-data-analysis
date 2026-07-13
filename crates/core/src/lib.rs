@@ -124,6 +124,76 @@ pub fn persistent_homology_with(
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
+// Persistent homology — sparse (COO) distance graphs
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Vietoris–Rips persistent homology of a sparse distance graph in COO form,
+/// with the default [`Config`]. See [`persistent_homology_sparse_with`].
+pub fn persistent_homology_sparse(
+    rows: &[u32],
+    cols: &[u32],
+    vals: &[f32],
+    n: usize,
+    max_dim: usize,
+) -> Result<BarcodeResult> {
+    persistent_homology_sparse_with(rows, cols, vals, n, max_dim, &Config::default())
+}
+
+/// Vietoris–Rips persistent homology of a sparse distance graph in COO form.
+///
+/// `(rows[k], cols[k], vals[k])` is one entry `d(rows[k], cols[k]) = vals[k]`
+/// of an undirected distance graph on `n` vertices. Orientation and duplicates
+/// are irrelevant — the smallest finite value given for a pair wins — and
+/// diagonal entries are ignored. A pair with no finite entry is never
+/// connected (infinite distance), and truncation uses the same per-component
+/// certificate as the dense distance-matrix path, so disconnected inputs are
+/// handled soundly. Values `>= f32::MAX` (or NaN) count as absent.
+///
+/// `config.distance_matrix` is meaningless for this entry point and ignored;
+/// the other fields behave as in [`persistent_homology_with`].
+pub fn persistent_homology_sparse_with(
+    rows: &[u32],
+    cols: &[u32],
+    vals: &[f32],
+    n: usize,
+    max_dim: usize,
+    config: &Config,
+) -> Result<BarcodeResult> {
+    let edges = build_sparse_edges(rows, cols, vals, n, max_dim, config)?;
+    Ok(compute_barcode(edges, max_dim, config.parallel))
+}
+
+/// Truncated filtration size of a sparse COO distance graph, with the default
+/// [`Config`]. See [`persistent_homology_sparse_with`] for the input contract.
+pub fn filtration_size_sparse(
+    rows: &[u32],
+    cols: &[u32],
+    vals: &[f32],
+    n: usize,
+    max_dim: usize,
+) -> Result<usize> {
+    filtration_size_sparse_with(rows, cols, vals, n, max_dim, &Config::default())
+}
+
+/// Truncated filtration size of a sparse COO distance graph. See
+/// [`persistent_homology_sparse_with`] for the input contract.
+pub fn filtration_size_sparse_with(
+    rows: &[u32],
+    cols: &[u32],
+    vals: &[f32],
+    n: usize,
+    max_dim: usize,
+    config: &Config,
+) -> Result<usize> {
+    let edges = build_sparse_edges(rows, cols, vals, n, max_dim, config)?;
+    Ok(utils::cliques::count_cliques(
+        edges,
+        max_dim + 1,
+        config.parallel,
+    ))
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
 // Filtration size
 // ═══════════════════════════════════════════════════════════════════════════════
 
@@ -178,6 +248,44 @@ fn build_edges(data: &[f32], n: usize, max_dim: usize, config: &Config) -> Resul
 
     apply_optimizations(&mut edges, config);
     Ok(edges)
+}
+
+/// The sparse sibling of [`build_edges`]: validate, build the truncated
+/// `EdgeList` from COO entries, then apply the optional transforms.
+fn build_sparse_edges(
+    rows: &[u32],
+    cols: &[u32],
+    vals: &[f32],
+    n: usize,
+    max_dim: usize,
+    config: &Config,
+) -> Result<EdgeList> {
+    validate_params(n, max_dim, config.threshold)?;
+    validate_sparse(rows, cols, vals, n)?;
+    let t = config.threshold.unwrap_or(f32::INFINITY);
+
+    let mut edges = EdgeList::from_coo(n, rows, cols, vals, t);
+    apply_optimizations(&mut edges, config);
+    Ok(edges)
+}
+
+#[inline]
+fn validate_sparse(rows: &[u32], cols: &[u32], vals: &[f32], n: usize) -> Result<()> {
+    if rows.len() != cols.len() || rows.len() != vals.len() {
+        return Err(Error::SparseLengthMismatch {
+            rows: rows.len(),
+            cols: cols.len(),
+            vals: vals.len(),
+        });
+    }
+    // n <= MAX_POINTS (already validated) so the cast is lossless.
+    let bound = n as u32;
+    for (&r, &c) in rows.iter().zip(cols) {
+        if r >= bound || c >= bound {
+            return Err(Error::SparseIndexOutOfRange { u: r, v: c, n });
+        }
+    }
+    Ok(())
 }
 
 /// Apply the optional transforms in canonical order: `peel` first (exact,
@@ -599,6 +707,103 @@ mod pipeline_tests {
         };
         let count = filtration_size_with(&points, 4, 1, &cfg).unwrap();
         assert_eq!(count, 8);
+    }
+
+    /// The sparse COO pipeline must produce the same barcode as the dense
+    /// distance-matrix pipeline on the same metric.
+    #[test]
+    fn sparse_pipeline_matches_dense_matrix() {
+        let (_, distances) = ring_distances();
+        let n = 4;
+        let mut rows = Vec::new();
+        let mut cols = Vec::new();
+        let mut vals = Vec::new();
+        for i in 0..n {
+            for j in 0..n {
+                rows.push(i as u32);
+                cols.push(j as u32);
+                vals.push(distances[i * n + j]); // diagonal zeros are ignored
+            }
+        }
+
+        for peel in [false, true] {
+            let base = config(peel, false, false, false);
+            let dense_cfg = Config {
+                distance_matrix: true,
+                ..base.clone()
+            };
+            let dense = persistent_homology_with(&distances, n, 1, &dense_cfg).unwrap();
+            let sparse =
+                persistent_homology_sparse_with(&rows, &cols, &vals, n, 1, &base).unwrap();
+            assert_same_barcode(&dense, &sparse);
+            assert_eq!(
+                filtration_size_sparse_with(&rows, &cols, &vals, n, 1, &base).unwrap(),
+                filtration_size_with(&distances, n, 1, &dense_cfg).unwrap()
+            );
+        }
+    }
+
+    /// Sparse input with missing pairs: disconnected components keep their
+    /// late deaths, and duplicate entries resolve to the minimum.
+    #[test]
+    fn sparse_disconnected_preserves_late_h1_death() {
+        // Component A: unit 4-cycle with diagonals 2.0 → H1 [1, 2).
+        // Component B: pair (4, 5). One duplicate entry that must lose.
+        let entries: &[(u32, u32, f32)] = &[
+            (0, 1, 1.0),
+            (1, 2, 1.0),
+            (2, 3, 1.0),
+            (3, 0, 1.0),
+            (0, 2, 2.0),
+            (1, 3, 2.0),
+            (4, 5, 1.0),
+            (1, 0, 7.0), // duplicate of (0, 1): the min (1.0) must win
+        ];
+        let rows: Vec<u32> = entries.iter().map(|e| e.0).collect();
+        let cols: Vec<u32> = entries.iter().map(|e| e.1).collect();
+        let vals: Vec<f32> = entries.iter().map(|e| e.2).collect();
+
+        let bc = persistent_homology_sparse_with(
+            &rows,
+            &cols,
+            &vals,
+            6,
+            1,
+            &config(false, false, false, false),
+        )
+        .unwrap();
+
+        let h0_essential = bc.intervals[0]
+            .iter()
+            .filter(|iv| iv.death.is_infinite())
+            .count();
+        assert_eq!(h0_essential, 2);
+        assert_eq!(bc.intervals[1].len(), 1, "H1 = {:?}", bc.intervals[1]);
+        let h1 = &bc.intervals[1][0];
+        assert!((h1.birth - 1.0).abs() < 1e-6);
+        assert!(h1.death.is_finite() && (h1.death - 2.0).abs() < 1e-6);
+
+        // Peel must remain barcode-preserving on sparse inputs too.
+        let peeled = persistent_homology_sparse_with(
+            &rows,
+            &cols,
+            &vals,
+            6,
+            1,
+            &config(true, false, false, false),
+        )
+        .unwrap();
+        assert_same_barcode(&bc, &peeled);
+    }
+
+    #[test]
+    fn sparse_input_validation_errors() {
+        let err =
+            persistent_homology_sparse(&[0, 1], &[1], &[1.0, 2.0], 4, 1).unwrap_err();
+        assert!(matches!(err, Error::SparseLengthMismatch { .. }));
+
+        let err = persistent_homology_sparse(&[0, 7], &[1, 0], &[1.0, 2.0], 4, 1).unwrap_err();
+        assert!(matches!(err, Error::SparseIndexOutOfRange { .. }));
     }
 
     #[test]

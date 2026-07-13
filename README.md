@@ -22,9 +22,10 @@
   </p>
 </div>
 
-TDA computes Vietoris–Rips persistent homology from point clouds or
-precomputed distance matrices. The performance-critical implementation is
-written in Rust and is available through both Python and Rust APIs.
+TDA computes Vietoris–Rips persistent homology from point clouds, precomputed
+distance matrices, or sparse distance graphs. The engine is an enhanced
+Ripser-style[^ripser] reduction written in Rust, available through both Python
+and Rust APIs.
 
 > [!CAUTION]
 > TDA is in an early stage of development. APIs may change between releases.
@@ -83,6 +84,22 @@ barcode = tda.persistent_homology(
 )
 ```
 
+Sparse distance matrices (any `scipy.sparse` format — in fact, anything with a
+`.tocoo()` method; scipy itself never becomes a dependency) are treated as
+distance graphs: entries are edges, missing pairs are never connected
+(infinite distance), duplicate entries resolve to the smallest value, and
+disconnected inputs are handled soundly:
+
+```python
+import scipy.sparse as sp
+
+graph = sp.coo_matrix(
+    ([1.0, 1.0, 1.0, 1.0], ([0, 1, 2, 3], [1, 2, 3, 0])),
+    shape=(4, 4),
+)
+barcode = tda.persistent_homology(graph, max_dim=1)
+```
+
 Use `filtration_size` to inspect the size of the truncated filtration built
 with the same options:
 
@@ -98,13 +115,13 @@ parameters:
 
 | Parameter         | Type            | Default | Description                                                                                                                                                              |
 | ----------------- | --------------- | ------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `data`            | `np.ndarray`    | —       | Two-dimensional `float32` or `float64` array (`float64` is cast to `float32`). Shape `(n, d)` for a point cloud or `(n, n)` for a distance matrix. Inputs are copied into row-major internal storage. |
+| `data`            | `np.ndarray` or sparse | —       | Two-dimensional `float32` or `float64` array (`float64` is cast to `float32`) — shape `(n, d)` for a point cloud, `(n, n)` for a distance matrix — or a square `scipy.sparse` distance matrix. Inputs are copied into row-major internal storage. |
 | `max_dim`         | `int`           | `1`     | Highest homology dimension to compute. Capped at 4.                                                                                                                     |
 | `threshold`       | `float \| None` | `None`  | Maximum filtration value. `None` uses the enclosing radius; an explicit value is capped by that radius.                                                                 |
-| `distance_matrix` | `bool`          | `False` | Interpret `data` as a square distance matrix. Symmetry, zero diagonal, and non-negativity are assumed rather than validated.                                            |
-| `quotient`        | `bool`          | `False` | Use the smaller quotient-cover filtration. This is an approximation with a `log(3)` interleaving guarantee, not the exact Vietoris–Rips barcode.                        |
+| `distance_matrix` | `bool`          | `False` | Interpret `data` as a square distance matrix. Symmetry, zero diagonal, and non-negativity are assumed rather than validated. Ignored for sparse input, which is always a distance graph. |
+| `quotient`        | `bool`          | `False` | Use the smaller quotient-cover filtration.[^quotient] This is an approximation with a `log(3)` interleaving guarantee, not the exact Vietoris–Rips barcode.             |
 | `peel`            | `bool`          | `True`  | Tighten the truncation radius with an exact strong-collapse peeling: identical barcode, strictly less work. Disable to compute over the plain enclosing radius.          |
-| `collapse`        | `bool`          | `False` | Remove filtration-dominated edges (exact edge collapse): identical barcode, smaller filtration, but expensive preprocessing.                                             |
+| `collapse`        | `bool`          | `False` | Remove filtration-dominated edges (exact edge collapse):[^collapse] identical barcode, smaller filtration, but expensive preprocessing.                                  |
 | `parallel`        | `bool`          | `True`  | Enable parallel preprocessing, sorting, and candidate assembly for sufficiently large inputs.                                                                            |
 
 `persistent_homology` returns a list of length `max_dim + 1`. Entry
@@ -172,8 +189,28 @@ fn main() -> Result<(), Error> {
 }
 ```
 
+Sparse COO distance graphs use `persistent_homology_sparse` /
+`persistent_homology_sparse_with` (and the matching `filtration_size_sparse`
+functions), taking `rows`, `cols`, and `values` slices plus `n`.
+
 Invalid inputs return `tda_core::Error`, including shape mismatches, invalid
 thresholds, too few or too many points, and unsupported dimensions.
+
+## References
+
+[^ripser]: U. Bauer. *Ripser: efficient computation of Vietoris–Rips
+    persistence barcodes*. Journal of Applied and Computational Topology, 2021.
+    [arXiv:1908.02518](https://arxiv.org/abs/1908.02518).
+
+[^quotient]: A. Leitão. *It's All About Covers: Persistent Homology of Cover
+    Refinements*. [arXiv:2602.22784](https://arxiv.org/abs/2602.22784).
+
+[^collapse]: J.-D. Boissonnat and S. Pritam. *Edge Collapse and Persistence of
+    Flag Complexes*. SoCG 2020.
+    [DOI:10.4230/LIPIcs.SoCG.2020.19](https://doi.org/10.4230/LIPIcs.SoCG.2020.19).
+    M. Glisse and S. Pritam. *Swap, Shift and Trim to Edge Collapse a
+    Filtration*. SoCG 2022.
+    [DOI:10.4230/LIPIcs.SoCG.2022.44](https://doi.org/10.4230/LIPIcs.SoCG.2022.44).
 
 ## License
 

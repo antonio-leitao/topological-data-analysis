@@ -1,10 +1,12 @@
-//! Sparse weighted edge-list construction from point clouds and distance matrices.
+//! Sparse weighted edge-list construction from point clouds, distance
+//! matrices, and sparse COO distance graphs.
 //!
 //! This is the common data boundary between distance preprocessing and the
 //! optional filtration transforms. Each undirected edge is stored once with
-//! `u > v`. Point-cloud construction preserves the tiled distance kernel and its
-//! adaptive memory policy: one buffered pass for ordinary inputs, two passes when
-//! buffering every candidate edge could exceed the staging budget.
+//! `u > v`. Point-cloud construction runs the tiled distance kernel in a
+//! single buffered pass; the staging buffer is kept small by a sampled
+//! eccentricity bound ([`staging_cutoff`]) that provably exceeds the final
+//! truncation radius.
 
 use rayon::prelude::*;
 
@@ -14,8 +16,9 @@ const MC: usize = 64;
 const NC: usize = 256;
 
 const NO_EDGE: f32 = f32::MAX;
-const SINGLE_PASS_BUDGET_BYTES: usize = 1 << 30;
 const PARALLEL_POINT_MIN_PAIRS: usize = 1 << 18;
+/// Number of vertices whose exact eccentricity seeds the staging cutoff.
+const STAGING_SAMPLES: usize = 8;
 
 /// One weighted undirected edge, stored canonically with `u > v`.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -59,18 +62,17 @@ impl EdgeList {
             };
         }
 
+        // Sound staging cutoff: an upper bound on the enclosing radius from a
+        // few exact eccentricities. Edges above it can never survive the final
+        // truncation, so they are never staged.
+        let staging = staging_cutoff(data, n, d, threshold);
+
         let pairs = n * (n - 1) / 2;
         let use_parallel = parallel && pairs >= PARALLEL_POINT_MIN_PAIRS;
-        if pairs.saturating_mul(std::mem::size_of::<Edge>()) <= SINGLE_PASS_BUDGET_BYTES {
-            if use_parallel {
-                points_single_pass_parallel(data, n, d, threshold)
-            } else {
-                points_single_pass(data, n, d, threshold)
-            }
-        } else if use_parallel {
-            points_two_pass_parallel(data, n, d, threshold)
+        if use_parallel {
+            points_single_pass_parallel(data, n, d, threshold, staging)
         } else {
-            points_two_pass(data, n, d, threshold)
+            points_single_pass(data, n, d, threshold, staging)
         }
     }
 
@@ -116,17 +118,7 @@ impl EdgeList {
                     }
                     row_finite += 1;
                     finite_count[j] += 1;
-                    let ri = uf_find(&mut parent, i as u32);
-                    let rj = uf_find(&mut parent, j as u32);
-                    if ri != rj {
-                        let (big, small) = if comp_size[ri as usize] >= comp_size[rj as usize] {
-                            (ri, rj)
-                        } else {
-                            (rj, ri)
-                        };
-                        parent[small as usize] = big;
-                        comp_size[big as usize] += comp_size[small as usize];
-                    }
+                    uf_union(&mut parent, &mut comp_size, i as u32, j as u32);
                 }
             }
             max_dist[i] = row_max;
@@ -150,6 +142,87 @@ impl EdgeList {
                 }
             }
         }
+
+        Self {
+            n,
+            edges,
+            center: center as u16,
+            threshold: effective,
+            sorted: false,
+        }
+    }
+
+    /// Build the truncated edge list from COO entries of a sparse distance
+    /// graph. The graph is undirected: entries may come in either or both
+    /// orientations, duplicates are allowed, and the smallest finite distance
+    /// for a pair wins. Diagonal entries are ignored. Entries `>= f32::MAX`
+    /// (or NaN) are absent — a pair with no finite entry is never connected,
+    /// exactly like an infinite entry in the dense distance-matrix path, and
+    /// truncation uses the same per-component minimax certificate.
+    ///
+    /// Indices must be `< n` (validated by the caller; debug-asserted here).
+    pub(crate) fn from_coo(
+        n: usize,
+        rows: &[u32],
+        cols: &[u32],
+        vals: &[f32],
+        threshold: f32,
+    ) -> Self {
+        debug_assert_eq!(rows.len(), cols.len());
+        debug_assert_eq!(rows.len(), vals.len());
+        debug_assert!(n <= u16::MAX as usize);
+        debug_assert!(threshold >= 0.0);
+
+        if n < 2 {
+            return Self {
+                n,
+                edges: Vec::new(),
+                center: 0,
+                threshold,
+                sorted: false,
+            };
+        }
+
+        // Canonical (u > v) finite edges, deduplicated to the minimum distance.
+        let mut edges: Vec<Edge> = Vec::with_capacity(vals.len());
+        for ((&r, &c), &distance) in rows.iter().zip(cols).zip(vals) {
+            debug_assert!((r as usize) < n && (c as usize) < n);
+            if r == c || !(distance < NO_EDGE) {
+                continue; // diagonal, absent (>= f32::MAX), or NaN
+            }
+            let (u, v) = if r > c {
+                (r as u16, c as u16)
+            } else {
+                (c as u16, r as u16)
+            };
+            edges.push(Edge { u, v, distance });
+        }
+        edges.sort_unstable_by_key(|edge| (edge.u, edge.v, edge.distance.to_bits()));
+        edges.dedup_by_key(|edge| (edge.u, edge.v)); // keeps the first = smallest
+
+        // Same statistics as the dense path: per-vertex max finite distance,
+        // distinct-neighbor counts, and components over the finite relation.
+        let mut max_dist = vec![f32::NEG_INFINITY; n];
+        let mut finite_count = vec![0u32; n];
+        let mut parent: Vec<u32> = (0..n as u32).collect();
+        let mut comp_size = vec![1u32; n];
+        for edge in &edges {
+            let (u, v) = (edge.u as usize, edge.v as usize);
+            if edge.distance > max_dist[u] {
+                max_dist[u] = edge.distance;
+            }
+            if edge.distance > max_dist[v] {
+                max_dist[v] = edge.distance;
+            }
+            finite_count[u] += 1;
+            finite_count[v] += 1;
+            uf_union(&mut parent, &mut comp_size, edge.u as u32, edge.v as u32);
+        }
+
+        let (center, r_cheb) =
+            per_component_minimax(&mut parent, &comp_size, &finite_count, &max_dist);
+        let effective = threshold.min(r_cheb);
+        edges.retain(|edge| edge.distance <= effective);
 
         Self {
             n,
@@ -224,28 +297,24 @@ struct PointWorker {
 }
 
 impl PointWorker {
-    fn new<const TRACK_MAX: bool>(n: usize, d: usize) -> Self {
+    fn new(n: usize, d: usize) -> Self {
         let (a_packed, b_packed) = alloc_panels(d);
         Self {
             a_packed,
             b_packed,
-            max_dist: if TRACK_MAX {
-                vec![0.0f32; n]
-            } else {
-                Vec::new()
-            },
+            max_dist: vec![0.0f32; n],
             edges: Vec::new(),
         }
     }
 
-    fn process_macro_tile<const TRACK_MAX: bool, const EMIT_EDGES: bool>(
+    fn process_macro_tile(
         &mut self,
         data: &[f32],
         n: usize,
         d: usize,
         jc: usize,
         ic: usize,
-        threshold: f32,
+        staging: f32,
     ) {
         let nc = (n - jc).min(NC);
         let mc = (n - ic).min(MC);
@@ -273,20 +342,18 @@ impl PointWorker {
                 let full = i_min > j_max;
                 for m in 0..mr_eff {
                     let i = i_min + m;
-                    let mut row_max = if TRACK_MAX { self.max_dist[i] } else { 0.0 };
+                    let mut row_max = self.max_dist[i];
                     for nn in 0..nr_eff {
                         let j = j_min + nn;
                         if full || i > j {
                             let distance = tile_dist(&tile, m, nn);
-                            if TRACK_MAX {
-                                if distance > row_max {
-                                    row_max = distance;
-                                }
-                                if distance > self.max_dist[j] {
-                                    self.max_dist[j] = distance;
-                                }
+                            if distance > row_max {
+                                row_max = distance;
                             }
-                            if EMIT_EDGES && distance <= threshold {
+                            if distance > self.max_dist[j] {
+                                self.max_dist[j] = distance;
+                            }
+                            if distance <= staging {
                                 self.edges.push(Edge {
                                     u: i as u16,
                                     v: j as u16,
@@ -295,9 +362,7 @@ impl PointWorker {
                             }
                         }
                     }
-                    if TRACK_MAX {
-                        self.max_dist[i] = row_max;
-                    }
+                    self.max_dist[i] = row_max;
                 }
                 jr += NR;
             }
@@ -305,12 +370,10 @@ impl PointWorker {
         }
     }
 
-    fn merge<const TRACK_MAX: bool>(mut self, other: Self) -> Self {
-        if TRACK_MAX {
-            for (left, right) in self.max_dist.iter_mut().zip(other.max_dist) {
-                if right > *left {
-                    *left = right;
-                }
+    fn merge(mut self, other: Self) -> Self {
+        for (left, right) in self.max_dist.iter_mut().zip(other.max_dist) {
+            if right > *left {
+                *left = right;
             }
         }
         self.edges.extend(other.edges);
@@ -318,12 +381,7 @@ impl PointWorker {
     }
 }
 
-fn parallel_point_pass<const TRACK_MAX: bool, const EMIT_EDGES: bool>(
-    data: &[f32],
-    n: usize,
-    d: usize,
-    threshold: f32,
-) -> PointWorker {
+fn parallel_point_pass(data: &[f32], n: usize, d: usize, staging: f32) -> PointWorker {
     let mut macro_tiles = Vec::new();
     for jc in (0..n).step_by(NC) {
         for ic in (jc..n).step_by(MC) {
@@ -334,9 +392,9 @@ fn parallel_point_pass<const TRACK_MAX: bool, const EMIT_EDGES: bool>(
     let workers: Vec<PointWorker> = macro_tiles
         .par_iter()
         .fold(
-            || PointWorker::new::<TRACK_MAX>(n, d),
+            || PointWorker::new(n, d),
             |mut worker, &(jc, ic)| {
-                worker.process_macro_tile::<TRACK_MAX, EMIT_EDGES>(data, n, d, jc, ic, threshold);
+                worker.process_macro_tile(data, n, d, jc, ic, staging);
                 worker
             },
         )
@@ -344,12 +402,10 @@ fn parallel_point_pass<const TRACK_MAX: bool, const EMIT_EDGES: bool>(
 
     let total_edges: usize = workers.iter().map(|worker| worker.edges.len()).sum();
     let mut workers = workers.into_iter();
-    let mut output = workers
-        .next()
-        .unwrap_or_else(|| PointWorker::new::<TRACK_MAX>(n, d));
+    let mut output = workers.next().unwrap_or_else(|| PointWorker::new(n, d));
     output.edges.reserve(total_edges - output.edges.len());
     for worker in workers {
-        output = output.merge::<TRACK_MAX>(worker);
+        output = output.merge(worker);
     }
     output
 }
@@ -399,6 +455,81 @@ fn tiled_pass(
     }
 }
 
+/// Upper bound on the truncation radius from a few exact eccentricities,
+/// combined with the user threshold.
+///
+/// The enclosing radius is `min_v ecc(v)`, so the eccentricity of ANY vertex
+/// bounds it from above, and the final cutoff `min(threshold, r_enc)` can
+/// never exceed `min(threshold, ecc(sample))`. Staging edges only up to this
+/// bound is therefore sound, and it shrinks the staging buffer from "every
+/// pair under the user threshold" to roughly the surviving edge count (a
+/// sampled eccentricity is at most `2 * r_enc` by the triangle inequality).
+///
+/// The bound is widened by a d-scaled epsilon so that float summation-order
+/// differences between this scalar loop and the tiled kernel cannot push the
+/// certified radius above it; `finalize_points` asserts that invariant.
+fn staging_cutoff(data: &[f32], n: usize, d: usize, threshold: f32) -> f32 {
+    let mut bound_sq = f32::INFINITY;
+    let step = (n / STAGING_SAMPLES).max(1);
+    let mut p = 0usize;
+    while p < n && bound_sq > 0.0 {
+        let row = &data[p * d..(p + 1) * d];
+        let mut ecc_sq = 0.0f32;
+        for q in 0..n {
+            let other = &data[q * d..(q + 1) * d];
+            let mut sq = 0.0f32;
+            for k in 0..d {
+                let diff = row[k] - other[k];
+                sq += diff * diff;
+            }
+            if sq > ecc_sq {
+                ecc_sq = sq;
+            }
+        }
+        if ecc_sq < bound_sq {
+            bound_sq = ecc_sq;
+        }
+        p += step;
+    }
+    // Absorb summation-order float noise between this loop and the tiled
+    // kernel (relative error is O(d * eps) on the squared distances).
+    let safety = 1.0 + (d as f32) * f32::EPSILON * 8.0;
+    threshold.min(bound_sq.sqrt() * safety)
+}
+
+/// Shared tail of the point paths: tighten to the certified radius, drop the
+/// staged edges above it, and release the staging slack.
+fn finalize_points(
+    n: usize,
+    mut edges: Vec<Edge>,
+    center: usize,
+    threshold: f32,
+    staging: f32,
+    r_cheb: f32,
+) -> EdgeList {
+    let effective = threshold.min(r_cheb);
+    // The staging cutoff bounds the certified radius by construction (with
+    // the float-noise cushion); a violation would mean silently dropped edges.
+    assert!(
+        effective <= staging,
+        "staging cutoff {staging} fell below the certified radius {r_cheb}"
+    );
+    if effective < staging {
+        edges.retain(|edge| edge.distance <= effective);
+        // The staging buffer was sized for the staging cutoff; release the
+        // dead capacity so it doesn't ride along through peel/coperto/BitCSR.
+        edges.shrink_to_fit();
+    }
+
+    EdgeList {
+        n,
+        edges,
+        center: center as u16,
+        threshold: effective,
+        sorted: false,
+    }
+}
+
 #[inline]
 fn reduce_minimax(max_dist: &[f32]) -> (usize, f32) {
     let mut center = 0usize;
@@ -421,6 +552,23 @@ fn uf_find(parent: &mut [u32], mut i: u32) -> u32 {
         i = grand;
     }
     i
+}
+
+/// Union by component size; `comp_size` is meaningful at roots only.
+#[inline]
+fn uf_union(parent: &mut [u32], comp_size: &mut [u32], a: u32, b: u32) {
+    let ra = uf_find(parent, a);
+    let rb = uf_find(parent, b);
+    if ra == rb {
+        return;
+    }
+    let (big, small) = if comp_size[ra as usize] >= comp_size[rb as usize] {
+        (ra, rb)
+    } else {
+        (rb, ra)
+    };
+    parent[small as usize] = big;
+    comp_size[big as usize] += comp_size[small as usize];
 }
 
 /// Sound truncation radius for a possibly-disconnected distance matrix.
@@ -489,7 +637,7 @@ fn per_component_minimax(
     (center, r_cheb)
 }
 
-fn points_single_pass(data: &[f32], n: usize, d: usize, threshold: f32) -> EdgeList {
+fn points_single_pass(data: &[f32], n: usize, d: usize, threshold: f32, staging: f32) -> EdgeList {
     let (mut a_packed, mut b_packed) = alloc_panels(d);
     let mut max_dist = vec![0.0f32; n];
     let mut edges = Vec::new();
@@ -514,7 +662,7 @@ fn points_single_pass(data: &[f32], n: usize, d: usize, threshold: f32) -> EdgeL
                         if distance > max_dist[j] {
                             max_dist[j] = distance;
                         }
-                        if distance <= threshold {
+                        if distance <= staging {
                             edges.push(Edge {
                                 u: i as u16,
                                 v: j as u16,
@@ -529,131 +677,22 @@ fn points_single_pass(data: &[f32], n: usize, d: usize, threshold: f32) -> EdgeL
     );
 
     let (center, r_cheb) = reduce_minimax(&max_dist);
-    let effective = threshold.min(r_cheb);
-    if effective < threshold {
-        edges.retain(|edge| edge.distance <= effective);
-        // The staging buffer was sized for the pre-tightening threshold; release
-        // the dead capacity so it doesn't ride along through peel/coperto/BitCSR.
-        edges.shrink_to_fit();
-    }
-
-    EdgeList {
-        n,
-        edges,
-        center: center as u16,
-        threshold: effective,
-        sorted: false,
-    }
+    finalize_points(n, edges, center, threshold, staging, r_cheb)
 }
 
-fn points_single_pass_parallel(data: &[f32], n: usize, d: usize, threshold: f32) -> EdgeList {
+fn points_single_pass_parallel(
+    data: &[f32],
+    n: usize,
+    d: usize,
+    threshold: f32,
+    staging: f32,
+) -> EdgeList {
     let PointWorker {
-        max_dist,
-        mut edges,
-        ..
-    } = parallel_point_pass::<true, true>(data, n, d, threshold);
+        max_dist, edges, ..
+    } = parallel_point_pass(data, n, d, staging);
 
     let (center, r_cheb) = reduce_minimax(&max_dist);
-    let effective = threshold.min(r_cheb);
-    if effective < threshold {
-        edges.retain(|edge| edge.distance <= effective);
-        // The staging buffer was sized for the pre-tightening threshold; release
-        // the dead capacity so it doesn't ride along through peel/coperto/BitCSR.
-        edges.shrink_to_fit();
-    }
-
-    EdgeList {
-        n,
-        edges,
-        center: center as u16,
-        threshold: effective,
-        sorted: false,
-    }
-}
-
-fn points_two_pass(data: &[f32], n: usize, d: usize, threshold: f32) -> EdgeList {
-    let (mut a_packed, mut b_packed) = alloc_panels(d);
-    let mut max_dist = vec![0.0f32; n];
-
-    tiled_pass(
-        data,
-        n,
-        d,
-        &mut a_packed,
-        &mut b_packed,
-        |tile, i_min, j_min, mr, nr, full| {
-            for m in 0..mr {
-                let i = i_min + m;
-                let mut row_max = max_dist[i];
-                for nn in 0..nr {
-                    let j = j_min + nn;
-                    if full || i > j {
-                        let distance = tile_dist(tile, m, nn);
-                        if distance > row_max {
-                            row_max = distance;
-                        }
-                        if distance > max_dist[j] {
-                            max_dist[j] = distance;
-                        }
-                    }
-                }
-                max_dist[i] = row_max;
-            }
-        },
-    );
-
-    let (center, r_cheb) = reduce_minimax(&max_dist);
-    let effective = threshold.min(r_cheb);
-    let mut edges = Vec::new();
-
-    tiled_pass(
-        data,
-        n,
-        d,
-        &mut a_packed,
-        &mut b_packed,
-        |tile, i_min, j_min, mr, nr, full| {
-            for m in 0..mr {
-                let i = i_min + m;
-                for nn in 0..nr {
-                    let j = j_min + nn;
-                    if full || i > j {
-                        let distance = tile_dist(tile, m, nn);
-                        if distance <= effective {
-                            edges.push(Edge {
-                                u: i as u16,
-                                v: j as u16,
-                                distance,
-                            });
-                        }
-                    }
-                }
-            }
-        },
-    );
-
-    EdgeList {
-        n,
-        edges,
-        center: center as u16,
-        threshold: effective,
-        sorted: false,
-    }
-}
-
-fn points_two_pass_parallel(data: &[f32], n: usize, d: usize, threshold: f32) -> EdgeList {
-    let first = parallel_point_pass::<true, false>(data, n, d, threshold);
-    let (center, r_cheb) = reduce_minimax(&first.max_dist);
-    let effective = threshold.min(r_cheb);
-    let second = parallel_point_pass::<false, true>(data, n, d, effective);
-
-    EdgeList {
-        n,
-        edges: second.edges,
-        center: center as u16,
-        threshold: effective,
-        sorted: false,
-    }
+    finalize_points(n, edges, center, threshold, staging, r_cheb)
 }
 
 /// Lower-triangular fixture → symmetric square matrix. Test-only helper shared
@@ -763,8 +802,11 @@ mod tests {
         assert_eq!(e.edges.len(), 4);
     }
 
+    /// The sampled staging cutoff must be transparent: the output (edges,
+    /// center, effective threshold) is identical to staging at the full user
+    /// threshold, for finite and infinite thresholds.
     #[test]
-    fn adaptive_point_paths_are_identical() {
+    fn staging_cutoff_is_transparent() {
         for &(n, d) in &[(5, 2), (17, 3), (33, 5), (70, 2)] {
             let points: Vec<f32> = (0..n * d)
                 .map(|i| {
@@ -773,12 +815,14 @@ mod tests {
                 })
                 .collect();
             for threshold in [0.25, 0.9, f32::INFINITY] {
-                let single = points_single_pass(&points, n, d, threshold);
-                let double = points_two_pass(&points, n, d, threshold);
-                assert_eq!(single.n, double.n);
-                assert_eq!(single.center, double.center);
-                assert_eq!(single.threshold.to_bits(), double.threshold.to_bits());
-                assert_eq!(sorted_edges(&single), sorted_edges(&double));
+                let staged = EdgeList::from_points(&points, n, d, threshold, false);
+                // Reference: no sampled bound — stage every pair under the
+                // user threshold, tighten afterwards exactly as before.
+                let reference = points_single_pass(&points, n, d, threshold, threshold);
+                assert_eq!(staged.n, reference.n);
+                assert_eq!(staged.center, reference.center);
+                assert_eq!(staged.threshold.to_bits(), reference.threshold.to_bits());
+                assert_eq!(sorted_edges(&staged), sorted_edges(&reference));
             }
         }
     }
@@ -795,23 +839,78 @@ mod tests {
             .collect();
 
         for threshold in [0.25, 0.9, f32::INFINITY] {
-            let single = points_single_pass(&points, n, d, threshold);
-            let single_parallel = points_single_pass_parallel(&points, n, d, threshold);
+            let staging = staging_cutoff(&points, n, d, threshold);
+            let single = points_single_pass(&points, n, d, threshold, staging);
+            let single_parallel = points_single_pass_parallel(&points, n, d, threshold, staging);
             assert_eq!(single.center, single_parallel.center);
             assert_eq!(
                 single.threshold.to_bits(),
                 single_parallel.threshold.to_bits()
             );
             assert_eq!(sorted_edges(&single), sorted_edges(&single_parallel));
-
-            let double = points_two_pass(&points, n, d, threshold);
-            let double_parallel = points_two_pass_parallel(&points, n, d, threshold);
-            assert_eq!(double.center, double_parallel.center);
-            assert_eq!(
-                double.threshold.to_bits(),
-                double_parallel.threshold.to_bits()
-            );
-            assert_eq!(sorted_edges(&double), sorted_edges(&double_parallel));
         }
+    }
+
+    /// COO input: duplicates resolve to the minimum, orientation and the
+    /// diagonal are irrelevant, and truncation uses the per-component minimax.
+    #[test]
+    fn coo_dedups_to_min_and_canonicalizes() {
+        let rows = [0u32, 1, 1, 2, 2];
+        let cols = [1u32, 0, 2, 1, 2]; // (2, 2) is a diagonal entry: ignored
+        let vals = [3.0f32, 1.0, 5.0, 5.0, 9.0];
+        let e = EdgeList::from_coo(3, &rows, &cols, &vals, f32::INFINITY);
+
+        // (1, 0) given twice → min 1.0; (2, 1) given twice → 5.0.
+        assert_eq!(sorted_edges(&e).len(), 2);
+        assert!(e.edges.iter().all(|edge| edge.u > edge.v));
+        assert!(e
+            .edges
+            .iter()
+            .any(|edge| (edge.u, edge.v, edge.distance) == (1, 0, 1.0)));
+        assert!(e
+            .edges
+            .iter()
+            .any(|edge| (edge.u, edge.v, edge.distance) == (2, 1, 5.0)));
+        // Vertex 1 is the only valid apex (sees 0 and 2): r_enc = max(1, 5).
+        assert_eq!(e.threshold, 5.0);
+        assert_eq!(e.center, 1);
+    }
+
+    /// A dense matrix and its COO expansion must produce identical edge lists,
+    /// including the disconnected-component truncation behaviour.
+    #[test]
+    fn coo_matches_dense_matrix_path() {
+        // Same fixture as `disconnected_truncation_uses_max_component_radius`.
+        let n = 6;
+        let mut d = vec![f32::INFINITY; n * n];
+        for i in 0..n {
+            d[i * n + i] = 0.0;
+        }
+        set_sym(&mut d, n, 0, 1, 1.0);
+        set_sym(&mut d, n, 1, 2, 1.0);
+        set_sym(&mut d, n, 2, 3, 1.0);
+        set_sym(&mut d, n, 0, 3, 1.0);
+        set_sym(&mut d, n, 0, 2, 2.0);
+        set_sym(&mut d, n, 1, 3, 2.0);
+        set_sym(&mut d, n, 4, 5, 1.0);
+
+        // COO expansion of every entry, including infinities and the diagonal.
+        let mut rows = Vec::new();
+        let mut cols = Vec::new();
+        let mut vals = Vec::new();
+        for i in 0..n {
+            for j in 0..n {
+                rows.push(i as u32);
+                cols.push(j as u32);
+                vals.push(d[i * n + j]);
+            }
+        }
+
+        let dense = EdgeList::from_distance_matrix(&d, n, f32::INFINITY);
+        let sparse = EdgeList::from_coo(n, &rows, &cols, &vals, f32::INFINITY);
+        assert_eq!(sparse.n, dense.n);
+        assert_eq!(sparse.center, dense.center);
+        assert_eq!(sparse.threshold.to_bits(), dense.threshold.to_bits());
+        assert_eq!(sorted_edges(&sparse), sorted_edges(&dense));
     }
 }

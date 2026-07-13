@@ -19,7 +19,11 @@
 //!       → int, the simplex count of the filtered complex (dimension ≤ max_dim).
 //!
 //! `data` may be float32 or float64; float64 input is cast to float32 on the
-//! way in (the core computes in f32).
+//! way in (the core computes in f32). `data` may also be a `scipy.sparse`
+//! matrix (anything exposing `.tocoo()`): sparse input is always treated as a
+//! distance graph — entries are edges, missing pairs are never connected
+//! (infinite distance), duplicates resolve to the minimum, and disconnected
+//! inputs truncate soundly per component. scipy itself is never imported.
 //!
 //! `peel` (exact truncation, ON by default — identical barcode, strictly less
 //! work) and `collapse` (exact edge collapse) preserve the barcode; `quotient`
@@ -30,7 +34,7 @@
 //! (square point cloud vs. distance matrix); a `UserWarning` is emitted naming
 //! the interpretation actually used.
 
-use numpy::{IntoPyArray, PyArray2, PyArrayMethods, PyReadonlyArray2};
+use numpy::{IntoPyArray, PyArray2, PyArrayMethods, PyReadonlyArray1, PyReadonlyArray2};
 use pyo3::exceptions::{PyTypeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
@@ -52,8 +56,60 @@ fn flatten_any(data: &Bound<'_, PyAny>) -> PyResult<(Vec<f32>, usize, usize)> {
     }
     Err(PyTypeError::new_err(
         "expected a 2-D numpy array of float32 or float64 — an (n, d) point \
-         cloud or an (n, n) distance matrix; for other dtypes convert with \
-         np.asarray(data, dtype=np.float32)",
+         cloud or an (n, n) distance matrix — or a scipy.sparse distance \
+         matrix; for other dtypes convert with np.asarray(data, dtype=np.float32)",
+    ))
+}
+
+/// Sparse (scipy-style) input: anything exposing `.tocoo()`. Returns `None`
+/// for dense arrays so the caller falls through to `flatten_any`.
+fn extract_coo(data: &Bound<'_, PyAny>) -> PyResult<Option<(Vec<u32>, Vec<u32>, Vec<f32>, usize)>> {
+    if !data.hasattr("tocoo")? {
+        return Ok(None);
+    }
+    let coo = data.call_method0("tocoo")?;
+    let (rows_n, cols_n): (usize, usize) = coo.getattr("shape")?.extract()?;
+    if rows_n != cols_n {
+        return Err(PyValueError::new_err(format!(
+            "sparse input must be a square (n, n) distance matrix, got ({rows_n}, {cols_n})"
+        )));
+    }
+    let rows = extract_indices(&coo.getattr("row")?)?;
+    let cols = extract_indices(&coo.getattr("col")?)?;
+    let vals = extract_values(&coo.getattr("data")?)?;
+    Ok(Some((rows, cols, vals, rows_n)))
+}
+
+fn extract_indices(obj: &Bound<'_, PyAny>) -> PyResult<Vec<u32>> {
+    fn convert<T: TryInto<u32> + Copy>(values: impl Iterator<Item = T>) -> PyResult<Vec<u32>> {
+        values
+            .map(|x| {
+                x.try_into().map_err(|_| {
+                    PyValueError::new_err("sparse indices must be non-negative 32-bit integers")
+                })
+            })
+            .collect()
+    }
+    if let Ok(arr) = obj.extract::<PyReadonlyArray1<i32>>() {
+        return convert(arr.as_array().iter().copied());
+    }
+    if let Ok(arr) = obj.extract::<PyReadonlyArray1<i64>>() {
+        return convert(arr.as_array().iter().copied());
+    }
+    Err(PyTypeError::new_err(
+        "sparse index arrays must be int32 or int64",
+    ))
+}
+
+fn extract_values(obj: &Bound<'_, PyAny>) -> PyResult<Vec<f32>> {
+    if let Ok(arr) = obj.extract::<PyReadonlyArray1<f32>>() {
+        return Ok(arr.as_array().iter().copied().collect());
+    }
+    if let Ok(arr) = obj.extract::<PyReadonlyArray1<f64>>() {
+        return Ok(arr.as_array().iter().map(|&x| x as f32).collect());
+    }
+    Err(PyTypeError::new_err(
+        "sparse value arrays must be float32 or float64",
     ))
 }
 
@@ -133,10 +189,6 @@ fn persistent_homology<'py>(
     collapse: bool,
     parallel: bool,
 ) -> PyResult<Vec<Bound<'py, PyArray2<f32>>>> {
-    let (flat, rows, cols) = flatten_any(data)?;
-
-    check_input(py, rows, cols, distance_matrix)?;
-
     let config = tda_core::Config {
         distance_matrix,
         threshold,
@@ -145,6 +197,19 @@ fn persistent_homology<'py>(
         collapse,
         parallel,
     };
+
+    // scipy.sparse input is inherently a distance graph; the
+    // `distance_matrix` flag is irrelevant on this path.
+    if let Some((rows, cols, vals, n)) = extract_coo(data)? {
+        let barcode =
+            tda_core::persistent_homology_sparse_with(&rows, &cols, &vals, n, max_dim, &config)
+                .map_err(to_py_err)?;
+        return barcode_to_py(py, barcode);
+    }
+
+    let (flat, rows, cols) = flatten_any(data)?;
+    check_input(py, rows, cols, distance_matrix)?;
+
     let barcode =
         tda_core::persistent_homology_with(&flat, rows, max_dim, &config).map_err(to_py_err)?;
 
@@ -166,10 +231,6 @@ fn filtration_size<'py>(
     collapse: bool,
     parallel: bool,
 ) -> PyResult<usize> {
-    let (flat, rows, cols) = flatten_any(data)?;
-
-    check_input(py, rows, cols, distance_matrix)?;
-
     let config = tda_core::Config {
         distance_matrix,
         threshold,
@@ -178,6 +239,15 @@ fn filtration_size<'py>(
         collapse,
         parallel,
     };
+
+    if let Some((rows, cols, vals, n)) = extract_coo(data)? {
+        return tda_core::filtration_size_sparse_with(&rows, &cols, &vals, n, max_dim, &config)
+            .map_err(to_py_err);
+    }
+
+    let (flat, rows, cols) = flatten_any(data)?;
+    check_input(py, rows, cols, distance_matrix)?;
+
     tda_core::filtration_size_with(&flat, rows, max_dim, &config).map_err(to_py_err)
 }
 
