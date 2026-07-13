@@ -14,92 +14,144 @@ pub const MAX_POINTS: usize = u16::MAX as usize;
 pub const MAX_DIM: usize = 4;
 
 // ═══════════════════════════════════════════════════════════════════════════════
+// Configuration
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Optional knobs for [`persistent_homology_with`] and [`filtration_size_with`].
+///
+/// `Config::default()` is the recommended configuration: point-cloud input, no
+/// user threshold (the certified truncation radius alone caps the filtration),
+/// `peel` on (exact, strictly cheaper, identical barcode), `parallel` on, and
+/// the `quotient` / `collapse` transforms off. The plain
+/// [`persistent_homology`] / [`filtration_size`] entry points use it
+/// implicitly; reach for `Config` only to deviate. Override individual fields
+/// with functional-record-update syntax:
+///
+/// ```
+/// use tda_core::Config;
+///
+/// let cfg = Config {
+///     distance_matrix: true,
+///     threshold: Some(1.5),
+///     ..Config::default()
+/// };
+/// ```
+#[derive(Debug, Clone)]
+pub struct Config {
+    /// Interpret `data` as a row-major `n × n` distance matrix instead of an
+    /// `n × d` point cloud. See [`persistent_homology_with`] for the layout
+    /// contract and the square-input ambiguity.
+    pub distance_matrix: bool,
+    /// Optional filtration cutoff. The effective cutoff is always
+    /// `min(threshold, certified radius)`; `None` means the certified radius
+    /// alone. Must be non-negative and not NaN.
+    pub threshold: Option<f32>,
+    /// Tighten the truncation radius via sound strong-collapse peeling:
+    /// strictly cheaper, identical barcode. Default `true`.
+    pub peel: bool,
+    /// Rewrite the filtration into a quotient-cover coning: strictly smaller,
+    /// `log 3`-interleaved with VR rather than equal. Default `false`.
+    pub quotient: bool,
+    /// Remove filtration-dominated edges (exact edge collapse): strictly
+    /// smaller, identical barcode, but expensive. Default `false`.
+    pub collapse: bool,
+    /// Enable rayon in sufficiently large point preprocessing, edge sorts, and
+    /// engine candidate assembly. Default `true`.
+    pub parallel: bool,
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            distance_matrix: false,
+            threshold: None,
+            peel: true,
+            quotient: false,
+            collapse: false,
+            parallel: true,
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
 // Persistent homology
 // ═══════════════════════════════════════════════════════════════════════════════
+
+/// Vietoris–Rips persistent homology of a point cloud, with the default
+/// [`Config`].
+///
+/// `data` is a row-major `&[f32]` point cloud of length `n * d`; `d` is
+/// inferred as `data.len() / n`. For distance-matrix input, a threshold, or
+/// any other option, use [`persistent_homology_with`].
+pub fn persistent_homology(data: &[f32], n: usize, max_dim: usize) -> Result<BarcodeResult> {
+    persistent_homology_with(data, n, max_dim, &Config::default())
+}
 
 /// Vietoris–Rips persistent homology over the BitCSR sparse backend.
 ///
 /// `data` is a row-major `&[f32]` whose length is:
-///   * `n * n` when `distance_matrix` is true — the strict lower triangle is
-///     read; symmetry, zero diagonal, and non-negativity are documented
-///     preconditions, not enforced invariants, and `f32::INFINITY` is a valid
-///     "disconnected" entry; or
+///   * `n * n` when `config.distance_matrix` is true — the strict lower
+///     triangle is read; symmetry, zero diagonal, and non-negativity are
+///     documented preconditions, not enforced invariants, and `f32::INFINITY`
+///     is a valid "disconnected" entry; or
 ///   * `n * d` otherwise — a point cloud, with `d` inferred as `data.len() / n`.
 ///
 /// The two layouts collide at `d == n` (square data): they are byte-identical,
-/// so `distance_matrix` is the *only* thing that disambiguates them — pass it
-/// correctly. (The Python layer warns on this case; the core cannot, since its
-/// hot caller is the benchmark loop.)
+/// so `config.distance_matrix` is the *only* thing that disambiguates them —
+/// set it correctly. (The Python layer warns on this case; the core cannot,
+/// since its hot caller is the benchmark loop.)
 ///
-/// `peel` tightens the truncation radius via a sound strong collapse
-/// ([`opt::peel`]) — strictly cheaper, identical barcode. `quotient` rewrites the
-/// filtration into a quotient-cover (complete-linkage) coning ([`opt::coperto`]) —
-/// strictly smaller, and `log 3`-interleaved with VR rather than equal.
-/// `collapse` removes filtration-dominated edges ([`opt::collapse`]) — strictly
-/// smaller, identical barcode. The canonical order is peel → quotient →
-/// collapse: peel first (fewer edges, leaves them sorted), collapse last (it is
-/// exact on any weighted graph's flag filtration, including the coned quotient,
-/// whereas the quotient's complete-linkage counting needs the un-collapsed
-/// graph). `parallel` enables Rayon in sufficiently large point preprocessing,
-/// edge sorts, and engine candidate assembly.
-pub fn persistent_homology(
+/// `config.peel` tightens the truncation radius via a sound strong collapse
+/// ([`opt::peel`]) — strictly cheaper, identical barcode. `config.quotient`
+/// rewrites the filtration into a quotient-cover (complete-linkage) coning
+/// ([`opt::coperto`]) — strictly smaller, and `log 3`-interleaved with VR
+/// rather than equal. `config.collapse` removes filtration-dominated edges
+/// ([`opt::collapse`]) — strictly smaller, identical barcode. The canonical
+/// order is peel → quotient → collapse: peel first (fewer edges, leaves them
+/// sorted), collapse last (it is exact on any weighted graph's flag
+/// filtration, including the coned quotient, whereas the quotient's
+/// complete-linkage counting needs the un-collapsed graph). `config.parallel`
+/// enables Rayon in sufficiently large point preprocessing, edge sorts, and
+/// engine candidate assembly.
+pub fn persistent_homology_with(
     data: &[f32],
     n: usize,
     max_dim: usize,
-    threshold: Option<f32>,
-    distance_matrix: bool,
-    quotient: bool,
-    peel: bool,
-    collapse: bool,
-    parallel: bool,
+    config: &Config,
 ) -> Result<BarcodeResult> {
-    let edges = build_edges(
-        data,
-        n,
-        max_dim,
-        threshold,
-        distance_matrix,
-        quotient,
-        peel,
-        collapse,
-        parallel,
-    )?;
-    Ok(compute_barcode(edges, max_dim, parallel))
+    let edges = build_edges(data, n, max_dim, config)?;
+    Ok(compute_barcode(edges, max_dim, config.parallel))
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // Filtration size
 // ═══════════════════════════════════════════════════════════════════════════════
-//
-// See [`persistent_homology`] for the `data` / `distance_matrix` layout contract
-// and the meaning of `peel` / `quotient` / `parallel`.
 
-pub fn filtration_size(
+/// Truncated Vietoris–Rips filtration size (simplices of dimension ≤
+/// `max_dim`) of a point cloud, with the default [`Config`]. See
+/// [`filtration_size_with`].
+pub fn filtration_size(data: &[f32], n: usize, max_dim: usize) -> Result<usize> {
+    filtration_size_with(data, n, max_dim, &Config::default())
+}
+
+/// Truncated Vietoris–Rips filtration size (simplices of dimension ≤
+/// `max_dim`). See [`persistent_homology_with`] for the `data` layout contract
+/// and the meaning of the [`Config`] fields.
+pub fn filtration_size_with(
     data: &[f32],
     n: usize,
     max_dim: usize,
-    threshold: Option<f32>,
-    distance_matrix: bool,
-    quotient: bool,
-    peel: bool,
-    collapse: bool,
-    parallel: bool,
+    config: &Config,
 ) -> Result<usize> {
-    let edges = build_edges(
-        data,
-        n,
-        max_dim,
-        threshold,
-        distance_matrix,
-        quotient,
-        peel,
-        collapse,
-        parallel,
-    )?;
+    let edges = build_edges(data, n, max_dim, config)?;
     // `max_dim` is a simplex dimension; `count_cliques` is clique-size oriented.
     // A simplex of dimension d is a clique of size d + 1, so counting simplices
     // of dimension <= max_dim means cliques of size <= max_dim + 1.
-    Ok(utils::cliques::count_cliques(edges, max_dim + 1, parallel))
+    Ok(utils::cliques::count_cliques(
+        edges,
+        max_dim + 1,
+        config.parallel,
+    ))
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -112,29 +164,19 @@ pub fn filtration_size(
 ///
 /// `max_dim` is validated up front, before the O(n²·d) distance build, so an
 /// out-of-range value fails fast rather than after the work.
-fn build_edges(
-    data: &[f32],
-    n: usize,
-    max_dim: usize,
-    threshold: Option<f32>,
-    distance_matrix: bool,
-    quotient: bool,
-    peel: bool,
-    collapse: bool,
-    parallel: bool,
-) -> Result<EdgeList> {
-    validate_params(n, max_dim, threshold)?;
-    let t = threshold.unwrap_or(f32::INFINITY);
+fn build_edges(data: &[f32], n: usize, max_dim: usize, config: &Config) -> Result<EdgeList> {
+    validate_params(n, max_dim, config.threshold)?;
+    let t = config.threshold.unwrap_or(f32::INFINITY);
 
-    let mut edges = if distance_matrix {
+    let mut edges = if config.distance_matrix {
         validate_distance_shape(data, n)?;
         EdgeList::from_distance_matrix(data, n, t)
     } else {
         let d = infer_dimension(data, n)?;
-        EdgeList::from_points(data, n, d, t, parallel)
+        EdgeList::from_points(data, n, d, t, config.parallel)
     };
 
-    apply_optimizations(&mut edges, peel, quotient, collapse, parallel);
+    apply_optimizations(&mut edges, config);
     Ok(edges)
 }
 
@@ -143,21 +185,15 @@ fn build_edges(
 /// (`coperto`, which reuses that sort and needs the un-collapsed graph), then
 /// `collapse` last (exact on whatever flag filtration it receives).
 #[inline]
-fn apply_optimizations(
-    edges: &mut EdgeList,
-    peel: bool,
-    quotient: bool,
-    collapse: bool,
-    parallel: bool,
-) {
-    if peel {
-        opt::peel::peel(edges, parallel);
+fn apply_optimizations(edges: &mut EdgeList, config: &Config) {
+    if config.peel {
+        opt::peel::peel(edges, config.parallel);
     }
-    if quotient {
-        opt::coperto::cone_in_place(edges, parallel);
+    if config.quotient {
+        opt::coperto::cone_in_place(edges, config.parallel);
     }
-    if collapse {
-        opt::collapse::collapse_in_place(edges, parallel);
+    if config.collapse {
+        opt::collapse::collapse_in_place(edges, config.parallel);
     }
 }
 
@@ -228,6 +264,18 @@ fn validate_params(n: usize, max_dim: usize, threshold: Option<f32>) -> Result<(
 mod pipeline_tests {
     use super::*;
 
+    /// A `Config` for the point-cloud path with no threshold; the four flags
+    /// every test varies, in one place.
+    fn config(peel: bool, quotient: bool, collapse: bool, parallel: bool) -> Config {
+        Config {
+            peel,
+            quotient,
+            collapse,
+            parallel,
+            ..Config::default()
+        }
+    }
+
     fn assert_same_barcode(a: &BarcodeResult, b: &BarcodeResult) {
         assert_eq!(a.intervals.len(), b.intervals.len());
         for (left, right) in a.intervals.iter().zip(&b.intervals) {
@@ -255,13 +303,30 @@ mod pipeline_tests {
     }
 
     #[test]
+    fn simple_api_matches_default_config() {
+        let points = [
+            0.0, 0.0, 0.1, 0.0, 0.0, 0.1, 0.1, 0.1, 0.05, 0.05, 0.2, 0.05, 0.05, 0.2,
+        ];
+        let n = points.len() / 2;
+        let simple = persistent_homology(&points, n, 2).unwrap();
+        let explicit = persistent_homology_with(&points, n, 2, &Config::default()).unwrap();
+        assert_same_barcode(&simple, &explicit);
+        assert_eq!(
+            filtration_size(&points, n, 2).unwrap(),
+            filtration_size_with(&points, n, 2, &Config::default()).unwrap()
+        );
+    }
+
+    #[test]
     fn point_pipeline_peel_preserves_barcode() {
         let points = [
             0.0, 0.0, 0.1, 0.0, 0.0, 0.1, 0.1, 0.1, 0.05, 0.05, 0.2, 0.05, 0.05, 0.2,
         ];
         let n = points.len() / 2;
-        let plain = persistent_homology(&points, n, 2, None, false, false, false, false, true).unwrap();
-        let peeled = persistent_homology(&points, n, 2, None, false, false, true, false, true).unwrap();
+        let plain =
+            persistent_homology_with(&points, n, 2, &config(false, false, false, true)).unwrap();
+        let peeled =
+            persistent_homology_with(&points, n, 2, &config(true, false, false, true)).unwrap();
         assert_same_barcode(&plain, &peeled);
     }
 
@@ -279,10 +344,22 @@ mod pipeline_tests {
             }
         }
 
-        let plain =
-            persistent_homology(&distances, n, 1, Some(1.5), true, false, false, false, true).unwrap();
-        let peeled =
-            persistent_homology(&distances, n, 1, Some(1.5), true, false, true, false, true).unwrap();
+        let base = Config {
+            distance_matrix: true,
+            threshold: Some(1.5),
+            ..config(false, false, false, true)
+        };
+        let plain = persistent_homology_with(&distances, n, 1, &base).unwrap();
+        let peeled = persistent_homology_with(
+            &distances,
+            n,
+            1,
+            &Config {
+                peel: true,
+                ..base.clone()
+            },
+        )
+        .unwrap();
         assert_same_barcode(&plain, &peeled);
     }
 
@@ -302,10 +379,22 @@ mod pipeline_tests {
             }
         }
 
-        let plain =
-            persistent_homology(&distances, n, 1, Some(1.5), true, false, false, false, true).unwrap();
-        let peeled =
-            persistent_homology(&distances, n, 1, Some(1.5), true, false, true, false, true).unwrap();
+        let base = Config {
+            distance_matrix: true,
+            threshold: Some(1.5),
+            ..config(false, false, false, true)
+        };
+        let plain = persistent_homology_with(&distances, n, 1, &base).unwrap();
+        let peeled = persistent_homology_with(
+            &distances,
+            n,
+            1,
+            &Config {
+                peel: true,
+                ..base.clone()
+            },
+        )
+        .unwrap();
         assert_same_barcode(&plain, &peeled);
     }
 
@@ -334,7 +423,11 @@ mod pipeline_tests {
             d[b * n + a] = v;
         }
 
-        let bc = persistent_homology(&d, n, 1, None, true, false, false, false, false).unwrap();
+        let base = Config {
+            distance_matrix: true,
+            ..config(false, false, false, false)
+        };
+        let bc = persistent_homology_with(&d, n, 1, &base).unwrap();
 
         // H0: exactly two essential components.
         let h0_essential = bc.intervals[0]
@@ -354,7 +447,16 @@ mod pipeline_tests {
         );
 
         // Peel must remain barcode-preserving on disconnected inputs.
-        let peeled = persistent_homology(&d, n, 1, None, true, false, true, false, false).unwrap();
+        let peeled = persistent_homology_with(
+            &d,
+            n,
+            1,
+            &Config {
+                peel: true,
+                ..base.clone()
+            },
+        )
+        .unwrap();
         assert_same_barcode(&bc, &peeled);
     }
 
@@ -373,15 +475,15 @@ mod pipeline_tests {
             let points: Vec<f32> = (0..n * d).map(|_| rng()).collect();
             for max_dim in 1..=2 {
                 let plain =
-                    persistent_homology(&points, n, max_dim, None, false, false, false, false, false)
+                    persistent_homology_with(&points, n, max_dim, &config(false, false, false, false))
                         .unwrap();
                 let collapsed =
-                    persistent_homology(&points, n, max_dim, None, false, false, false, true, false)
+                    persistent_homology_with(&points, n, max_dim, &config(false, false, true, false))
                         .unwrap();
                 assert_same_barcode(&plain, &collapsed);
 
                 let peel_collapse =
-                    persistent_homology(&points, n, max_dim, None, false, false, true, true, false)
+                    persistent_homology_with(&points, n, max_dim, &config(true, false, true, false))
                         .unwrap();
                 assert_same_barcode(&plain, &peel_collapse);
             }
@@ -393,9 +495,10 @@ mod pipeline_tests {
     #[test]
     fn collapse_preserves_quotient_barcode() {
         let (points, _) = ring_distances();
-        let quot = persistent_homology(&points, 4, 1, None, false, true, true, false, false).unwrap();
+        let quot =
+            persistent_homology_with(&points, 4, 1, &config(true, true, false, false)).unwrap();
         let quot_collapsed =
-            persistent_homology(&points, 4, 1, None, false, true, true, true, false).unwrap();
+            persistent_homology_with(&points, 4, 1, &config(true, true, true, false)).unwrap();
         assert_same_barcode(&quot, &quot_collapsed);
     }
 
@@ -410,9 +513,10 @@ mod pipeline_tests {
             }
         }
         let n = 16;
-        let plain = filtration_size(&points, n, 2, None, false, false, false, false, false).unwrap();
+        let plain =
+            filtration_size_with(&points, n, 2, &config(false, false, false, false)).unwrap();
         let collapsed =
-            filtration_size(&points, n, 2, None, false, false, false, true, false).unwrap();
+            filtration_size_with(&points, n, 2, &config(false, false, true, false)).unwrap();
         assert!(
             collapsed < plain,
             "collapse should shrink the filtration ({collapsed} vs {plain})"
@@ -421,13 +525,15 @@ mod pipeline_tests {
 
     #[test]
     fn parallel_flag_preserves_barcode() {
-        // The new flag must be behaviour-neutral: seq and par assembly agree.
+        // The flag must be behaviour-neutral: seq and par assembly agree.
         let points = [
             0.0, 0.0, 0.1, 0.0, 0.0, 0.1, 0.1, 0.1, 0.05, 0.05, 0.2, 0.05, 0.05, 0.2,
         ];
         let n = points.len() / 2;
-        let seq = persistent_homology(&points, n, 2, None, false, false, false, false, false).unwrap();
-        let par = persistent_homology(&points, n, 2, None, false, false, false, false, true).unwrap();
+        let seq =
+            persistent_homology_with(&points, n, 2, &config(false, false, false, false)).unwrap();
+        let par =
+            persistent_homology_with(&points, n, 2, &config(false, false, false, true)).unwrap();
         assert_same_barcode(&seq, &par);
     }
 
@@ -435,23 +541,36 @@ mod pipeline_tests {
     fn filtration_size_matches_across_input_modes() {
         let (points, distances) = ring_distances();
 
-        let point_count =
-            filtration_size(&points, 4, 1, Some(1.0), false, false, false, false, false).unwrap();
-        let matrix_count =
-            filtration_size(&distances, 4, 1, Some(1.0), true, false, false, false, false).unwrap();
+        let point_cfg = Config {
+            threshold: Some(1.0),
+            ..config(false, false, false, false)
+        };
+        let matrix_cfg = Config {
+            distance_matrix: true,
+            ..point_cfg.clone()
+        };
+        let point_count = filtration_size_with(&points, 4, 1, &point_cfg).unwrap();
+        let matrix_count = filtration_size_with(&distances, 4, 1, &matrix_cfg).unwrap();
         assert_eq!(point_count, 8); // 4 vertices + 4 cycle edges
         assert_eq!(matrix_count, point_count);
 
-        let peeled = filtration_size(&points, 4, 1, None, false, false, true, false, false).unwrap();
-        let unpeeled = filtration_size(&points, 4, 1, None, false, false, false, false, false).unwrap();
+        let peeled =
+            filtration_size_with(&points, 4, 1, &config(true, false, false, false)).unwrap();
+        let unpeeled =
+            filtration_size_with(&points, 4, 1, &config(false, false, false, false)).unwrap();
         assert!(peeled <= unpeeled);
     }
 
     #[test]
     fn quotient_filtration_matches_input_modes() {
         let (points, distances) = ring_distances();
-        let from_points = filtration_size(&points, 4, 1, None, false, true, true, false, false).unwrap();
-        let from_matrix = filtration_size(&distances, 4, 1, None, true, true, true, false, false).unwrap();
+        let point_cfg = config(true, true, false, false);
+        let matrix_cfg = Config {
+            distance_matrix: true,
+            ..point_cfg.clone()
+        };
+        let from_points = filtration_size_with(&points, 4, 1, &point_cfg).unwrap();
+        let from_matrix = filtration_size_with(&distances, 4, 1, &matrix_cfg).unwrap();
         assert_eq!(from_points, from_matrix);
     }
 
@@ -460,10 +579,13 @@ mod pipeline_tests {
         // Regression anchor for the sparse quotient path: both input modes feed
         // coperto the same edge set, so the barcodes agree.
         let (points, distances) = ring_distances();
-        let from_points =
-            persistent_homology(&points, 4, 1, None, false, true, true, false, true).unwrap();
-        let from_matrix =
-            persistent_homology(&distances, 4, 1, None, true, true, true, false, true).unwrap();
+        let point_cfg = config(true, true, false, true);
+        let matrix_cfg = Config {
+            distance_matrix: true,
+            ..point_cfg.clone()
+        };
+        let from_points = persistent_homology_with(&points, 4, 1, &point_cfg).unwrap();
+        let from_matrix = persistent_homology_with(&distances, 4, 1, &matrix_cfg).unwrap();
         assert_same_barcode(&from_points, &from_matrix);
     }
 
@@ -471,21 +593,25 @@ mod pipeline_tests {
     fn points_dimension_is_inferred() {
         // 4 points in 2-D: length 8, n=4 ⇒ d=2 inferred, matching the explicit-d era.
         let (points, _) = ring_distances();
-        let count = filtration_size(&points, 4, 1, Some(1.0), false, false, false, false, false).unwrap();
+        let cfg = Config {
+            threshold: Some(1.0),
+            ..config(false, false, false, false)
+        };
+        let count = filtration_size_with(&points, 4, 1, &cfg).unwrap();
         assert_eq!(count, 8);
     }
 
     #[test]
     fn points_length_not_multiple_of_n_errors() {
         let points = [0.0, 0.0, 1.0, 0.0, 1.0]; // length 5, n=2 ⇒ not divisible
-        let err = filtration_size(&points, 2, 1, None, false, false, false, false, false).unwrap_err();
+        let err = filtration_size(&points, 2, 1).unwrap_err();
         assert!(matches!(err, Error::ShapeMismatch { .. }));
     }
 
     #[test]
     fn empty_points_errors() {
         let points: [f32; 0] = [];
-        let err = filtration_size(&points, 2, 1, None, false, false, false, false, false).unwrap_err();
+        let err = filtration_size(&points, 2, 1).unwrap_err();
         assert!(matches!(err, Error::EmptyDimension));
     }
 }

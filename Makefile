@@ -71,6 +71,13 @@ bench-quot: ## Benchmark the vanilla pipeline + quotient
 bench-clps: ## Benchmark the vanilla pipeline + edge collapse
 	@$(MAKE) bench VARIANT=clps
 
+bench-all:
+	@$(MAKE) bench
+	@$(MAKE) bench VARIANT=peel
+	@$(MAKE) bench VARIANT=quot
+	@$(MAKE) bench VARIANT=clps
+
+
 
 profile-build: ## Build the single-run profiling runner (optimized + line info)
 	@echo "$(CYAN)📦 Building profiling runner...$(RESET)"

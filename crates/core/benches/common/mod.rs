@@ -4,7 +4,7 @@ use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use tda_core::{persistent_homology, BarcodeResult};
+use tda_core::{persistent_homology_with, BarcodeResult, Config};
 
 pub struct Dataset {
     pub name: String,
@@ -71,7 +71,7 @@ pub fn variant_from_env() -> Variant {
 /// Group / directory label: the historical `bitcsr_h{d}` for vanilla (keeps
 /// existing criterion baselines comparable), `bitcsr_h{d}_{variant}` otherwise.
 pub fn group_name(max_dim: usize, variant: Variant) -> String {
-    if variant.peel || variant.quotient {
+    if variant.peel || variant.quotient || variant.collapse {
         format!("bitcsr_h{max_dim}_{}", variant.name)
     } else {
         format!("bitcsr_h{max_dim}")
@@ -153,15 +153,12 @@ pub fn run_once(
     max_dim: usize,
     variant: Variant,
 ) -> tda_core::Result<BarcodeResult> {
-    persistent_homology(
-        &dataset.points,
-        dataset.n,
-        max_dim,
-        None,
-        false,
-        variant.quotient,
-        variant.peel,
-        variant.collapse,
-        false, //benches should not be parallel
-    )
+    let config = Config {
+        quotient: variant.quotient,
+        peel: variant.peel,
+        collapse: variant.collapse,
+        parallel: false, // benches should not be parallel
+        ..Config::default()
+    };
+    persistent_homology_with(&dataset.points, dataset.n, max_dim, &config)
 }

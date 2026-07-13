@@ -42,8 +42,10 @@ def load_points(file):
     return np.loadtxt(DATA_DIR / file).astype(np.float32)
 
 
+# peel defaults to True; each variant pins it so the four columns stay
+# "vanilla" and "each transform in isolation".
 def run_tda(data, max_dim):
-    return tda.persistent_homology(data, max_dim=max_dim)
+    return tda.persistent_homology(data, max_dim=max_dim, peel=False)
 
 
 def run_tda_peel(data, max_dim):
@@ -51,11 +53,11 @@ def run_tda_peel(data, max_dim):
 
 
 def run_tda_quotient(data, max_dim):
-    return tda.persistent_homology(data, max_dim=max_dim, quotient=True)
+    return tda.persistent_homology(data, max_dim=max_dim, quotient=True, peel=False)
 
 
 def run_tda_collapse(data, max_dim):
-    return tda.persistent_homology(data, max_dim=max_dim, collapse=True)
+    return tda.persistent_homology(data, max_dim=max_dim, collapse=True, peel=False)
 
 
 def gudhi_reference(data, max_dim):

@@ -62,8 +62,8 @@ maturin develop --release
 import numpy as np
 import tda
 
-# Point cloud: an (n, d) float32 array.
-points = np.random.rand(200, 3).astype(np.float32)
+# Point cloud: an (n, d) array (float32 or float64).
+points = np.random.rand(200, 3)
 barcode = tda.persistent_homology(points, max_dim=2)
 
 # barcode[d] is a (k_d, 2) array of [birth, death] intervals.
@@ -75,7 +75,7 @@ print(barcode[2])  # H2
 Precomputed distance matrices are also supported:
 
 ```python
-distances = np.asarray(my_distance_matrix, dtype=np.float32)
+distances = np.asarray(my_distance_matrix)
 barcode = tda.persistent_homology(
     distances,
     max_dim=1,
@@ -87,7 +87,7 @@ Use `filtration_size` to inspect the size of the truncated filtration built
 with the same options:
 
 ```python
-size = tda.filtration_size(points, max_dim=2, peel=True)
+size = tda.filtration_size(points, max_dim=2)
 print(size)
 ```
 
@@ -96,15 +96,16 @@ print(size)
 Both `persistent_homology` and `filtration_size` accept the following
 parameters:
 
-| Parameter         | Type            | Default | Description                                                                                                                                             |
-| ----------------- | --------------- | ------- | ------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `data`            | `np.ndarray`    | —       | Two-dimensional `float32` array. Shape `(n, d)` for a point cloud or `(n, n)` for a distance matrix. Inputs are copied into row-major internal storage. |
-| `max_dim`         | `int`           | `1`     | Highest homology dimension to compute. Capped at 4.                                                                                                     |
-| `threshold`       | `float \| None` | `None`  | Maximum filtration value. `None` uses the enclosing radius; an explicit value is capped by that radius.                                                 |
-| `distance_matrix` | `bool`          | `False` | Interpret `data` as a square distance matrix. Symmetry, zero diagonal, and non-negativity are assumed rather than validated.                            |
-| `quotient`        | `bool`          | `False` | Use the smaller quotient-cover filtration. This is an approximation with a `log(3)` interleaving guarantee, not the exact Vietoris–Rips barcode.        |
-| `peel`            | `bool`          | `False` | Apply an exact strong-collapse reduction before computing the result.                                                                                   |
-| `parallel`        | `bool`          | `True`  | Enable parallel preprocessing, sorting, and candidate assembly for sufficiently large inputs.                                                           |
+| Parameter         | Type            | Default | Description                                                                                                                                                              |
+| ----------------- | --------------- | ------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `data`            | `np.ndarray`    | —       | Two-dimensional `float32` or `float64` array (`float64` is cast to `float32`). Shape `(n, d)` for a point cloud or `(n, n)` for a distance matrix. Inputs are copied into row-major internal storage. |
+| `max_dim`         | `int`           | `1`     | Highest homology dimension to compute. Capped at 4.                                                                                                                     |
+| `threshold`       | `float \| None` | `None`  | Maximum filtration value. `None` uses the enclosing radius; an explicit value is capped by that radius.                                                                 |
+| `distance_matrix` | `bool`          | `False` | Interpret `data` as a square distance matrix. Symmetry, zero diagonal, and non-negativity are assumed rather than validated.                                            |
+| `quotient`        | `bool`          | `False` | Use the smaller quotient-cover filtration. This is an approximation with a `log(3)` interleaving guarantee, not the exact Vietoris–Rips barcode.                        |
+| `peel`            | `bool`          | `True`  | Tighten the truncation radius with an exact strong-collapse peeling: identical barcode, strictly less work. Disable to compute over the plain enclosing radius.          |
+| `collapse`        | `bool`          | `False` | Remove filtration-dominated edges (exact edge collapse): identical barcode, smaller filtration, but expensive preprocessing.                                             |
+| `parallel`        | `bool`          | `True`  | Enable parallel preprocessing, sorting, and candidate assembly for sufficiently large inputs.                                                                            |
 
 `persistent_homology` returns a list of length `max_dim + 1`. Entry
 `barcode[d]` is a NumPy array of shape `(k_d, 2)` whose rows are
@@ -121,7 +122,8 @@ tda_core = "0.3"
 ```
 
 For a point cloud, pass a flat row-major `(n, d)` slice. The ambient dimension
-is inferred from the slice length and `n`:
+is inferred from the slice length and `n`, and the defaults (peel on, parallel
+on, no explicit threshold) are the recommended configuration:
 
 ```rust
 use tda_core::{persistent_homology, Error};
@@ -134,16 +136,7 @@ fn main() -> Result<(), Error> {
         1.0, 1.0,
     ];
 
-    let barcode = persistent_homology(
-        &points,
-        4,     // number of points
-        1,     // max_dim
-        None,  // threshold
-        false, // distance_matrix
-        false, // quotient
-        false, // peel
-        true,  // parallel
-    )?;
+    let barcode = persistent_homology(&points, 4 /* points */, 1 /* max_dim */)?;
 
     for (dim, intervals) in barcode.intervals.iter().enumerate() {
         for interval in intervals {
@@ -155,10 +148,11 @@ fn main() -> Result<(), Error> {
 }
 ```
 
-Distance matrices use the same function with `distance_matrix = true`:
+Everything else — distance-matrix input, thresholds, the optional transforms —
+goes through `Config` and the `_with` variants:
 
 ```rust
-use tda_core::{persistent_homology, Error};
+use tda_core::{persistent_homology_with, Config, Error};
 
 fn main() -> Result<(), Error> {
     let distances: Vec<f32> = vec![
@@ -167,16 +161,11 @@ fn main() -> Result<(), Error> {
         2.0, 1.5, 0.0,
     ];
 
-    let barcode = persistent_homology(
-        &distances,
-        3,
-        1,
-        None,
-        true,  // distance_matrix
-        false, // quotient
-        false, // peel
-        true,  // parallel
-    )?;
+    let config = Config {
+        distance_matrix: true,
+        ..Config::default()
+    };
+    let barcode = persistent_homology_with(&distances, 3, 1, &config)?;
 
     println!("{:?}", barcode.intervals);
     Ok(())
