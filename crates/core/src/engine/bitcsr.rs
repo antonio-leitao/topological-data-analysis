@@ -134,7 +134,7 @@ impl BitCsrDistanceMatrix {
 
     /// Distance between an existing edge `(a, b)`. Debug-asserts the edge exists.
     #[inline(always)]
-    pub(crate) fn edge_dist(&self, a: u16, b: u16) -> f32 {
+    pub(crate) fn edge_dist(&self, a: u32, b: u32) -> f32 {
         let block = (b as usize) >> 6;
         let bit = (b as usize) & 63;
         let row_start = self.row_start(a as usize);
@@ -153,7 +153,7 @@ impl BitCsrDistanceMatrix {
 
     /// Encoded (raw u32 bits) distance of edge `(a, b)`.
     #[inline(always)]
-    pub(crate) fn edge_dist_bits(&self, a: u16, b: u16) -> u32 {
+    pub(crate) fn edge_dist_bits(&self, a: u32, b: u32) -> u32 {
         self.edge_dist(a, b).to_bits()
     }
 
@@ -164,18 +164,18 @@ impl BitCsrDistanceMatrix {
     /// receives the neighbour id and `max_extra` — the largest distance from that
     /// neighbour to any vertex in the set. Return `false` from `f` to stop.
     #[inline]
-    pub(crate) fn for_each_common_neighbor(
+    pub(crate) fn for_each_common_neighbor<const K: usize>(
         &self,
-        verts: &[u16; 6],
+        verts: &[u32; K],
         vc: usize,
         floor: i32,
-        mut f: impl FnMut(u16, f32) -> bool,
+        mut f: impl FnMut(u32, f32) -> bool,
     ) {
         if vc == 0 {
             return;
         }
 
-        let mut row_start = [0usize; 6];
+        let mut row_start = [0usize; K];
         let mut limit = usize::MAX;
         for i in 0..vc {
             let v = verts[i] as usize;
@@ -209,7 +209,7 @@ impl BitCsrDistanceMatrix {
             while mask != 0 {
                 let bit = highest_set_bit(mask);
                 mask &= !(1u64 << bit);
-                let w = ((block << 6) | bit) as u16;
+                let w = ((block << 6) | bit) as u32;
                 let extra = self.max_extra(&row_start, vc, block, bit);
                 if !f(w, extra) {
                     return;
@@ -224,10 +224,10 @@ impl BitCsrDistanceMatrix {
     #[inline]
     pub(crate) fn for_each_common_neighbor_edges(
         &self,
-        v0: u16,
-        v1: u16,
+        v0: u32,
+        v1: u32,
         floor: i32,
-        mut f: impl FnMut(u16, f32, f32) -> bool,
+        mut f: impl FnMut(u32, f32, f32) -> bool,
     ) {
         let s0 = self.row_start(v0 as usize);
         let s1 = self.row_start(v1 as usize);
@@ -260,7 +260,7 @@ impl BitCsrDistanceMatrix {
             while mask != 0 {
                 let bit = highest_set_bit(mask);
                 mask &= !(1u64 << bit);
-                let w = ((block << 6) | bit) as u16;
+                let w = ((block << 6) | bit) as u32;
                 let d0 = self.word_distance_unchecked(f0, word0, bit);
                 let d1 = self.word_distance_unchecked(f1, word1, bit);
                 if !f(w, d0, d1) {
@@ -274,7 +274,7 @@ impl BitCsrDistanceMatrix {
     /// its edge distance. This is the per-row primitive H0 edge enumeration is
     /// built from. Return `false` from `f` to stop.
     #[inline]
-    pub(crate) fn for_each_neighbor_above(&self, v: usize, mut f: impl FnMut(u16, f32) -> bool) {
+    pub(crate) fn for_each_neighbor_above(&self, v: usize, mut f: impl FnMut(u32, f32) -> bool) {
         let row_start = self.row_start(v);
         let row_len = self.row_len(v);
         if row_len == 0 {
@@ -294,7 +294,7 @@ impl BitCsrDistanceMatrix {
             while iter_word != 0 {
                 let bit = highest_set_bit(iter_word);
                 iter_word &= !(1u64 << bit);
-                let w = ((block << 6) | bit) as u16;
+                let w = ((block << 6) | bit) as u32;
                 let d = self.word_distance_unchecked(flat, word, bit);
                 if !f(w, d) {
                     return;
@@ -304,7 +304,12 @@ impl BitCsrDistanceMatrix {
     }
 
     #[inline(always)]
-    fn intersection_word(&self, row_start: &[usize; 6], vc: usize, block: usize) -> u64 {
+    fn intersection_word<const K: usize>(
+        &self,
+        row_start: &[usize; K],
+        vc: usize,
+        block: usize,
+    ) -> u64 {
         let words = &self.words;
         unsafe {
             let w0 = *words.get_unchecked(row_start[0] + block);
@@ -317,43 +322,40 @@ impl BitCsrDistanceMatrix {
                 return acc;
             }
 
-            let w2 = *words.get_unchecked(row_start[2] + block);
-            if w2 == 0 {
-                return 0;
-            }
-            acc &= w2;
-            if acc == 0 || vc == 3 {
-                return acc;
-            }
-
-            let w3 = *words.get_unchecked(row_start[3] + block);
-            if w3 == 0 {
-                return 0;
-            }
-            acc &= w3;
-            if acc == 0 || vc == 4 {
-                return acc;
-            }
-
-            let w4 = *words.get_unchecked(row_start[4] + block);
-            if w4 == 0 {
-                return 0;
-            }
-            acc &= w4;
-            if acc == 0 || vc == 5 {
-                return acc;
+            // Rows 2..K-1. `K` is a monomorphisation constant, so this loop
+            // fully unrolls to exactly the depth the layout needs — for
+            // Simplex128 (K = 6) this is the historical 6-deep chain, with
+            // no dead arms from wider layouts in the instruction stream.
+            let mut k = 2;
+            while k + 1 < K {
+                let w = *words.get_unchecked(row_start[k] + block);
+                if w == 0 {
+                    return 0;
+                }
+                acc &= w;
+                if acc == 0 || vc == k + 1 {
+                    return acc;
+                }
+                k += 1;
             }
 
-            let w5 = *words.get_unchecked(row_start[5] + block);
-            if w5 == 0 {
+            // Reaching here means vc == K: the last row is unconditional.
+            let w = *words.get_unchecked(row_start[K - 1] + block);
+            if w == 0 {
                 return 0;
             }
-            acc & w5
+            acc & w
         }
     }
 
     #[inline(always)]
-    fn max_extra(&self, row_start: &[usize; 6], vc: usize, block: usize, bit: usize) -> f32 {
+    fn max_extra<const K: usize>(
+        &self,
+        row_start: &[usize; K],
+        vc: usize,
+        block: usize,
+        bit: usize,
+    ) -> f32 {
         unsafe {
             match vc {
                 1 => {
@@ -441,6 +443,7 @@ fn set_edge_distance(
 mod tests {
     use super::*;
     use crate::engine::algorithm::{compute, for_each_edge};
+    use crate::engine::simplex::Simplex128;
     use crate::preprocess::edgelist::square_from_lower_tri;
     use crate::preprocess::edgelist::EdgeList;
     use crate::types::BarcodeResult;
@@ -483,8 +486,8 @@ mod tests {
     /// barcodes on the same input.
     fn seq_par_check(lt: &[f32], n: usize, threshold: f32, max_dim: usize) {
         let (bitcsr, eff) = bitcsr_from_lower_tri(lt, n, threshold);
-        let seq = compute(&bitcsr, max_dim, false);
-        let par = compute(&bitcsr, max_dim, true);
+        let seq = compute::<6, Simplex128>(&bitcsr, max_dim, false);
+        let par = compute::<6, Simplex128>(&bitcsr, max_dim, true);
         assert!(
             barcodes_equal(&seq, &par),
             "seq vs par barcode mismatch (n={n}, eff={eff}, max_dim={max_dim})\n seq={:?}\n par={:?}",
@@ -512,7 +515,7 @@ mod tests {
         let (bitcsr, _eff) = bitcsr_from_lower_tri(&data, n, 1.0);
 
         let mut edges = Vec::new();
-        for_each_edge(&bitcsr, |edge| {
+        for_each_edge(&bitcsr, |edge: Simplex128| {
             edges.push(edge.vertices());
             true
         });

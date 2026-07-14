@@ -18,8 +18,8 @@ pub enum Error {
     TooFewPoints { got: usize },
 
     #[error(
-        "library supports at most {max} points (Simplex128 packs vertex IDs \
-         into 16 bits); got {got}"
+        "library supports at most {max} points (vertex ids are packed into \
+         24-bit simplex slots); got {got}"
     )]
     TooManyPoints { got: usize, max: usize },
 
@@ -28,7 +28,7 @@ pub enum Error {
 
     #[error(
         "max_dim must be at most {max} (reducing d-simplices needs (d+1)-cofacet \
-         enumeration, capped at 6 vertices by Simplex128); got {got}"
+         enumeration, capped at 9 vertices by the widest simplex layout); got {got}"
     )]
     DimTooLarge { got: usize, max: usize },
 

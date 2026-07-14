@@ -3,15 +3,20 @@
 // the first read Floyd-heapifies that batch in O(k), instead of paying k
 // dependent sift-ups through one potentially huge global heap.
 
-use crate::engine::simplex::Simplex128;
 use std::collections::{binary_heap::PeekMut, BinaryHeap};
+
+/// The heap needs only value semantics and the Ripser total order — NOT the
+/// full `PackedSimplex` contract. Binding to the minimal bounds keeps this
+/// file independent of the layout's `K` const parameter.
+pub trait HeapKey: Copy + Ord + std::fmt::Debug {}
+impl<T: Copy + Ord + std::fmt::Debug> HeapKey for T {}
 
 const ARITY: usize = 8;
 const COMPACT_MIN_ENTRIES: usize = 16 * 1024;
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-struct RunHead {
-    key: Simplex128,
+struct RunHead<S: HeapKey> {
+    key: S,
     run: usize,
 }
 
@@ -21,15 +26,15 @@ struct Run {
     len: usize,
 }
 
-pub struct FastHeap {
-    arena: Vec<Simplex128>,
+pub struct FastHeap<S: HeapKey> {
+    arena: Vec<S>,
     runs: Vec<Run>,
-    heads: BinaryHeap<RunHead>,
+    heads: BinaryHeap<RunHead<S>>,
     pending_start: usize,
     live_len: usize,
 }
 
-impl FastHeap {
+impl<S: HeapKey> FastHeap<S> {
     #[inline]
     pub fn new() -> Self {
         Self {
@@ -64,13 +69,13 @@ impl FastHeap {
     }
 
     #[inline]
-    pub fn peek(&mut self) -> Option<&Simplex128> {
+    pub fn peek(&mut self) -> Option<&S> {
         self.finalize_pending();
         self.heads.peek().map(|head| &head.key)
     }
 
     #[inline(always)]
-    pub fn push(&mut self, item: Simplex128) {
+    pub fn push(&mut self, item: S) {
         self.arena.push(item);
         self.live_len += 1;
     }
@@ -78,7 +83,7 @@ impl FastHeap {
     /// Append to the current batch. Kept as the explicit bulk-build spelling
     /// used by the initial coboundary path.
     #[inline(always)]
-    pub fn append_raw(&mut self, item: Simplex128) {
+    pub fn append_raw(&mut self, item: S) {
         self.push(item);
     }
 
@@ -110,7 +115,7 @@ impl FastHeap {
         self.pending_start = end;
     }
 
-    pub fn pop(&mut self) -> Option<Simplex128> {
+    pub fn pop(&mut self) -> Option<S> {
         self.finalize_pending();
 
         let result;
@@ -157,7 +162,7 @@ impl FastHeap {
 
     // ── Z/2 cancellation (unchanged from original) ─────────────────────────
 
-    pub fn pop_pivot(&mut self) -> Option<Simplex128> {
+    pub fn pop_pivot(&mut self) -> Option<S> {
         loop {
             let top = self.pop()?;
             match self.peek() {
@@ -169,14 +174,14 @@ impl FastHeap {
         }
     }
 
-    pub fn get_pivot(&mut self) -> Option<Simplex128> {
+    pub fn get_pivot(&mut self) -> Option<S> {
         let pivot = self.pop_pivot()?;
         self.push(pivot);
         Some(pivot)
     }
 }
 
-impl Default for FastHeap {
+impl<S: HeapKey> Default for FastHeap<S> {
     #[inline]
     fn default() -> Self {
         Self::new()
@@ -184,7 +189,7 @@ impl Default for FastHeap {
 }
 
 #[inline(always)]
-unsafe fn sift_down(ptr: *mut Simplex128, mut pos: usize, end: usize, item: Simplex128) {
+unsafe fn sift_down<S: HeapKey>(ptr: *mut S, mut pos: usize, end: usize, item: S) {
     loop {
         let first = ARITY * pos + 1;
         if first >= end {
@@ -263,7 +268,7 @@ unsafe fn sift_down(ptr: *mut Simplex128, mut pos: usize, end: usize, item: Simp
 }
 
 #[inline]
-unsafe fn heapify_slice(ptr: *mut Simplex128, len: usize) {
+unsafe fn heapify_slice<S: HeapKey>(ptr: *mut S, len: usize) {
     if len <= 1 {
         return;
     }
@@ -276,7 +281,7 @@ unsafe fn heapify_slice(ptr: *mut Simplex128, len: usize) {
 }
 
 #[inline]
-unsafe fn pop_heap(ptr: *mut Simplex128, len: &mut usize) -> Simplex128 {
+unsafe fn pop_heap<S: HeapKey>(ptr: *mut S, len: &mut usize) -> S {
     let n = *len;
     debug_assert!(n > 0);
     let result = *ptr;
@@ -295,6 +300,7 @@ unsafe fn pop_heap(ptr: *mut Simplex128, len: &mut usize) -> Simplex128 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::engine::simplex::Simplex128;
 
     fn s(x: u128) -> Simplex128 {
         Simplex128(x)
@@ -329,7 +335,7 @@ mod tests {
 
     #[test]
     fn empty_returns_none() {
-        let mut h = FastHeap::new();
+        let mut h: FastHeap<Simplex128> = FastHeap::new();
         assert!(h.peek().is_none());
         assert!(h.pop().is_none());
         assert!(h.pop_pivot().is_none());

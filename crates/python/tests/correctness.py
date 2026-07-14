@@ -23,8 +23,8 @@ LOG_EPS = 1e-30  # clamp for log(0) births; both sides clamp identically
 
 def default_max_dim():
     value = int(os.environ.get("TDA_MAX_DIM", "1"))
-    if value not in (1, 2):
-        raise ValueError("max_dim must be 1 or 2")
+    if not 1 <= value <= 7:
+        raise ValueError("max_dim must be in 1..=7")
     return value
 
 

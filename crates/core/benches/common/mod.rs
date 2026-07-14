@@ -79,10 +79,15 @@ pub fn group_name(max_dim: usize, variant: Variant) -> String {
 }
 
 pub fn parse_max_dim(value: &str) -> Result<usize, String> {
-    match value {
-        "" | "1" => Ok(1),
-        "2" => Ok(2),
-        other => Err(format!("max_dim must be 1 or 2, got {other}")),
+    if value.is_empty() {
+        return Ok(1);
+    }
+    match value.parse::<usize>() {
+        Ok(d) if (1..=tda_core::MAX_DIM).contains(&d) => Ok(d),
+        _ => Err(format!(
+            "max_dim must be in 1..={}, got {value}",
+            tda_core::MAX_DIM
+        )),
     }
 }
 

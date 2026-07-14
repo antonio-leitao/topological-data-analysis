@@ -52,7 +52,7 @@ use rayon::prelude::*;
 
 /// Adjacency entry: (neighbor id, edge value), kept sorted by id. Each list
 /// also holds a `(self, -inf)` sentinel.
-type Nbr = (u16, f32);
+type Nbr = (u32, f32);
 
 /// Memory budget for the optional dense n×n value matrix (GUDHI's
 /// `GUDHI_COLLAPSE_USE_DENSE_ARRAY`): O(1) adjacency-value lookups make a
@@ -65,7 +65,7 @@ const DENSE_BUDGET_BYTES: usize = 1 << 28;
 /// against the id-sorted adjacency of `c`; the self-sentinel makes `c`'s own
 /// membership pass automatically. Degree precheck up front.
 #[inline]
-fn is_dominated_by(active: &[u16], adj_c: &[Nbr], t: f32) -> bool {
+fn is_dominated_by(active: &[u32], adj_c: &[Nbr], t: f32) -> bool {
     if adj_c.len() < active.len() {
         return false;
     }
@@ -96,9 +96,9 @@ fn find_dominator(
     adj: &[Vec<Nbr>],
     dense: &[f32],
     n: usize,
-    active: &[u16],
+    active: &[u32],
     t: f32,
-) -> Option<u16> {
+) -> Option<u32> {
     if dense.is_empty() {
         active
             .iter()
@@ -117,7 +117,7 @@ fn find_dominator(
 }
 
 #[inline]
-fn remove_neighbor(list: &mut Vec<Nbr>, w: u16) {
+fn remove_neighbor(list: &mut Vec<Nbr>, w: u32) {
     let pos = list
         .binary_search_by_key(&w, |&(x, _)| x)
         .expect("removing an edge that is not present");
@@ -125,7 +125,7 @@ fn remove_neighbor(list: &mut Vec<Nbr>, w: u16) {
 }
 
 #[inline]
-fn set_neighbor_value(list: &mut [Nbr], w: u16, value: f32) {
+fn set_neighbor_value(list: &mut [Nbr], w: u32, value: f32) {
     let pos = list
         .binary_search_by_key(&w, |&(x, _)| x)
         .expect("delaying an edge that is not present");
@@ -174,7 +174,7 @@ fn collapse_impl(edge_list: &mut EdgeList, parallel: bool, use_dense: bool) {
         adj[edge.v as usize].push((edge.u, edge.distance));
     }
     for (v, list) in adj.iter_mut().enumerate() {
-        list.push((v as u16, f32::NEG_INFINITY));
+        list.push((v as u32, f32::NEG_INFINITY));
     }
     if parallel {
         adj.par_iter_mut()
@@ -204,8 +204,8 @@ fn collapse_impl(edge_list: &mut EdgeList, parallel: bool, use_dense: bool) {
     let mut any_shift = false;
     // Reused scratch: active members (id-sorted in the fallback path, where
     // the merge walk needs it) and future appearance events.
-    let mut active: Vec<u16> = Vec::new();
-    let mut later: Vec<Reverse<(u32, u16)>> = Vec::new();
+    let mut active: Vec<u32> = Vec::new();
+    let mut later: Vec<Reverse<(u32, u32)>> = Vec::new();
 
     // Decreasing value order; ties in deterministic (u, v) order.
     for idx in (0..edge_list.edges.len()).rev() {
@@ -247,7 +247,7 @@ fn collapse_impl(edge_list: &mut EdgeList, parallel: bool, use_dense: bool) {
         if !active.is_empty() {
             // Lazily heapified: edges that are never dominated, or dominated
             // through infinity with no future events, never pay for it.
-            let mut heap: Option<BinaryHeap<Reverse<(u32, u16)>>> = None;
+            let mut heap: Option<BinaryHeap<Reverse<(u32, u32)>>> = None;
 
             'outer: while let Some(dom) = find_dominator(&adj, &dense, n, &active, time) {
                 let adj_dom = &adj[dom as usize];
@@ -384,7 +384,7 @@ mod tests {
         for n in [6usize, 10, 16, 24] {
             for &thr in &[0.4f32, 0.7, 1.0] {
                 let mut edges = Vec::new();
-                for u in 1..n as u16 {
+                for u in 1..n as u32 {
                     for v in 0..u {
                         let d = rng();
                         if d <= thr {
@@ -396,7 +396,7 @@ mod tests {
                 let mut without_dense = edge_list(n, edges);
                 collapse_impl(&mut with_dense, false, true);
                 collapse_impl(&mut without_dense, false, false);
-                let key = |e: &EdgeList| -> Vec<(u16, u16, u32)> {
+                let key = |e: &EdgeList| -> Vec<(u32, u32, u32)> {
                     e.edges
                         .iter()
                         .map(|x| (x.u, x.v, x.distance.to_bits()))
@@ -412,7 +412,7 @@ mod tests {
     /// graph is triangle-free.
     #[test]
     fn complete_graph_collapses_to_tree() {
-        let edges: Vec<Edge> = (1..4u16)
+        let edges: Vec<Edge> = (1..4u32)
             .flat_map(|u| (0..u).map(move |v| Edge { u, v, distance: 1.0 }))
             .collect();
         let mut e = edge_list(4, edges);

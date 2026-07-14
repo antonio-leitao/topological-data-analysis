@@ -84,11 +84,7 @@ fn find(parent: &mut [u32], mut i: u32) -> u32 {
 #[inline(always)]
 fn push_edge(out: &mut Vec<Edge>, a: u32, b: u32, distance: f32) {
     let (u, v) = if a > b { (a, b) } else { (b, a) };
-    out.push(Edge {
-        u: u as u16,
-        v: v as u16,
-        distance,
-    });
+    out.push(Edge { u, v, distance });
 }
 
 /// Rewrite `edge_list` in place into the 1-skeleton of the coned quotient
@@ -225,7 +221,7 @@ mod tests {
         }
     }
 
-    fn edge_set(edge_list: &EdgeList) -> Vec<(u16, u16, u32)> {
+    fn edge_set(edge_list: &EdgeList) -> Vec<(u32, u32, u32)> {
         let mut v: Vec<_> = edge_list
             .edges
             .iter()

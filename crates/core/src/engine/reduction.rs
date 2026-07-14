@@ -5,23 +5,23 @@
 use crate::engine::algorithm::{for_each_cofacet, zero_apparent_facet};
 use crate::engine::bitcsr::BitCsrDistanceMatrix;
 use crate::engine::heap::FastHeap;
-use crate::engine::simplex::{FxHashMap, Simplex128};
+use crate::engine::simplex::{FxHashMap, PackedSimplex};
 use crate::types::PersistenceInterval;
 
 /// Engine-internal representative for one EMITTED interval: the birth simplex,
 /// the death simplex (`None` for essential classes), and the representative
 /// cocycle — the birth simplex plus the recorded reduction (V) column, over
 /// Z/2. Aligned index-for-index with the emitted intervals of its dimension.
-pub(crate) struct RawRepresentative {
-    pub(crate) birth: Simplex128,
-    pub(crate) death: Option<Simplex128>,
-    pub(crate) cocycle: Vec<Simplex128>,
+pub(crate) struct RawRepresentative<S> {
+    pub(crate) birth: S,
+    pub(crate) death: Option<S>,
+    pub(crate) cocycle: Vec<S>,
 }
 
 /// Sort and Z/2-cancel `working_v` in place, emitting each surviving entry.
 /// Since elements may appear with multiplicity, equal pairs cancel.
 #[inline]
-fn for_each_cancelled(working_v: &mut [Simplex128], mut f: impl FnMut(Simplex128)) {
+fn for_each_cancelled<S: Copy + Ord>(working_v: &mut [S], mut f: impl FnMut(S)) {
     working_v.sort_unstable();
     let mut i = 0;
     while i < working_v.len() {
@@ -39,12 +39,12 @@ fn for_each_cancelled(working_v: &mut [Simplex128], mut f: impl FnMut(Simplex128
 // CompressedSparseMatrix — storage for the reduction matrix V
 // ═══════════════════════════════════════════════════════════════════════════════
 
-pub struct CompressedSparseMatrix {
-    entries: Vec<Simplex128>,
+pub struct CompressedSparseMatrix<S: Copy> {
+    entries: Vec<S>,
     bounds: Vec<usize>,
 }
 
-impl CompressedSparseMatrix {
+impl<S: Copy> CompressedSparseMatrix<S> {
     #[inline]
     pub fn new() -> Self {
         Self {
@@ -59,14 +59,14 @@ impl CompressedSparseMatrix {
     }
 
     #[inline]
-    pub fn push(&mut self, entry: Simplex128) {
+    pub fn push(&mut self, entry: S) {
         debug_assert!(!self.bounds.is_empty(), "must call append_column first");
         self.entries.push(entry);
         *self.bounds.last_mut().unwrap() = self.entries.len();
     }
 
     #[inline]
-    pub fn column(&self, index: usize) -> &[Simplex128] {
+    pub fn column(&self, index: usize) -> &[S] {
         let end = self.bounds[index];
         let start = if index == 0 {
             0
@@ -84,11 +84,11 @@ impl CompressedSparseMatrix {
 
 //hottest loop accounts for 55% of runtime
 #[inline]
-fn add_simplex_coboundary(
-    simplex: Simplex128,
+fn add_simplex_coboundary<const K: usize, S: PackedSimplex<K>>(
+    simplex: S,
     dist: &BitCsrDistanceMatrix,
-    working_v: &mut Vec<Simplex128>,
-    working_coboundary: &mut FastHeap,
+    working_v: &mut Vec<S>,
+    working_coboundary: &mut FastHeap<S>,
 ) {
     working_v.push(simplex);
     for_each_cofacet(dist, simplex, true, |cofacet| {
@@ -98,13 +98,13 @@ fn add_simplex_coboundary(
 }
 
 #[inline]
-fn add_coboundary(
-    v_matrix: &CompressedSparseMatrix,
-    columns: &[Simplex128],
+fn add_coboundary<const K: usize, S: PackedSimplex<K>>(
+    v_matrix: &CompressedSparseMatrix<S>,
+    columns: &[S],
     column_index: usize,
     dist: &BitCsrDistanceMatrix,
-    working_v: &mut Vec<Simplex128>,
-    working_coboundary: &mut FastHeap,
+    working_v: &mut Vec<S>,
+    working_coboundary: &mut FastHeap<S>,
 ) {
     add_simplex_coboundary(columns[column_index], dist, working_v, working_coboundary);
 
@@ -117,15 +117,15 @@ fn add_coboundary(
 // Initial pivot search with emergent-pair shortcut
 // ═══════════════════════════════════════════════════════════════════════════════
 
-fn init_coboundary_and_get_pivot(
-    sigma: Simplex128,
+fn init_coboundary_and_get_pivot<const K: usize, S: PackedSimplex<K>>(
+    sigma: S,
     dist: &BitCsrDistanceMatrix,
-    pivot_column_index: &FxHashMap<Simplex128, usize>,
-    working_coboundary: &mut FastHeap,
-) -> Option<Simplex128> {
+    pivot_column_index: &FxHashMap<S, usize>,
+    working_coboundary: &mut FastHeap<S>,
+) -> Option<S> {
     let sigma_filt = sigma.filtration_encoded();
     let mut check_for_emergent_pair = true;
-    let mut emergent: Option<Simplex128> = None;
+    let mut emergent: Option<S> = None;
 
     for_each_cofacet(dist, sigma, true, |cofacet| {
         if check_for_emergent_pair && cofacet.filtration_encoded() == sigma_filt {
@@ -163,26 +163,26 @@ fn init_coboundary_and_get_pivot(
 /// path monomorphises with every recording block removed, so it stays exactly
 /// the hot loop it was. When recording, one `RawRepresentative` is pushed to
 /// `dim_reps` per EMITTED interval, in the same order.
-pub(crate) fn compute_pairs<const RECORD: bool>(
-    columns: &[Simplex128],
+pub(crate) fn compute_pairs<const K: usize, S: PackedSimplex<K>, const RECORD: bool>(
+    columns: &[S],
     dist: &BitCsrDistanceMatrix,
     dim_intervals: &mut Vec<PersistenceInterval>,
-    dim_reps: &mut Vec<RawRepresentative>,
-) -> FxHashMap<Simplex128, usize> {
-    let mut pivot_column_index: FxHashMap<Simplex128, usize> =
+    dim_reps: &mut Vec<RawRepresentative<S>>,
+) -> FxHashMap<S, usize> {
+    let mut pivot_column_index: FxHashMap<S, usize> =
         FxHashMap::with_capacity_and_hasher(columns.len(), Default::default());
     if columns.is_empty() {
         return pivot_column_index;
     }
 
-    let mut v_matrix = CompressedSparseMatrix::new();
+    let mut v_matrix: CompressedSparseMatrix<S> = CompressedSparseMatrix::new();
 
     // Working buffers grow on demand; the prealloc is a warm start, not a bound.
     // Cap it so huge column counts don't reserve gigabytes speculatively
     // (2 buffers x 16 B/entry: the cap bounds the upfront cost to ~16 MiB each).
     let cap = (columns.len() * 4).clamp(1024, 1 << 20);
-    let mut working_v: Vec<Simplex128> = Vec::with_capacity(cap);
-    let mut working_coboundary = FastHeap::with_capacity(cap);
+    let mut working_v: Vec<S> = Vec::with_capacity(cap);
+    let mut working_coboundary: FastHeap<S> = FastHeap::with_capacity(cap);
 
     for (j, &sigma) in columns.iter().enumerate() {
         working_v.clear();

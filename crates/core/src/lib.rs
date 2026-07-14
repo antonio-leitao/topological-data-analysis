@@ -10,8 +10,19 @@ use preprocess::edgelist::EdgeList;
 pub use error::{Error, Result};
 pub use types::{BarcodeResult, PersistenceInterval, Representative, RepresentedBarcode};
 
-pub const MAX_POINTS: usize = u16::MAX as usize;
-pub const MAX_DIM: usize = 4;
+/// Maximum number of points: bounded by `Simplex256`'s 24-bit vertex slots
+/// (`id + 1 < 2^24`, ids `0..n-1` ⇒ `n <= 2^24 - 1`).
+pub const MAX_POINTS: usize = (1 << 24) - 1;
+/// Maximum homology dimension: bounded by `Simplex256`'s 9 vertex slots
+/// (columns of dimension 7 have 8 vertices; their cofacets have 9).
+pub const MAX_DIM: usize = 7;
+
+/// Bounds of the narrow (`Simplex128`) engine arm: 16-bit vertex slots
+/// (`id + 1 <= u16::MAX` ⇒ `n <= u16::MAX`) and 6 vertex slots (max_dim 4).
+/// Inputs within BOTH bounds take the narrow arm; anything else takes
+/// `Simplex256`.
+const S128_MAX_POINTS: usize = u16::MAX as usize;
+const S128_MAX_DIM: usize = 4;
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // Configuration
@@ -373,18 +384,42 @@ fn apply_optimizations(edges: &mut EdgeList, config: &Config) {
 
 /// Reduce an `EdgeList` to a barcode through the BitCSR backend. The homology
 /// back-half, mirroring `count_cliques` for the filtration-size path.
+///
+/// SIMPLEX DISPATCH: the engine is generic over the packed-simplex layout
+/// (`PackedSimplex<K>`, where `K` is the layout's vertex capacity and sizes
+/// every engine scratch array at compile time); this is where the
+/// instantiation is chosen. Inputs fitting `Simplex128` (16-bit ids, 6
+/// slots) take the narrow arm — the fast path for `n <= 65_535` and
+/// `max_dim <= 4`, bit-identical to the pre-generic engine. Everything else
+/// (more points, or deeper dimensions at any size) takes `Simplex256`
+/// (24-bit ids, 9 slots). Both arms produce identical barcodes on shared
+/// inputs — the packing changes, the reduction order does not.
 #[inline]
 fn compute_barcode(edges: EdgeList, max_dim: usize, parallel: bool) -> BarcodeResult {
+    let use_s128 = edges.n <= S128_MAX_POINTS && max_dim <= S128_MAX_DIM;
     let bitcsr = engine::BitCsrDistanceMatrix::from_edge_list(edges);
-    engine::algorithm::compute(&bitcsr, max_dim, parallel)
+    if use_s128 {
+        engine::algorithm::compute::<6, engine::simplex::Simplex128>(&bitcsr, max_dim, parallel)
+    } else {
+        engine::algorithm::compute::<9, engine::simplex::Simplex256>(&bitcsr, max_dim, parallel)
+    }
 }
 
 /// [`compute_barcode`]'s recording sibling: same pipeline, monomorphised with
-/// representative capture enabled.
+/// representative capture enabled. Simplex dispatch mirrors [`compute_barcode`].
 #[inline]
 fn compute_represented_barcode(edges: EdgeList, max_dim: usize, parallel: bool) -> RepresentedBarcode {
+    let use_s128 = edges.n <= S128_MAX_POINTS && max_dim <= S128_MAX_DIM;
     let bitcsr = engine::BitCsrDistanceMatrix::from_edge_list(edges);
-    engine::algorithm::compute_with_representatives(&bitcsr, max_dim, parallel)
+    if use_s128 {
+        engine::algorithm::compute_with_representatives::<6, engine::simplex::Simplex128>(
+            &bitcsr, max_dim, parallel,
+        )
+    } else {
+        engine::algorithm::compute_with_representatives::<9, engine::simplex::Simplex256>(
+            &bitcsr, max_dim, parallel,
+        )
+    }
 }
 
 /// Recover the ambient dimension of a row-major point cloud from its flat length.
@@ -949,6 +984,70 @@ mod pipeline_tests {
 
         let err = persistent_homology_sparse(&[0, 7], &[1, 0], &[1.0, 2.0], 4, 1).unwrap_err();
         assert!(matches!(err, Error::SparseIndexOutOfRange { .. }));
+    }
+
+    /// max_dim > 4 forces the Simplex256 arm even for tiny inputs; the
+    /// shared dimensions must match the Simplex128 arm bit-for-bit, and the
+    /// deep dimensions of a 4-point space are empty.
+    #[test]
+    fn deep_dimension_dispatches_to_simplex256() {
+        let (points, _) = ring_distances();
+        let wide = persistent_homology(&points, 4, 5).unwrap();
+        let narrow = persistent_homology(&points, 4, 1).unwrap();
+        assert_eq!(wide.intervals.len(), 6);
+        for d in 0..=1 {
+            let key = |ivs: &[PersistenceInterval]| {
+                let mut v: Vec<_> = ivs
+                    .iter()
+                    .map(|iv| (iv.birth.to_bits(), iv.death.to_bits()))
+                    .collect();
+                v.sort_unstable();
+                v
+            };
+            assert_eq!(key(&wide.intervals[d]), key(&narrow.intervals[d]), "dim {d}");
+        }
+        for d in 2..=5 {
+            assert!(wide.intervals[d].is_empty(), "dim {d} must be empty");
+        }
+    }
+
+    /// Deep dimensions composed with the quotient transform (the intended
+    /// HPC configuration): the wide arm must run the coned filtration and
+    /// agree with the narrow arm on shared dimensions.
+    #[test]
+    fn quotient_composes_with_deep_dimensions() {
+        let mut s: u64 = 0x0dd5_eed5_4321_8765;
+        let mut rng = || {
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
+            (s >> 40) as f32 / 16_777_216.0
+        };
+        let n = 24;
+        let points: Vec<f32> = (0..n * 3).map(|_| rng()).collect();
+        let cfg = config(true, true, false, false); // peel + quotient
+
+        let narrow = persistent_homology_with(&points, n, 2, &cfg).unwrap(); // S128 arm
+        let wide = persistent_homology_with(&points, n, 5, &cfg).unwrap(); // S256 arm
+
+        let key = |ivs: &[PersistenceInterval]| {
+            let mut v: Vec<_> = ivs
+                .iter()
+                .map(|iv| (iv.birth.to_bits(), iv.death.to_bits()))
+                .collect();
+            v.sort_unstable();
+            v
+        };
+        for d in 0..=2 {
+            assert_eq!(key(&wide.intervals[d]), key(&narrow.intervals[d]), "dim {d}");
+        }
+    }
+
+    #[test]
+    fn max_dim_above_cap_errors() {
+        let (points, _) = ring_distances();
+        let err = persistent_homology(&points, 4, MAX_DIM + 1).unwrap_err();
+        assert!(matches!(err, Error::DimTooLarge { .. }));
     }
 
     #[test]

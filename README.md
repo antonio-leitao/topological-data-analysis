@@ -27,6 +27,13 @@ distance matrices, or sparse distance graphs. The engine is an enhanced
 Ripser-style[^ripser] reduction written in Rust, available through both Python
 and Rust APIs.
 
+Limits: up to 16,777,215 points and homology dimension 7. Internally the
+engine picks between two packed-simplex layouts — a 128-bit one (up to 65,535
+points and H4, the fastest path) and a 256-bit one (everything else) — with
+identical output on shared inputs. Deep dimensions and large point counts are
+most practical together with `quotient`, which trades exactness for a
+`log(3)`-interleaved approximation at a fraction of the cost.
+
 > [!CAUTION]
 > TDA is in an early stage of development. APIs may change between releases.
 
@@ -134,7 +141,7 @@ parameters:
 | Parameter         | Type                   | Default | Description                                                                                                                                                                                                                                       |
 | ----------------- | ---------------------- | ------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `data`            | `np.ndarray` or sparse | —       | Two-dimensional `float32` or `float64` array (`float64` is cast to `float32`) — shape `(n, d)` for a point cloud, `(n, n)` for a distance matrix — or a square `scipy.sparse` distance matrix. Inputs are copied into row-major internal storage. |
-| `max_dim`         | `int`                  | `1`     | Highest homology dimension to compute. Capped at 4.                                                                                                                                                                                               |
+| `max_dim`         | `int`                  | `1`     | Highest homology dimension to compute. Capped at 7.                                                                                                                                                                                               |
 | `threshold`       | `float \| None`        | `None`  | Maximum filtration value. `None` uses the enclosing radius; an explicit value is capped by that radius.                                                                                                                                           |
 | `distance_matrix` | `bool`                 | `False` | Interpret `data` as a square distance matrix. Symmetry, zero diagonal, and non-negativity are assumed rather than validated. Ignored for sparse input, which is always a distance graph.                                                          |
 | `quotient`        | `bool`                 | `False` | Use the smaller quotient-cover filtration.[^quotient] This is an approximation with a `log(3)` interleaving guarantee, not the exact Vietoris–Rips barcode.                                                                                       |
@@ -154,7 +161,7 @@ The Rust crate is published as
 
 ```toml
 [dependencies]
-tda_core = "0.3"
+tda_core = "0.4"
 ```
 
 For a point cloud, pass a flat row-major `(n, d)` slice. The ambient dimension

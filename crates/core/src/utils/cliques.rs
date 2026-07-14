@@ -249,8 +249,8 @@ mod tests {
                             let distance = rng();
                             if distance <= thr {
                                 edges.push(Edge {
-                                    u: u as u16,
-                                    v: v as u16,
+                                    u: u as u32,
+                                    v: v as u32,
                                     distance,
                                 });
                             }
@@ -270,7 +270,7 @@ mod tests {
 
     #[test]
     fn parallel_matches_sequential() {
-        let n = 96u16;
+        let n = 96u32;
         let edges: Vec<Edge> = (1..n)
             .flat_map(|u| {
                 (0..u).map(move |v| Edge {

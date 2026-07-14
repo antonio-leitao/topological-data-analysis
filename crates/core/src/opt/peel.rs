@@ -22,7 +22,7 @@ fn bit_set(bits: &[u64], i: usize) -> bool {
 /// immutable; emptied words stay as zeros and are skipped by the walks.
 struct SparseRows {
     row_ptr: Vec<u32>,
-    block_ids: Vec<u16>,
+    block_ids: Vec<u32>,
     words: Vec<u64>,
 }
 
@@ -35,7 +35,7 @@ impl SparseRows {
         for v in 0..n {
             adj_ptr[v + 1] = adj_ptr[v] + (deg[v] - 1);
         }
-        let mut adj = vec![0u16; adj_ptr[n] as usize];
+        let mut adj = vec![0u32; adj_ptr[n] as usize];
         let mut fill: Vec<u32> = adj_ptr.clone();
         for edge in edges {
             adj[fill[edge.u as usize] as usize] = edge.v;
@@ -48,22 +48,22 @@ impl SparseRows {
         // blocks in sorted order. O(deg) per row, one nw-word scratch total.
         let nw = (n + 63) >> 6;
         let mut scratch = vec![0u64; nw];
-        let mut touched: Vec<u16> = Vec::new();
+        let mut touched: Vec<u32> = Vec::new();
         let mut row_ptr = Vec::with_capacity(n + 1);
         row_ptr.push(0u32);
-        let mut block_ids: Vec<u16> = Vec::new();
+        let mut block_ids: Vec<u32> = Vec::new();
         let mut words: Vec<u64> = Vec::new();
 
         for v in 0..n {
             touched.clear();
-            for id in std::iter::once(v as u16).chain(
+            for id in std::iter::once(v as u32).chain(
                 adj[adj_ptr[v] as usize..adj_ptr[v + 1] as usize]
                     .iter()
                     .copied(),
             ) {
                 let b = (id >> 6) as usize;
                 if scratch[b] == 0 {
-                    touched.push(b as u16);
+                    touched.push(b as u32);
                 }
                 scratch[b] |= 1u64 << (id & 63);
             }
@@ -116,7 +116,7 @@ impl SparseRows {
     #[inline]
     fn clear(&mut self, v: usize, u: usize) {
         let r = self.range(v);
-        let block = (u >> 6) as u16;
+        let block = (u >> 6) as u32;
         let idx = self.block_ids[r.clone()]
             .binary_search(&block)
             .expect("clearing an edge that was never stored");
@@ -226,7 +226,7 @@ pub(crate) fn peel(edge_list: &mut EdgeList, parallel: bool) {
             }
 
             // Candidates z ∈ N(w) ∩ ball, ascending id over w's occupied blocks.
-            let w_block = (w >> 6) as u16;
+            let w_block = (w >> 6) as u32;
             let w_mask = !(1u64 << (w & 63));
             let mut found = false;
             'search: for i in rows.range(w) {
@@ -313,7 +313,7 @@ mod tests {
     use super::*;
     use crate::preprocess::edgelist::EdgeList;
 
-    fn unit_edge(u: u16, v: u16) -> Edge {
+    fn unit_edge(u: u32, v: u32) -> Edge {
         Edge {
             u,
             v,
@@ -355,7 +355,7 @@ mod tests {
     fn sparse_rows_cross_block_ids() {
         // Star centered at 100 with leaves straddling three 64-bit blocks.
         let n = 200usize;
-        let leaves = [3u16, 63, 64, 65, 127, 128, 199];
+        let leaves = [3u32, 63, 64, 65, 127, 128, 199];
         let edges: Vec<Edge> = leaves
             .iter()
             .map(|&l| {
@@ -412,7 +412,7 @@ mod tests {
         matrix
     }
 
-    fn assert_finalized(edge_list: &EdgeList, center: u16, initial_threshold: f32) {
+    fn assert_finalized(edge_list: &EdgeList, center: u32, initial_threshold: f32) {
         assert_eq!(edge_list.center, center);
         assert!(edge_list.sorted);
         assert!(edge_list.threshold <= initial_threshold);

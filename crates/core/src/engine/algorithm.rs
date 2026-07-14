@@ -4,9 +4,10 @@
 //
 // This file owns the algorithm logic that turns a `BitCsrDistanceMatrix` into a
 // barcode: the dimension driver (`compute`), H0 via union-find, cofacet/edge
-// enumeration into `Simplex128`, apparent-pair detection, and next-dimension
+// enumeration into packed simplices, apparent-pair detection, and next-dimension
 // candidate assembly (including the rayon-parallel path). The matrix reduction
-// loop itself lives in `reduction.rs`.
+// loop itself lives in `reduction.rs`. Everything is generic over the
+// `PackedSimplex` layout; `lib.rs` chooses the instantiation from `n`.
 //
 // Everything here drives the data structure through its primitive bit/neighbour
 // operations (`for_each_common_neighbor`, `edge_dist`, …); the `BitCsr` type
@@ -14,7 +15,7 @@
 
 use crate::engine::bitcsr::BitCsrDistanceMatrix;
 use crate::engine::reduction::{compute_pairs, RawRepresentative};
-use crate::engine::simplex::{encode_filtration, FxHashMap, Simplex128};
+use crate::engine::simplex::{encode_filtration, CofacetBuilder, FxHashMap, PackedSimplex};
 use crate::types::{BarcodeResult, PersistenceInterval, Representative, RepresentedBarcode};
 
 /// Minimum number of input simplices before `assemble_candidates` uses rayon.
@@ -67,17 +68,20 @@ impl UnionFind {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// Edge & cofacet enumeration — build Simplex128 from the BitCSR primitives
+// Edge & cofacet enumeration — build packed simplices from the BitCSR primitives
 // ═══════════════════════════════════════════════════════════════════════════════
 
 /// Enumerate every stored 1-simplex (edge), each exactly once (the larger
 /// endpoint stored first), with its diameter encoded. Used to seed H0. Return
 /// `false` from `f` to stop early.
-pub(crate) fn for_each_edge(dist: &BitCsrDistanceMatrix, mut f: impl FnMut(Simplex128) -> bool) {
+pub(crate) fn for_each_edge<const K: usize, S: PackedSimplex<K>>(
+    dist: &BitCsrDistanceMatrix,
+    mut f: impl FnMut(S) -> bool,
+) {
     for v in 0..dist.n() {
         let mut stop = false;
         dist.for_each_neighbor_above(v, |w, d| {
-            if !f(Simplex128::from_sorted_desc(d, &[w, v as u16])) {
+            if !f(S::from_sorted_desc(d, &[w, v as u32])) {
                 stop = true;
                 return false;
             }
@@ -100,11 +104,11 @@ pub(crate) fn for_each_edge(dist: &BitCsrDistanceMatrix, mut f: impl FnMut(Simpl
 ///
 /// Return `false` from `f` to stop early.
 #[inline]
-pub(crate) fn for_each_cofacet(
+pub(crate) fn for_each_cofacet<const K: usize, S: PackedSimplex<K>>(
     dist: &BitCsrDistanceMatrix,
-    sigma: Simplex128,
+    sigma: S,
     all_cofacets: bool,
-    mut f: impl FnMut(Simplex128) -> bool,
+    mut f: impl FnMut(S) -> bool,
 ) {
     let vc = sigma.vertex_count();
     if vc == 0 {
@@ -118,14 +122,11 @@ pub(crate) fn for_each_cofacet(
     } else {
         sigma.largest_vertex() as i32
     };
-    // Cache the cofacet-construction masks; they depend only on the insertion
-    // rank `vi`, which advances monotonically as the youngest-first neighbour id
-    // descends past σ's vertices.
-    let payload = sigma.vertex_key();
+    // The builder caches the cofacet-construction masks; they depend only on
+    // the insertion rank `vi`, which advances monotonically as the
+    // youngest-first neighbour id descends past σ's vertices.
+    let mut builder = sigma.cofacet_builder();
     let mut vi = 0usize;
-    let mut payload_upper: u128 = 0;
-    let mut payload_lower_shifted: u128 = payload >> 16;
-    let mut insert_shift: u32 = 80;
 
     dist.for_each_common_neighbor(&verts, vc, floor, |w, extra| {
         let old_vi = vi;
@@ -133,22 +134,11 @@ pub(crate) fn for_each_cofacet(
             vi += 1;
         }
         if vi != old_vi {
-            let split = 96 - (vi as u32) * 16;
-            let upper_mask = (!0u128) << split;
-            payload_upper = payload & upper_mask;
-            payload_lower_shifted = (payload & !upper_mask) >> 16;
-            insert_shift = split - 16;
+            builder.set_rank(vi);
         }
 
         let diam = if extra > base { extra } else { base };
-        let w_ins = (w as u128) + 1;
-        let cof = Simplex128(
-            ((encode_filtration(diam) as u128) << 96)
-                | payload_upper
-                | (w_ins << insert_shift)
-                | payload_lower_shifted,
-        );
-        f(cof)
+        f(builder.build(w, encode_filtration(diam)))
     });
 }
 
@@ -163,12 +153,12 @@ pub(crate) fn for_each_cofacet(
 /// First common neighbour whose max edge distance to the set is ≤ `max_extra`
 /// (youngest-first), or `None`.
 #[inline]
-fn first_common_neighbor_le(
+fn first_common_neighbor_le<const K: usize>(
     dist: &BitCsrDistanceMatrix,
-    verts: &[u16; 6],
+    verts: &[u32; K],
     vc: usize,
     max_extra: f32,
-) -> Option<u16> {
+) -> Option<u32> {
     let mut result = None;
     dist.for_each_common_neighbor(verts, vc, -1, |w, extra| {
         if extra <= max_extra {
@@ -183,7 +173,12 @@ fn first_common_neighbor_le(
 
 /// Diameter of the facet of `verts[0..vc]` obtained by removing slot `skip`.
 #[inline]
-fn facet_diameter(dist: &BitCsrDistanceMatrix, verts: &[u16; 6], vc: usize, skip: usize) -> f32 {
+fn facet_diameter<const K: usize>(
+    dist: &BitCsrDistanceMatrix,
+    verts: &[u32; K],
+    vc: usize,
+    skip: usize,
+) -> f32 {
     let mut diam = 0.0f32;
     for i in 0..vc {
         if i == skip {
@@ -205,9 +200,9 @@ fn facet_diameter(dist: &BitCsrDistanceMatrix, verts: &[u16; 6], vc: usize, skip
 /// Bitmask (over `edge_bit(i, j)`) of the edges whose encoded distance equals
 /// `diam_bits` — the "diameter edges" of the vertex set.
 #[inline]
-fn diameter_edge_mask(
+fn diameter_edge_mask<const K: usize>(
     dist: &BitCsrDistanceMatrix,
-    verts: &[u16; 6],
+    verts: &[u32; K],
     vc: usize,
     diam_bits: u32,
 ) -> u64 {
@@ -215,7 +210,7 @@ fn diameter_edge_mask(
     for i in 0..vc {
         for j in (i + 1)..vc {
             if dist.edge_dist_bits(verts[i], verts[j]) == diam_bits {
-                mask |= edge_bit(i, j);
+                mask |= edge_bit::<K>(i, j);
             }
         }
     }
@@ -224,14 +219,17 @@ fn diameter_edge_mask(
 
 /// Oldest same-diameter facet of `tau`, or `None`.
 #[inline]
-fn zero_pivot_facet(dist: &BitCsrDistanceMatrix, tau: Simplex128) -> Option<Simplex128> {
+fn zero_pivot_facet<const K: usize, S: PackedSimplex<K>>(
+    dist: &BitCsrDistanceMatrix,
+    tau: S,
+) -> Option<S> {
     let target = tau.filtration_encoded();
     let verts = tau.vertices();
     let vc = tau.vertex_count();
 
     if vc >= 3 {
         let diam_edges = diameter_edge_mask(dist, &verts, vc, !target);
-        if let Some(skip) = oldest_same_diam_facet_slot(vc, diam_edges) {
+        if let Some(skip) = oldest_same_diam_facet_slot::<K>(vc, diam_edges) {
             return Some(tau.remove_vertex_at(skip, target));
         }
         return None;
@@ -248,7 +246,10 @@ fn zero_pivot_facet(dist: &BitCsrDistanceMatrix, tau: Simplex128) -> Option<Simp
 
 /// Youngest same-diameter cofacet of `sigma`, or `None`.
 #[inline]
-fn zero_pivot_cofacet(dist: &BitCsrDistanceMatrix, sigma: Simplex128) -> Option<Simplex128> {
+fn zero_pivot_cofacet<const K: usize, S: PackedSimplex<K>>(
+    dist: &BitCsrDistanceMatrix,
+    sigma: S,
+) -> Option<S> {
     let same_diam = sigma.filtration();
     let vc = sigma.vertex_count();
     if vc == 0 {
@@ -262,10 +263,10 @@ fn zero_pivot_cofacet(dist: &BitCsrDistanceMatrix, sigma: Simplex128) -> Option<
 /// If `tau` is the cofacet side of an apparent pair, return its facet partner φ.
 /// Used as the reduction shortcut.
 #[inline]
-pub(crate) fn zero_apparent_facet(
+pub(crate) fn zero_apparent_facet<const K: usize, S: PackedSimplex<K>>(
     dist: &BitCsrDistanceMatrix,
-    tau: Simplex128,
-) -> Option<Simplex128> {
+    tau: S,
+) -> Option<S> {
     let phi = zero_pivot_facet(dist, tau)?;
     let tau_check = zero_pivot_cofacet(dist, phi)?;
     if tau_check == tau {
@@ -278,7 +279,10 @@ pub(crate) fn zero_apparent_facet(
 /// If `sigma` is the facet side of an apparent pair, return its cofacet partner
 /// τ. Used by H0 to skip already-paired edges.
 #[inline]
-fn zero_apparent_cofacet(dist: &BitCsrDistanceMatrix, sigma: Simplex128) -> Option<Simplex128> {
+fn zero_apparent_cofacet<const K: usize, S: PackedSimplex<K>>(
+    dist: &BitCsrDistanceMatrix,
+    sigma: S,
+) -> Option<S> {
     let tau = zero_pivot_cofacet(dist, sigma)?;
     let phi = zero_pivot_facet(dist, tau)?;
     if phi == sigma {
@@ -292,15 +296,15 @@ fn zero_apparent_cofacet(dist: &BitCsrDistanceMatrix, sigma: Simplex128) -> Opti
 // H0: enumerate edges, Kruskal, split into simplices + columns_to_reduce
 // ═══════════════════════════════════════════════════════════════════════════════
 
-fn compute_h0<const RECORD: bool>(
+fn compute_h0<const K: usize, S: PackedSimplex<K>, const RECORD: bool>(
     dist: &BitCsrDistanceMatrix,
     intervals: &mut Vec<PersistenceInterval>,
-    reps: &mut Vec<RawRepresentative>,
+    reps: &mut Vec<RawRepresentative<S>>,
     parallel: bool,
-) -> (Vec<Simplex128>, Vec<Simplex128>) {
+) -> (Vec<S>, Vec<S>) {
     let n = dist.n();
 
-    let mut edges: Vec<Simplex128> = Vec::new();
+    let mut edges: Vec<S> = Vec::new();
     for_each_edge(dist, |edge| {
         edges.push(edge);
         true
@@ -322,8 +326,8 @@ fn compute_h0<const RECORD: bool>(
     // Every vertex is born at 0, so the elder rule reduces to an id
     // convention: the surviving class keeps the smaller minimum, the dying
     // class is named by the larger one (matching Ripser's vertex pairing).
-    let mut comp_min: Vec<u16> = if RECORD {
-        (0..n).map(|v| v as u16).collect()
+    let mut comp_min: Vec<u32> = if RECORD {
+        (0..n).map(|v| v as u32).collect()
     } else {
         Vec::new()
     };
@@ -347,7 +351,7 @@ fn compute_h0<const RECORD: bool>(
                 if RECORD {
                     let dying = comp_min[ra].max(comp_min[rb]);
                     reps.push(RawRepresentative {
-                        birth: Simplex128::from_sorted_desc(0.0, &[dying]),
+                        birth: S::from_sorted_desc(0.0, &[dying]),
                         death: Some(edge),
                         cocycle: Vec::new(),
                     });
@@ -382,7 +386,7 @@ fn compute_h0<const RECORD: bool>(
         for v in 0..n {
             if uf.find(v) == v {
                 reps.push(RawRepresentative {
-                    birth: Simplex128::from_sorted_desc(0.0, &[comp_min[v]]),
+                    birth: S::from_sorted_desc(0.0, &[comp_min[v]]),
                     death: None,
                     cocycle: Vec::new(),
                 });
@@ -413,13 +417,13 @@ fn compute_h0<const RECORD: bool>(
 /// by giving each worker its own buffers and concatenating; the final sort makes
 /// the merge order irrelevant. The size guard keeps small inputs (and every
 /// H1/small-dataset case) on the allocation-free sequential path.
-pub(crate) fn assemble_candidates(
+pub(crate) fn assemble_candidates<const K: usize, S: PackedSimplex<K>>(
     dist: &BitCsrDistanceMatrix,
-    simplices: &mut Vec<Simplex128>,
-    cleared_pivots: &FxHashMap<Simplex128, usize>,
+    simplices: &mut Vec<S>,
+    cleared_pivots: &FxHashMap<S, usize>,
     build_pool: bool,
     parallel: bool,
-) -> Vec<Simplex128> {
+) -> Vec<S> {
     if simplices.is_empty() {
         return Vec::new();
     }
@@ -430,7 +434,7 @@ pub(crate) fn assemble_candidates(
         use rayon::prelude::*;
         // Collect per-worker buffers, then merge once with an exact reservation.
         // (A tree reduce would recopy each element O(log workers) times.)
-        let workers: Vec<(Vec<Simplex128>, Vec<Simplex128>)> = simplices
+        let workers: Vec<(Vec<S>, Vec<S>)> = simplices
             .par_iter()
             .fold(
                 || (Vec::new(), Vec::new()),
@@ -460,12 +464,12 @@ pub(crate) fn assemble_candidates(
         }
         (next, cols)
     } else {
-        let mut next_simplices: Vec<Simplex128> = if build_pool {
+        let mut next_simplices: Vec<S> = if build_pool {
             Vec::with_capacity(simplices.len() * 2)
         } else {
             Vec::new()
         };
-        let mut columns_to_reduce: Vec<Simplex128> = Vec::with_capacity(simplices.len());
+        let mut columns_to_reduce: Vec<S> = Vec::with_capacity(simplices.len());
         for &sigma in simplices.iter() {
             assemble_one(
                 dist,
@@ -492,13 +496,13 @@ pub(crate) fn assemble_candidates(
 }
 
 #[inline]
-fn assemble_one(
+fn assemble_one<const K: usize, S: PackedSimplex<K>>(
     dist: &BitCsrDistanceMatrix,
-    sigma: Simplex128,
-    cleared_pivots: &FxHashMap<Simplex128, usize>,
+    sigma: S,
+    cleared_pivots: &FxHashMap<S, usize>,
     build_pool: bool,
-    next_simplices: &mut Vec<Simplex128>,
-    columns_to_reduce: &mut Vec<Simplex128>,
+    next_simplices: &mut Vec<S>,
+    columns_to_reduce: &mut Vec<S>,
 ) {
     if sigma.vertex_count() == 2 {
         assemble_edge_candidates(
@@ -522,13 +526,13 @@ fn assemble_one(
 }
 
 #[inline]
-fn assemble_edge_candidates(
+fn assemble_edge_candidates<const K: usize, S: PackedSimplex<K>>(
     dist: &BitCsrDistanceMatrix,
-    sigma: Simplex128,
-    cleared_pivots: &FxHashMap<Simplex128, usize>,
+    sigma: S,
+    cleared_pivots: &FxHashMap<S, usize>,
     build_pool: bool,
-    next_simplices: &mut Vec<Simplex128>,
-    columns_to_reduce: &mut Vec<Simplex128>,
+    next_simplices: &mut Vec<S>,
+    columns_to_reduce: &mut Vec<S>,
 ) {
     let verts = sigma.vertices();
     let v0 = verts[0];
@@ -540,7 +544,7 @@ fn assemble_edge_candidates(
     dist.for_each_common_neighbor_edges(v0, v1, floor, |w, d0, d1| {
         let extra = d0.max(d1);
         let diam = base.max(extra);
-        let tau = Simplex128::from_sorted_desc(diam, &[w, v0, v1]);
+        let tau = S::from_sorted_desc(diam, &[w, v0, v1]);
         if build_pool {
             next_simplices.push(tau);
         }
@@ -549,15 +553,18 @@ fn assemble_edge_candidates(
             let diam_bits = diam.to_bits();
             let mut diam_edges = 0u64;
             if d0.to_bits() == diam_bits {
-                diam_edges |= edge_bit(0, 1);
+                diam_edges |= edge_bit::<K>(0, 1);
             }
             if d1.to_bits() == diam_bits {
-                diam_edges |= edge_bit(0, 2);
+                diam_edges |= edge_bit::<K>(0, 2);
             }
             if base_bits == diam_bits {
-                diam_edges |= edge_bit(1, 2);
+                diam_edges |= edge_bit::<K>(1, 2);
             }
-            let tau_verts = [w, v0, v1, 0, 0, 0];
+            let mut tau_verts = [0u32; K];
+            tau_verts[0] = w;
+            tau_verts[1] = v0;
+            tau_verts[2] = v1;
             if keep_fused_candidate(dist, tau, &tau_verts, 3, diam_edges) {
                 columns_to_reduce.push(tau);
             }
@@ -567,13 +574,13 @@ fn assemble_edge_candidates(
 }
 
 #[inline]
-fn assemble_generic_candidates(
+fn assemble_generic_candidates<const K: usize, S: PackedSimplex<K>>(
     dist: &BitCsrDistanceMatrix,
-    sigma: Simplex128,
-    cleared_pivots: &FxHashMap<Simplex128, usize>,
+    sigma: S,
+    cleared_pivots: &FxHashMap<S, usize>,
     build_pool: bool,
-    next_simplices: &mut Vec<Simplex128>,
-    columns_to_reduce: &mut Vec<Simplex128>,
+    next_simplices: &mut Vec<S>,
+    columns_to_reduce: &mut Vec<S>,
 ) {
     for_each_cofacet(dist, sigma, false, |tau| {
         if build_pool {
@@ -594,10 +601,10 @@ fn assemble_generic_candidates(
 /// A cofacet τ survives iff it is NOT the facet side and NOT the cofacet side of
 /// an apparent pair (the fused apparent-pair filter).
 #[inline]
-fn keep_fused_candidate(
+fn keep_fused_candidate<const K: usize, S: PackedSimplex<K>>(
     dist: &BitCsrDistanceMatrix,
-    tau: Simplex128,
-    tau_verts: &[u16; 6],
+    tau: S,
+    tau_verts: &[u32; K],
     vc: usize,
     diam_edges: u64,
 ) -> bool {
@@ -606,18 +613,18 @@ fn keep_fused_candidate(
 }
 
 #[inline]
-fn is_zero_apparent_cofacet_side(
+fn is_zero_apparent_cofacet_side<const K: usize, S: PackedSimplex<K>>(
     dist: &BitCsrDistanceMatrix,
-    tau: Simplex128,
-    tau_verts: &[u16; 6],
+    tau: S,
+    tau_verts: &[u32; K],
     vc: usize,
     diam_edges: u64,
 ) -> bool {
-    let Some(skip) = oldest_same_diam_facet_slot(vc, diam_edges) else {
+    let Some(skip) = oldest_same_diam_facet_slot::<K>(vc, diam_edges) else {
         return false;
     };
 
-    let mut facet_verts = [0u16; 6];
+    let mut facet_verts = [0u32; K];
     let mut out = 0usize;
     for i in 0..vc {
         if i != skip {
@@ -630,14 +637,14 @@ fn is_zero_apparent_cofacet_side(
 }
 
 #[inline]
-fn is_zero_apparent_facet_side(
+fn is_zero_apparent_facet_side<const K: usize, S: PackedSimplex<K>>(
     dist: &BitCsrDistanceMatrix,
-    tau: Simplex128,
-    tau_verts: &[u16; 6],
+    tau: S,
+    tau_verts: &[u32; K],
     vc: usize,
     diam_edges: u64,
 ) -> bool {
-    if vc >= 6 {
+    if vc >= K {
         return false;
     }
 
@@ -646,32 +653,40 @@ fn is_zero_apparent_facet_side(
     };
 
     let (_rho_verts, rank) = insert_vertex_desc(tau_verts, vc, w);
-    let mut rho_edges = remap_edge_mask_after_insert(diam_edges, vc, rank);
+    let mut rho_edges = remap_edge_mask_after_insert::<K>(diam_edges, vc, rank);
     let diam_bits = !tau.filtration_encoded();
     for i in 0..vc {
         if dist.edge_dist_bits(w, tau_verts[i]) == diam_bits {
             let j = if i >= rank { i + 1 } else { i };
             let (a, b) = if rank < j { (rank, j) } else { (j, rank) };
-            rho_edges |= edge_bit(a, b);
+            rho_edges |= edge_bit::<K>(a, b);
         }
     }
 
-    oldest_same_diam_facet_slot(vc + 1, rho_edges) == Some(rank)
+    oldest_same_diam_facet_slot::<K>(vc + 1, rho_edges) == Some(rank)
 }
 
 // ── Small combinatorial helpers for the apparent-pair / assembly logic ────────
 
-/// Encode edge `(i, j)` (with `i < j < 6`) as a single bit in a 64-bit mask.
+/// Encode edge `(i, j)` (with `i < j < K`) as a single bit in a 64-bit mask.
+/// Row-major `i * K + j` when that fits 64 bits (K <= 8; for Simplex128's
+/// K = 6 this is the historical one-`lea` packing), triangular
+/// `j*(j-1)/2 + i` otherwise (supports K <= 11). The branch is a constant
+/// per monomorphisation, and masks never cross instantiations.
 #[inline(always)]
-fn edge_bit(i: usize, j: usize) -> u64 {
-    debug_assert!(i < j && j < 6);
-    1u64 << (i * 6 + j)
+fn edge_bit<const K: usize>(i: usize, j: usize) -> u64 {
+    debug_assert!(i < j && j < K);
+    if K * K <= 64 {
+        1u64 << (i * K + j)
+    } else {
+        1u64 << (j * (j - 1) / 2 + i)
+    }
 }
 
 /// Given the mask of diameter edges, which slot to remove to obtain the oldest
 /// same-diameter facet, or `None` if there is no same-diameter facet.
 #[inline]
-fn oldest_same_diam_facet_slot(vc: usize, diam_edges: u64) -> Option<usize> {
+fn oldest_same_diam_facet_slot<const K: usize>(vc: usize, diam_edges: u64) -> Option<usize> {
     if vc < 3 || diam_edges == 0 {
         return None;
     }
@@ -681,7 +696,7 @@ fn oldest_same_diam_facet_slot(vc: usize, diam_edges: u64) -> Option<usize> {
                 continue;
             }
             for j in (i + 1)..vc {
-                if j != skip && (diam_edges & edge_bit(i, j)) != 0 {
+                if j != skip && (diam_edges & edge_bit::<K>(i, j)) != 0 {
                     return Some(skip);
                 }
             }
@@ -693,8 +708,12 @@ fn oldest_same_diam_facet_slot(vc: usize, diam_edges: u64) -> Option<usize> {
 /// Insert `w` into the descending vertex array, returning the new array and the
 /// insertion rank.
 #[inline]
-fn insert_vertex_desc(verts: &[u16; 6], vc: usize, w: u16) -> ([u16; 6], usize) {
-    let mut out = [0u16; 6];
+fn insert_vertex_desc<const K: usize>(
+    verts: &[u32; K],
+    vc: usize,
+    w: u32,
+) -> ([u32; K], usize) {
+    let mut out = [0u32; K];
     let mut i = 0usize;
     while i < vc && verts[i] > w {
         out[i] = verts[i];
@@ -711,16 +730,16 @@ fn insert_vertex_desc(verts: &[u16; 6], vc: usize, w: u16) -> ([u16; 6], usize) 
 
 /// Adjust an edge mask after inserting a new vertex at `rank`.
 #[inline]
-fn remap_edge_mask_after_insert(mask: u64, vc: usize, rank: usize) -> u64 {
+fn remap_edge_mask_after_insert<const K: usize>(mask: u64, vc: usize, rank: usize) -> u64 {
     let mut out = 0u64;
     for i in 0..vc {
         for j in (i + 1)..vc {
-            if (mask & edge_bit(i, j)) == 0 {
+            if (mask & edge_bit::<K>(i, j)) == 0 {
                 continue;
             }
             let ni = if i >= rank { i + 1 } else { i };
             let nj = if j >= rank { j + 1 } else { j };
-            out |= edge_bit(ni, nj);
+            out |= edge_bit::<K>(ni, nj);
         }
     }
     out
@@ -732,21 +751,29 @@ fn remap_edge_mask_after_insert(mask: u64, vc: usize, rank: usize) -> u64 {
 
 /// Barcode only — the hot entry point. Monomorphised with recording compiled
 /// out, so it pays nothing for the representatives machinery.
-pub fn compute(dist: &BitCsrDistanceMatrix, max_dim: usize, parallel: bool) -> BarcodeResult {
-    compute_impl::<false>(dist, max_dim, parallel).0
+pub fn compute<const K: usize, S: PackedSimplex<K>>(
+    dist: &BitCsrDistanceMatrix,
+    max_dim: usize,
+    parallel: bool,
+) -> BarcodeResult {
+    compute_impl::<K, S, false>(dist, max_dim, parallel).0
 }
 
 /// Barcode plus cocycle representatives (persistent cohomology), aligned
 /// index-for-index with the emitted intervals of each dimension.
-pub fn compute_with_representatives(
+pub fn compute_with_representatives<const K: usize, S: PackedSimplex<K>>(
     dist: &BitCsrDistanceMatrix,
     max_dim: usize,
     parallel: bool,
 ) -> RepresentedBarcode {
-    let (barcode, raw) = compute_impl::<true>(dist, max_dim, parallel);
+    let (barcode, raw) = compute_impl::<K, S, true>(dist, max_dim, parallel);
     let representatives = raw
         .into_iter()
-        .map(|dim| dim.into_iter().map(convert_representative).collect())
+        .map(|dim| {
+            dim.into_iter()
+                .map(convert_representative::<K, S>)
+                .collect()
+        })
         .collect();
     RepresentedBarcode {
         barcode,
@@ -755,32 +782,38 @@ pub fn compute_with_representatives(
 }
 
 /// Vertex ids (descending) of a packed simplex, for external consumption.
-fn simplex_vertices(simplex: Simplex128) -> Vec<u16> {
+fn simplex_vertices<const K: usize, S: PackedSimplex<K>>(simplex: S) -> Vec<u32> {
     let vc = simplex.vertex_count();
     simplex.vertices()[..vc].to_vec()
 }
 
-fn convert_representative(raw: RawRepresentative) -> Representative {
+fn convert_representative<const K: usize, S: PackedSimplex<K>>(
+    raw: RawRepresentative<S>,
+) -> Representative {
     Representative {
-        birth: simplex_vertices(raw.birth),
-        death: raw.death.map(simplex_vertices),
-        cocycle: raw.cocycle.into_iter().map(simplex_vertices).collect(),
+        birth: simplex_vertices::<K, S>(raw.birth),
+        death: raw.death.map(simplex_vertices::<K, S>),
+        cocycle: raw
+            .cocycle
+            .into_iter()
+            .map(simplex_vertices::<K, S>)
+            .collect(),
     }
 }
 
-fn compute_impl<const RECORD: bool>(
+fn compute_impl<const K: usize, S: PackedSimplex<K>, const RECORD: bool>(
     dist: &BitCsrDistanceMatrix,
     max_dim: usize,
     parallel: bool,
-) -> (BarcodeResult, Vec<Vec<RawRepresentative>>) {
+) -> (BarcodeResult, Vec<Vec<RawRepresentative<S>>>) {
     let mut intervals: Vec<Vec<PersistenceInterval>> = Vec::with_capacity(max_dim + 1);
-    let mut representatives: Vec<Vec<RawRepresentative>> = Vec::new();
+    let mut representatives: Vec<Vec<RawRepresentative<S>>> = Vec::new();
 
     // H0: union-find. No clearing input needed (no previous dim).
     let mut h0 = Vec::new();
     let mut h0_reps = Vec::new();
     let (mut simplices, mut columns_to_reduce) =
-        compute_h0::<RECORD>(dist, &mut h0, &mut h0_reps, parallel);
+        compute_h0::<K, S, RECORD>(dist, &mut h0, &mut h0_reps, parallel);
     intervals.push(h0);
     if RECORD {
         representatives.push(h0_reps);
@@ -801,7 +834,7 @@ fn compute_impl<const RECORD: bool>(
         // the pivots recorded at THIS dimension; its key set is the clearing
         // set consumed by assemble_candidates for dim+1.
         let pivots =
-            compute_pairs::<RECORD>(&columns_to_reduce, dist, &mut dim_intervals, &mut dim_reps);
+            compute_pairs::<K, S, RECORD>(&columns_to_reduce, dist, &mut dim_intervals, &mut dim_reps);
         intervals.push(dim_intervals);
         if RECORD {
             representatives.push(dim_reps);
@@ -829,8 +862,110 @@ fn compute_impl<const RECORD: bool>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::engine::simplex::{Simplex128, Simplex256};
     use crate::preprocess::edgelist::square_from_lower_tri;
     use crate::preprocess::edgelist::EdgeList;
+
+    /// Sorted (birth, death) bit-pairs per dimension — an exact multiset key.
+    fn barcode_key(bc: &BarcodeResult) -> Vec<Vec<(u32, u32)>> {
+        bc.intervals
+            .iter()
+            .map(|dim| {
+                let mut v: Vec<_> = dim
+                    .iter()
+                    .map(|iv| (iv.birth.to_bits(), iv.death.to_bits()))
+                    .collect();
+                v.sort_unstable();
+                v
+            })
+            .collect()
+    }
+
+    /// The Simplex256 instantiation must reproduce Simplex128's output
+    /// EXACTLY: the packing changes, but the Ripser order (filtration
+    /// descending, colex ties) — and therefore every pivot, apparent pair,
+    /// and emitted interval — does not. Random fixtures with and without
+    /// diameter ties, several thresholds and dimensions, barcodes AND
+    /// cocycle representatives.
+    #[test]
+    fn simplex256_engine_matches_simplex128() {
+        let mut s: u64 = 0x5eed_cafe_0123_4567;
+        let mut rng = || {
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
+            s
+        };
+
+        for &(n, levels) in &[(12usize, 0u64), (20, 0), (16, 4), (24, 3)] {
+            let m = n * (n - 1) / 2;
+            let lt: Vec<f32> = (0..m)
+                .map(|_| {
+                    if levels == 0 {
+                        (rng() >> 40) as f32 / 16_777_216.0
+                    } else {
+                        ((rng() % levels) as f32 + 1.0) * 0.5
+                    }
+                })
+                .collect();
+            let sq = square_from_lower_tri(n, &lt);
+
+            for &thr in &[0.4f32, 0.8, f32::INFINITY] {
+                for max_dim in 1..=3 {
+                    let edges = EdgeList::from_distance_matrix(&sq, n, thr);
+                    let bitcsr = BitCsrDistanceMatrix::from_edge_list(edges);
+
+                    let narrow = compute::<6, Simplex128>(&bitcsr, max_dim, false);
+                    let wide = compute::<9, Simplex256>(&bitcsr, max_dim, false);
+                    assert_eq!(
+                        barcode_key(&narrow),
+                        barcode_key(&wide),
+                        "barcode mismatch (n={n}, levels={levels}, thr={thr}, max_dim={max_dim})"
+                    );
+
+                    let narrow_reps =
+                        compute_with_representatives::<6, Simplex128>(&bitcsr, max_dim, false);
+                    let wide_reps =
+                        compute_with_representatives::<9, Simplex256>(&bitcsr, max_dim, false);
+                    assert_eq!(
+                        barcode_key(&narrow_reps.barcode),
+                        barcode_key(&wide_reps.barcode)
+                    );
+                    assert_eq!(
+                        narrow_reps.representatives, wide_reps.representatives,
+                        "representative mismatch (n={n}, thr={thr}, max_dim={max_dim})"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Octahedron through the wide engine: the H2 sphere class must appear
+    /// exactly as in the narrow engine (see `octahedron_h2`), and dimensions
+    /// 3..=5 of a 6-point space are empty.
+    #[test]
+    fn simplex256_deep_dims_on_octahedron() {
+        let s = std::f32::consts::SQRT_2;
+        let lt = [
+            2.0, // (1,0)
+            s, s, // (2,0), (2,1)
+            s, s, 2.0, // (3,0..2)
+            s, s, s, s, // (4,0..3)
+            s, s, s, s, 2.0, // (5,0..4)
+        ];
+        let sq = square_from_lower_tri(6, &lt);
+        let edges = EdgeList::from_distance_matrix(&sq, 6, f32::INFINITY);
+        let bitcsr = BitCsrDistanceMatrix::from_edge_list(edges);
+        let bc = compute::<9, Simplex256>(&bitcsr, 5, false);
+
+        assert_eq!(bc.intervals.len(), 6);
+        assert!(bc.intervals[2]
+            .iter()
+            .any(|iv| (iv.birth - s).abs() < 1e-5));
+        for d in 3..=5 {
+            assert!(bc.intervals[d].is_empty(), "H{d} of the octahedron");
+        }
+    }
 
     /// Build a BitCSR from a lower-triangular fixture (through the real pdist
     /// distance-matrix path) and run the engine.
@@ -838,7 +973,7 @@ mod tests {
         let sq = square_from_lower_tri(n, lt);
         let edges = EdgeList::from_distance_matrix(&sq, n, threshold);
         let bitcsr = BitCsrDistanceMatrix::from_edge_list(edges);
-        compute(&bitcsr, max_dim, true)
+        compute::<6, Simplex128>(&bitcsr, max_dim, true)
     }
 
     fn approx_eq(a: f32, b: f32, tol: f32) -> bool {
@@ -1004,8 +1139,8 @@ mod tests {
             );
             let bitcsr = BitCsrDistanceMatrix::from_edge_list(edges);
             let max_dim = 2;
-            let (bc, reps) = compute_impl::<true>(&bitcsr, max_dim, false);
-            let plain = compute(&bitcsr, max_dim, false);
+            let (bc, reps) = compute_impl::<6, Simplex128, true>(&bitcsr, max_dim, false);
+            let plain = compute::<6, Simplex128>(&bitcsr, max_dim, false);
 
             // Recording must not perturb the barcode, and reps align 1:1.
             assert_eq!(bc.intervals.len(), plain.intervals.len());

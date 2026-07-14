@@ -27,9 +27,9 @@ pub struct BarcodeResult {
 /// pair carries the information.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Representative {
-    pub birth: Vec<u16>,
-    pub death: Option<Vec<u16>>,
-    pub cocycle: Vec<Vec<u16>>,
+    pub birth: Vec<u32>,
+    pub death: Option<Vec<u32>>,
+    pub cocycle: Vec<Vec<u32>>,
 }
 
 /// Barcode plus cocycle representatives.

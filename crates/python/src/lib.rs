@@ -218,7 +218,7 @@ fn persistent_homology<'py>(
 
 /// Representative in transit to Python: (birth, death, cocycle) as vertex-id
 /// lists. Converted to the `tda.Representative` dataclass on the Python side.
-type PyRep = (Vec<u16>, Option<Vec<u16>>, Vec<Vec<u16>>);
+type PyRep = (Vec<u32>, Option<Vec<u32>>, Vec<Vec<u32>>);
 
 fn reps_to_py(reps: Vec<Vec<tda_core::Representative>>) -> Vec<Vec<PyRep>> {
     reps.into_iter()

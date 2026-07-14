@@ -24,8 +24,8 @@ const STAGING_SAMPLES: usize = 8;
 #[derive(Clone, Copy, Debug, PartialEq)]
 #[repr(C)]
 pub(crate) struct Edge {
-    pub(crate) u: u16,
-    pub(crate) v: u16,
+    pub(crate) u: u32,
+    pub(crate) v: u32,
     pub(crate) distance: f32,
 }
 
@@ -33,7 +33,7 @@ pub(crate) struct Edge {
 pub(crate) struct EdgeList {
     pub(crate) n: usize,
     pub(crate) edges: Vec<Edge>,
-    pub(crate) center: u16,
+    pub(crate) center: u32,
     pub(crate) threshold: f32,
     /// True only when `edges` is in ascending `(distance, endpoints)` order.
     pub(crate) sorted: bool,
@@ -49,7 +49,7 @@ impl EdgeList {
         parallel: bool,
     ) -> Self {
         debug_assert_eq!(data.len(), n * d);
-        debug_assert!(n <= u16::MAX as usize);
+        debug_assert!(n <= crate::MAX_POINTS);
         debug_assert!(threshold >= 0.0);
 
         if n < 2 {
@@ -80,7 +80,7 @@ impl EdgeList {
     /// Only the strict lower triangle is read; entries `>= f32::MAX` are absent.
     pub(crate) fn from_distance_matrix(mat: &[f32], n: usize, threshold: f32) -> Self {
         debug_assert_eq!(mat.len(), n * n);
-        debug_assert!(n <= u16::MAX as usize);
+        debug_assert!(n <= crate::MAX_POINTS);
         debug_assert!(threshold >= 0.0);
 
         if n < 2 {
@@ -135,8 +135,8 @@ impl EdgeList {
                 let distance = mat[row_base + j];
                 if distance <= effective && distance < NO_EDGE {
                     edges.push(Edge {
-                        u: i as u16,
-                        v: j as u16,
+                        u: i as u32,
+                        v: j as u32,
                         distance,
                     });
                 }
@@ -146,7 +146,7 @@ impl EdgeList {
         Self {
             n,
             edges,
-            center: center as u16,
+            center: center as u32,
             threshold: effective,
             sorted: false,
         }
@@ -170,7 +170,7 @@ impl EdgeList {
     ) -> Self {
         debug_assert_eq!(rows.len(), cols.len());
         debug_assert_eq!(rows.len(), vals.len());
-        debug_assert!(n <= u16::MAX as usize);
+        debug_assert!(n <= crate::MAX_POINTS);
         debug_assert!(threshold >= 0.0);
 
         if n < 2 {
@@ -190,11 +190,7 @@ impl EdgeList {
             if r == c || !(distance < NO_EDGE) {
                 continue; // diagonal, absent (>= f32::MAX), or NaN
             }
-            let (u, v) = if r > c {
-                (r as u16, c as u16)
-            } else {
-                (c as u16, r as u16)
-            };
+            let (u, v) = if r > c { (r, c) } else { (c, r) };
             edges.push(Edge { u, v, distance });
         }
         edges.sort_unstable_by_key(|edge| (edge.u, edge.v, edge.distance.to_bits()));
@@ -227,7 +223,7 @@ impl EdgeList {
         Self {
             n,
             edges,
-            center: center as u16,
+            center: center as u32,
             threshold: effective,
             sorted: false,
         }
@@ -355,8 +351,8 @@ impl PointWorker {
                             }
                             if distance <= staging {
                                 self.edges.push(Edge {
-                                    u: i as u16,
-                                    v: j as u16,
+                                    u: i as u32,
+                                    v: j as u32,
                                     distance,
                                 });
                             }
@@ -524,7 +520,7 @@ fn finalize_points(
     EdgeList {
         n,
         edges,
-        center: center as u16,
+        center: center as u32,
         threshold: effective,
         sorted: false,
     }
@@ -664,8 +660,8 @@ fn points_single_pass(data: &[f32], n: usize, d: usize, threshold: f32, staging:
                         }
                         if distance <= staging {
                             edges.push(Edge {
-                                u: i as u16,
-                                v: j as u16,
+                                u: i as u32,
+                                v: j as u32,
                                 distance,
                             });
                         }
@@ -724,8 +720,8 @@ mod tests {
     }
 
     #[test]
-    fn edge_is_eight_bytes() {
-        assert_eq!(std::mem::size_of::<Edge>(), 8);
+    fn edge_is_twelve_bytes() {
+        assert_eq!(std::mem::size_of::<Edge>(), 12);
     }
 
     fn set_sym(d: &mut [f32], n: usize, i: usize, j: usize, v: f32) {
