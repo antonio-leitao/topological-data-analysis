@@ -189,9 +189,9 @@ pub(crate) fn peel(edge_list: &mut EdgeList, parallel: bool) {
 
     let mut dirty: Vec<u32> = Vec::with_capacity(n);
     let mut in_dirty = vec![false; n];
-    for x in 0..n {
+    for (x, queued) in in_dirty.iter_mut().enumerate() {
         if !bit_set(&ball_bits, x) {
-            in_dirty[x] = true;
+            *queued = true;
             dirty.push(x as u32);
         }
     }

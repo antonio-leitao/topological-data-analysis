@@ -54,6 +54,38 @@ pub enum Error {
 
     #[error("sparse entry ({u}, {v}) is out of range for n={n}")]
     SparseIndexOutOfRange { u: u32, v: u32, n: usize },
+
+    #[error(
+        "coordinates: requested class {requested} but only {available} \
+         classes exist in dimension {dim}"
+    )]
+    NotEnoughClasses {
+        requested: usize,
+        available: usize,
+        dim: usize,
+    },
+
+    #[error("coordinates: scale {scale} outside the class interval [{birth}, {death})")]
+    InvalidScale { scale: f32, birth: f32, death: f32 },
+
+    #[error("coordinates: target_dim must be in 1..={max} for {points} input points, got {got}")]
+    InvalidTargetDim {
+        got: usize,
+        max: usize,
+        points: usize,
+    },
+
+    #[error(
+        "coordinates: the balanced integer lift of the selected H^{dim} cocycle over Z/{prime} \
+         is not closed at scale {scale}; choose another class, scale, or prime"
+    )]
+    NonIntegralCocycleLift { dim: usize, prime: u32, scale: f32 },
+
+    #[error("coordinates: prime must be an odd prime below 65536, got {0}")]
+    InvalidPrime(u32),
+
+    #[error("{0} is not implemented yet")]
+    NotImplemented(&'static str),
 }
 
 /// Crate-wide `Result` alias.

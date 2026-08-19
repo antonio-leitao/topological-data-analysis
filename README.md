@@ -22,17 +22,16 @@
   </p>
 </div>
 
-TDA computes Vietoris–Rips persistent homology from point clouds, precomputed
-distance matrices, or sparse distance graphs. The engine is an enhanced
-Ripser-style[^ripser] reduction written in Rust, available through both Python
-and Rust APIs.
+TDA does one computational job: Vietoris–Rips persistent homology, quickly.
+It accepts point clouds, distance matrices, and sparse distance graphs and runs
+a packed, Ripser-style[^ripser] reduction in Rust. Use the result directly as a
+persistence diagram, or bring a selected class back to the data through
+topological coordinates.
 
-Limits: up to 16,777,215 points and homology dimension 7. Internally the
-engine picks between two packed-simplex layouts — a 128-bit one (up to 65,535
-points and H4, the fastest path) and a 256-bit one (everything else) — with
-identical output on shared inputs. Deep dimensions and large point counts are
-most practical together with `quotient`, which trades exactness for a
-`log(3)`-interleaved approximation at a fraction of the cost.
+Limits: up to 16,777,215 points and homology dimension 7. Internally the engine
+selects a packed 128-bit or 256-bit simplex layout. Deep dimensions and large
+point counts are most practical with `quotient`, which trades exactness for a
+`log(3)`-interleaved approximation at a fraction of the cost.[^quotient]
 
 > [!CAUTION]
 > TDA is in an early stage of development. APIs may change between releases.
@@ -43,12 +42,13 @@ TDA requires Python 3.11 or newer. Pre-built wheels for common macOS, Windows,
 and Linux platforms are published on [PyPI](https://pypi.org/project/tda/):
 
 ```sh
-python -m pip install tda
+pip install tda
 ```
 
-### Compiling from source
+<details>
+<summary>Compiling from source</summary>
 
-Building from source requires
+Building requires
 [Rust/Cargo](https://doc.rust-lang.org/cargo/getting-started/installation.html)
 and [maturin](https://www.maturin.rs/):
 
@@ -64,26 +64,33 @@ cd crates/python
 maturin develop --release
 ```
 
-## Python usage
+</details>
+
+## Quick start
 
 ```python
 import numpy as np
 import tda
 
-# Point cloud: an (n, d) array (float32 or float64).
 points = np.random.rand(200, 3)
 barcode = tda.persistent_homology(points, max_dim=2)
 
-# barcode[d] is a (k_d, 2) array of [birth, death] intervals.
-print(barcode[0])  # H0
-print(barcode[1])  # H1
-print(barcode[2])  # H2
+# barcode[d] contains the [birth, death] intervals in dimension d.
+print(barcode[1])
 ```
 
-Precomputed distance matrices are also supported:
+For a guided introduction, see the runnable notebooks:
+
+- [`persistent_homology.ipynb`](examples/persistent_homology.ipynb) covers
+  circles, spheres, distance matrices, and quotient preprocessing.
+- [`coordinates.ipynb`](examples/coordinates.ipynb) shows circular,
+  projective, and fitted coordinates.
+
+### Inputs
+
+Set `distance_matrix=True` for a dense precomputed distance matrix:
 
 ```python
-distances = np.asarray(my_distance_matrix)
 barcode = tda.persistent_homology(
     distances,
     max_dim=1,
@@ -91,11 +98,8 @@ barcode = tda.persistent_homology(
 )
 ```
 
-Sparse distance matrices (any `scipy.sparse` format — in fact, anything with a
-`.tocoo()` method; scipy itself never becomes a dependency) are treated as
-distance graphs: entries are edges, missing pairs are never connected
-(infinite distance), duplicate entries resolve to the smallest value, and
-disconnected inputs are handled soundly:
+Sparse matrices are treated as distance graphs. Entries are edges and missing
+pairs have infinite distance:
 
 ```python
 import scipy.sparse as sp
@@ -107,54 +111,123 @@ graph = sp.coo_matrix(
 barcode = tda.persistent_homology(graph, max_dim=1)
 ```
 
-Pass `representatives=True` to also get, per interval, its birth simplex, its
-death simplex, and a representative cocycle of the class (persistent
-cohomology, as in Ripser's `do_cocycles`):
-
-```python
-result = tda.persistent_homology(points, max_dim=1, representatives=True)
-interval = result.diagrams[1][0]         # [birth, death]
-rep = result.representatives[1][0]       # aligned with diagrams[1][0]
-rep.birth                                # e.g. [17, 4]  — the birth edge
-rep.death                                # e.g. [23, 17, 4], None if essential
-rep.cocycle                              # list of simplices (vertex-id lists)
-```
-
-In dimension 0 the cocycle is empty; the birth vertex and the death (merge)
-edge carry the information. Under `quotient`, representatives live on the
-quotient complex (vertex ids are cluster representatives); under `collapse`,
-they are cocycles of the exactly-equivalent collapsed filtration.
-
-Use `filtration_size` to inspect the size of the truncated filtration built
-with the same options:
-
-```python
-size = tda.filtration_size(points, max_dim=2)
-print(size)
-```
-
 ### Parameters
 
-Both `persistent_homology` and `filtration_size` accept the following
-parameters:
+`persistent_homology` and `filtration_size` share these options:
 
-| Parameter         | Type                   | Default | Description                                                                                                                                                                                                                                       |
-| ----------------- | ---------------------- | ------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `data`            | `np.ndarray` or sparse | —       | Two-dimensional `float32` or `float64` array (`float64` is cast to `float32`) — shape `(n, d)` for a point cloud, `(n, n)` for a distance matrix — or a square `scipy.sparse` distance matrix. Inputs are copied into row-major internal storage. |
-| `max_dim`         | `int`                  | `1`     | Highest homology dimension to compute. Capped at 7.                                                                                                                                                                                               |
-| `threshold`       | `float \| None`        | `None`  | Maximum filtration value. `None` uses the enclosing radius; an explicit value is capped by that radius.                                                                                                                                           |
-| `distance_matrix` | `bool`                 | `False` | Interpret `data` as a square distance matrix. Symmetry, zero diagonal, and non-negativity are assumed rather than validated. Ignored for sparse input, which is always a distance graph.                                                          |
-| `quotient`        | `bool`                 | `False` | Use the smaller quotient-cover filtration.[^quotient] This is an approximation with a `log(3)` interleaving guarantee, not the exact Vietoris–Rips barcode.                                                                                       |
-| `peel`            | `bool`                 | `True`  | Tighten the truncation radius with an exact strong-collapse peeling: identical barcode, strictly less work. Disable to compute over the plain enclosing radius.                                                                                   |
-| `collapse`        | `bool`                 | `False` | Remove filtration-dominated edges (exact edge collapse):[^collapse] identical barcode, smaller filtration, but expensive preprocessing.                                                                                                           |
-| `parallel`        | `bool`                 | `True`  | Enable parallel preprocessing, sorting, and candidate assembly for sufficiently large inputs.                                                                                                                                                     |
-| `representatives` | `bool`                 | `False` | (`persistent_homology` only.) Return a `Barcode` object with `diagrams` plus aligned cocycle `representatives`. Recording is compiled separately, so the default path pays nothing for it.                                                        |
+| Parameter         | Default | Description                                                 |
+| ----------------- | ------- | ----------------------------------------------------------- |
+| `max_dim`         | `1`     | Highest homology dimension to compute; at most 7.           |
+| `threshold`       | `None`  | Maximum filtration value. `None` uses the enclosing radius. |
+| `distance_matrix` | `False` | Interpret a dense input as a square distance matrix.        |
+| `peel`            | `True`  | Apply the exact dominated-vertex peeling step.              |
+| `collapse`        | `False` | Apply exact filtration edge collapse.[^collapse]            |
+| `quotient`        | `False` | Use the approximate quotient-cover filtration.[^quotient]   |
+| `parallel`        | `True`  | Parallelize preprocessing and assembly when useful.         |
 
-`persistent_homology` returns a list of length `max_dim + 1`. Entry
-`barcode[d]` is a NumPy array of shape `(k_d, 2)` whose rows are
-`[birth, death]` intervals. A death value of `inf` marks an essential feature.
+The result is a list of length `max_dim + 1`. `barcode[d]` is an array of
+`[birth, death]` intervals; `inf` marks an essential feature.
 
-## Rust usage
+## Scaling persistent homology
+
+The filtration is normally the expensive object. TDA provides three composable
+ways to reduce it before persistence:
+
+| Step         | Guarantee             | Use it when...                                                                                         |
+| ------------ | --------------------- | ------------------------------------------------------------------------------------------------------ |
+| **Peel**     | Exact                 | You want a cheap default reduction. It uses dominated vertices to certify a smaller truncation radius. |
+| **Collapse** | Exact                 | Extra preprocessing is worthwhile to remove filtration-dominated edges.[^collapse]                     |
+| **Quotient** | `log(3)` interleaving | The exact filtration is too large and a controlled approximation is acceptable.[^quotient]             |
+
+For the strongest exact reduction, combine peel and collapse. Peel is based on
+the established dominated-vertex/strong-collapse idea; to our knowledge, this
+filtration-peeling implementation is currently specific to TDA. For much larger
+problems, quotient produces a near-linear skeleton and can still be combined
+with the exact steps. The canonical order is **peel → quotient → collapse**.
+
+### Benchmark
+
+One run of the [`summary` example](crates/core/examples/summary.rs) with
+`max_dim=2` and `parallel=false`:
+
+```sh
+cargo run --release -p tda_core --example summary
+```
+
+| Dataset     |  Vanilla |     Peel | Collapse | Peel+Collapse | Quotient | Quotient+Peel |    Q+P+C |
+| ----------- | -------: | -------: | -------: | ------------: | -------: | ------------: | -------: |
+| celegans    | 135.22ms | 106.47ms |  37.54ms |       35.61ms |   3.52ms |        3.90ms |   3.79ms |
+| vicsek      | 134.28ms | 132.84ms |  53.73ms |       55.17ms |   2.00ms |        2.10ms |   2.23ms |
+| klein_400   | 230.00ms |  92.60ms | 111.66ms |       59.80ms |   3.64ms |        4.55ms |   4.19ms |
+| klein_900   |    3.30s |    1.24s |    1.23s |      618.48ms |  18.44ms |       21.13ms |  21.12ms |
+| dragon_1000 |    2.98s |    1.65s |    1.21s |      654.81ms |  19.06ms |       21.56ms |  22.03ms |
+| dragon_2000 |   22.43s |   11.09s |   14.10s |         6.54s | 149.59ms |      201.23ms | 213.05ms |
+| hiv1        |   12.83s |    6.17s |    3.03s |         1.80s | 126.70ms |      109.23ms | 105.56ms |
+
+Timings depend on hardware; filtration size more directly shows the work that
+reaches reduction:
+
+| Dataset     |   Vanilla |      Peel | Collapse | Peel+Collapse | Quotient | Quotient+Peel | Q+P+C |
+| ----------- | --------: | --------: | -------: | ------------: | -------: | ------------: | ----: |
+| celegans    |   4102122 |   3562466 |     2031 |          2031 |     8944 |          8910 |   757 |
+| vicsek      |   4089966 |   4052107 |     6109 |          6054 |     2196 |          2196 |   924 |
+| klein_400   |   5968412 |   2042830 |    16243 |         16243 |     5219 |          5191 |  1828 |
+| klein_900   |  63867012 |  21890852 |   156044 |        156044 |    14607 |         14554 |  5077 |
+| dragon_1000 |  56423455 |  25537491 |   108174 |        108174 |    14248 |         14176 |  5287 |
+| dragon_2000 | 546815948 | 182326181 |   918585 |        918585 |    30418 |         30366 | 11570 |
+| hiv1        | 157117515 |  70122454 |   330419 |        330376 |   117473 |        117427 |  3529 |
+
+On `dragon_2000`, quotient reduces 546.8 million simplices to about 30.4
+thousand and cuts this run from 22.43 seconds to 149.59 milliseconds. That is
+the intended quotient use case: a controlled approximation when the full
+filtration is the bottleneck.
+
+## Using persistence
+
+### Persistence diagrams
+
+For many applications, the barcode returned by `persistent_homology` is the
+final summary: long-lived intervals identify features that persist across
+scales.
+
+### Coordinates
+
+Coordinates bring a selected persistent cohomology class back to the original
+observations. Circular coordinates, for example, assign every point an angle
+on S¹:[^circcoords]
+
+```python
+result = tda.coords.circular(points)
+angles = result.coordinates  # (n, 1), values in [0, 2π)
+```
+
+TDA's coordinate constructions are adapted from
+[DREiMAC](https://dreimac.scikit-tda.org/en/latest/), the reference
+implementation.[^dreimac] The API also includes toroidal coordinates and real
+and complex projective targets.[^toroidal][^projcoords] See the
+[`coordinates` notebook](examples/coordinates.ipynb) for the geometric
+intuition, target selection, quotient coordinates, and fitted maps for new
+data.
+
+Circular and complex projective coordinates check the balanced finite-field
+lift. DREiMAC can repair a failed lift with mixed-integer optimization; TDA
+instead returns an error and leaves the choice of another class, scale, or
+prime to the user.[^dreimac-lift]
+
+## Additional APIs
+
+Use `filtration_size` to inspect the truncated filtration under the same
+preprocessing options without computing persistence:
+
+```python
+size = tda.filtration_size(points, max_dim=2, quotient=True)
+```
+
+Fitted `circular_map`, `projective_map`, and `complex_projective_map` objects
+can transform new point-cloud observations without recomputing persistence.
+See the [coordinates notebook](examples/coordinates.ipynb) for examples.
+
+### Rust
 
 The Rust crate is published as
 [`tda_core`](https://crates.io/crates/tda_core):
@@ -164,67 +237,26 @@ The Rust crate is published as
 tda_core = "0.4"
 ```
 
-For a point cloud, pass a flat row-major `(n, d)` slice. The ambient dimension
-is inferred from the slice length and `n`, and the defaults (peel on, parallel
-on, no explicit threshold) are the recommended configuration:
-
 ```rust
 use tda_core::{persistent_homology, Error};
 
 fn main() -> Result<(), Error> {
-    let points: Vec<f32> = vec![
+    let points = vec![
         0.0, 0.0,
         1.0, 0.0,
         0.0, 1.0,
         1.0, 1.0,
     ];
 
-    let barcode = persistent_homology(&points, 4 /* points */, 1 /* max_dim */)?;
-
-    for (dim, intervals) in barcode.intervals.iter().enumerate() {
-        for interval in intervals {
-            println!("H{dim}: [{}, {})", interval.birth, interval.death);
-        }
-    }
-
-    Ok(())
-}
-```
-
-Everything else — distance-matrix input, thresholds, the optional transforms —
-goes through `Config` and the `_with` variants:
-
-```rust
-use tda_core::{persistent_homology_with, Config, Error};
-
-fn main() -> Result<(), Error> {
-    let distances: Vec<f32> = vec![
-        0.0, 1.0, 2.0,
-        1.0, 0.0, 1.5,
-        2.0, 1.5, 0.0,
-    ];
-
-    let config = Config {
-        distance_matrix: true,
-        ..Config::default()
-    };
-    let barcode = persistent_homology_with(&distances, 3, 1, &config)?;
-
+    let barcode = persistent_homology(&points, 4, 1)?;
     println!("{:?}", barcode.intervals);
     Ok(())
 }
 ```
 
-Sparse COO distance graphs use `persistent_homology_sparse` /
-`persistent_homology_sparse_with` (and the matching `filtration_size_sparse`
-functions), taking `rows`, `cols`, and `values` slices plus `n`. Cocycle
-representatives come from the `_reps` siblings (`persistent_homology_reps`,
-`persistent_homology_reps_with`, and the sparse variants), which return a
-`RepresentedBarcode` whose `representatives[d][i]` is aligned with
-`barcode.intervals[d][i]`.
-
-Invalid inputs return `tda_core::Error`, including shape mismatches, invalid
-thresholds, too few or too many points, and unsupported dimensions.
+Distance matrices, sparse COO distance graphs, thresholds, and preprocessing
+options are available through `Config` and the corresponding `_with` and
+`_sparse` functions. Invalid input returns `tda_core::Error`.
 
 ## References
 
@@ -244,6 +276,34 @@ thresholds, too few or too many points, and unsupported dimensions.
     M. Glisse and S. Pritam. _Swap, Shift and Trim to Edge Collapse a
     Filtration_. SoCG 2022.
     [DOI:10.4230/LIPIcs.SoCG.2022.44](https://doi.org/10.4230/LIPIcs.SoCG.2022.44).
+
+[^circcoords]:
+    V. de Silva, D. Morozov, and M. Vejdemo-Johansson. _Persistent
+    Cohomology and Circular Coordinates_. Discrete & Computational
+    Geometry, 2011.
+    [DOI:10.1007/s00454-011-9344-x](https://doi.org/10.1007/s00454-011-9344-x).
+
+[^toroidal]:
+    L. Scoccola, H. Gakhar, J. Bush, N. Schonsheck, T. Rask, L. Zhou,
+    and J. A. Perea. _Toroidal Coordinates: Decorrelating Circular
+    Coordinates with Lattice Reduction_. SoCG 2023.
+    [DOI:10.4230/LIPIcs.SoCG.2023.57](https://doi.org/10.4230/LIPIcs.SoCG.2023.57).
+
+[^projcoords]:
+    J. A. Perea. _Multiscale Projective Coordinates via Persistent
+    Cohomology of Sparse Filtrations_. Discrete & Computational Geometry, 2018. [arXiv:1612.02861](https://arxiv.org/abs/1612.02861).
+
+[^dreimac]:
+    J. A. Perea, L. Scoccola, and C. J. Tralie. _DREiMac: Dimensionality
+    Reduction with Eilenberg–MacLane Coordinates_. Journal of Open Source
+    Software 8(91), 5791, 2023.
+    [DOI:10.21105/joss.05791](https://doi.org/10.21105/joss.05791).
+    [Source](https://github.com/scikit-tda/DREiMac) (Apache-2.0).
+
+[^dreimac-lift]:
+    DREiMAC documentation. _Choosing the parameters prime and
+    check_cocycle_condition_.
+    [Documentation](https://dreimac.scikit-tda.org/en/latest/notebooks/parameters_prime_and_check_cocycle_condition.html).
 
 ## License
 

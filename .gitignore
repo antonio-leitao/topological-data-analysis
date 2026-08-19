@@ -8,7 +8,8 @@ crates/core/profile.json.gz
 crates/core/profile.json.syms.json
 crates/core/profile.json
 crates/python/tests/results/
-crates/core/examples/
+crates/core/examples/*
+!crates/core/examples/summary.rs
 # Build artifacts / project-specific
 /tests
 notebooks/

@@ -118,8 +118,8 @@ pub(crate) fn cone_in_place(edge_list: &mut EdgeList, parallel: bool) {
     let mut out: Vec<Edge> = Vec::with_capacity(n);
 
     for edge in &input {
-        let a = find(&mut parent, edge.u as u32);
-        let b = find(&mut parent, edge.v as u32);
+        let a = find(&mut parent, edge.u);
+        let b = find(&mut parent, edge.v);
         if a == b {
             continue; // intra-cluster: nothing to record.
         }

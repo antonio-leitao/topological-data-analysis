@@ -13,6 +13,15 @@ readme = "README.md"
 keywords = ["topology", "homology", "tda", "persistent-homology", "ripser"]
 categories = ["mathematics", "science"]
 
+# One codegen unit + full LTO: the hot reduction loop's cross-function
+# inlining must not depend on how rustc happens to partition an ever-growing
+# crate into codegen units (adding unrelated modules — e.g. coords — was
+# observed to shift partitioning and cost ~10% on the engine benchmarks).
+# Slower builds, deterministic codegen quality.
+[profile.release]
+codegen-units = 1
+lto = "fat"
+
 [profile.bench]
 debug = "line-tables-only"
 split-debuginfo = "packed"

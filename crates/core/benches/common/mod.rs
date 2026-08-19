@@ -59,7 +59,9 @@ pub fn parse_variant(value: &str) -> Result<Variant, String> {
             quotient: false,
             collapse: true,
         }),
-        other => Err(format!("variant must be vanilla|peel|quot|clps, got {other}")),
+        other => Err(format!(
+            "variant must be vanilla|peel|quot|clps, got {other}"
+        )),
     }
 }
 

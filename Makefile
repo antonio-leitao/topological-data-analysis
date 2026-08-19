@@ -52,8 +52,8 @@ test-core: ## Run Rust core tests
 test-python: install ## Run Python correctness test
 	@echo "$(CYAN)🧪 Running Python correctness...$(RESET)"
 	@$(PYTHON) crates/python/tests/correctness.py $(MAX_DIM)
-	@echo "$(CYAN)🧪 Running representatives checks...$(RESET)"
-	@$(PYTHON) crates/python/tests/representatives.py
+	@echo "$(CYAN)🧪 Running coordinates checks...$(RESET)"
+	@$(PYTHON) crates/python/tests/coordinates.py
 
 test: test-core test-python ## Run all correctness tests
 	@echo "$(GREEN)✅ Tests passed!$(RESET)"

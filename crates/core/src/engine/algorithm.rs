@@ -296,7 +296,7 @@ fn zero_apparent_cofacet<const K: usize, S: PackedSimplex<K>>(
 // H0: enumerate edges, Kruskal, split into simplices + columns_to_reduce
 // ═══════════════════════════════════════════════════════════════════════════════
 
-fn compute_h0<const K: usize, S: PackedSimplex<K>, const RECORD: bool>(
+pub(crate) fn compute_h0<const K: usize, S: PackedSimplex<K>, const RECORD: bool>(
     dist: &BitCsrDistanceMatrix,
     intervals: &mut Vec<PersistenceInterval>,
     reps: &mut Vec<RawRepresentative<S>>,
@@ -383,10 +383,10 @@ fn compute_h0<const K: usize, S: PackedSimplex<K>, const RECORD: bool>(
         });
     }
     if RECORD {
-        for v in 0..n {
+        for (v, &minimum) in comp_min.iter().enumerate() {
             if uf.find(v) == v {
                 reps.push(RawRepresentative {
-                    birth: S::from_sorted_desc(0.0, &[comp_min[v]]),
+                    birth: S::from_sorted_desc(0.0, &[minimum]),
                     death: None,
                     cocycle: Vec::new(),
                 });
@@ -626,9 +626,9 @@ fn is_zero_apparent_cofacet_side<const K: usize, S: PackedSimplex<K>>(
 
     let mut facet_verts = [0u32; K];
     let mut out = 0usize;
-    for i in 0..vc {
+    for (i, &vertex) in tau_verts.iter().take(vc).enumerate() {
         if i != skip {
-            facet_verts[out] = tau_verts[i];
+            facet_verts[out] = vertex;
             out += 1;
         }
     }
@@ -655,8 +655,8 @@ fn is_zero_apparent_facet_side<const K: usize, S: PackedSimplex<K>>(
     let (_rho_verts, rank) = insert_vertex_desc(tau_verts, vc, w);
     let mut rho_edges = remap_edge_mask_after_insert::<K>(diam_edges, vc, rank);
     let diam_bits = !tau.filtration_encoded();
-    for i in 0..vc {
-        if dist.edge_dist_bits(w, tau_verts[i]) == diam_bits {
+    for (i, &vertex) in tau_verts.iter().take(vc).enumerate() {
+        if dist.edge_dist_bits(w, vertex) == diam_bits {
             let j = if i >= rank { i + 1 } else { i };
             let (a, b) = if rank < j { (rank, j) } else { (j, rank) };
             rho_edges |= edge_bit::<K>(a, b);
@@ -708,11 +708,7 @@ fn oldest_same_diam_facet_slot<const K: usize>(vc: usize, diam_edges: u64) -> Op
 /// Insert `w` into the descending vertex array, returning the new array and the
 /// insertion rank.
 #[inline]
-fn insert_vertex_desc<const K: usize>(
-    verts: &[u32; K],
-    vc: usize,
-    w: u32,
-) -> ([u32; K], usize) {
+fn insert_vertex_desc<const K: usize>(verts: &[u32; K], vc: usize, w: u32) -> ([u32; K], usize) {
     let mut out = [0u32; K];
     let mut i = 0usize;
     while i < vc && verts[i] > w {
@@ -833,8 +829,12 @@ fn compute_impl<const K: usize, S: PackedSimplex<K>, const RECORD: bool>(
         // Reduce this dimension's columns. The returned pivot map holds exactly
         // the pivots recorded at THIS dimension; its key set is the clearing
         // set consumed by assemble_candidates for dim+1.
-        let pivots =
-            compute_pairs::<K, S, RECORD>(&columns_to_reduce, dist, &mut dim_intervals, &mut dim_reps);
+        let pivots = compute_pairs::<K, S, RECORD>(
+            &columns_to_reduce,
+            dist,
+            &mut dim_intervals,
+            &mut dim_reps,
+        );
         intervals.push(dim_intervals);
         if RECORD {
             representatives.push(dim_reps);
@@ -959,9 +959,7 @@ mod tests {
         let bc = compute::<9, Simplex256>(&bitcsr, 5, false);
 
         assert_eq!(bc.intervals.len(), 6);
-        assert!(bc.intervals[2]
-            .iter()
-            .any(|iv| (iv.birth - s).abs() < 1e-5));
+        assert!(bc.intervals[2].iter().any(|iv| (iv.birth - s).abs() < 1e-5));
         for d in 3..=5 {
             assert!(bc.intervals[d].is_empty(), "H{d} of the octahedron");
         }
@@ -1108,9 +1106,11 @@ mod tests {
     ///     pivot property);
     ///   * essential class: no surviving cofacet at all (a true cocycle in
     ///     the truncated complex).
+    ///
     /// Also: birth/death simplex diameters equal the interval endpoints, and
     /// representatives align 1:1 with emitted intervals.
     #[test]
+    #[allow(clippy::needless_range_loop)] // dimensions index aligned result arrays
     fn cocycle_representatives_are_valid() {
         use std::collections::HashMap;
 
@@ -1134,9 +1134,8 @@ mod tests {
 
         for (n, lt, threshold) in cases {
             let sq = crate::preprocess::edgelist::square_from_lower_tri(n, &lt);
-            let edges = crate::preprocess::edgelist::EdgeList::from_distance_matrix(
-                &sq, n, threshold,
-            );
+            let edges =
+                crate::preprocess::edgelist::EdgeList::from_distance_matrix(&sq, n, threshold);
             let bitcsr = BitCsrDistanceMatrix::from_edge_list(edges);
             let max_dim = 2;
             let (bc, reps) = compute_impl::<6, Simplex128, true>(&bitcsr, max_dim, false);
@@ -1153,10 +1152,7 @@ mod tests {
                 for (iv, rep) in bc.intervals[dim].iter().zip(&reps[dim]) {
                     assert_eq!(rep.birth.filtration(), iv.birth);
                     assert!(rep.cocycle.contains(&rep.birth));
-                    assert!(rep
-                        .cocycle
-                        .iter()
-                        .all(|s| s.vertex_count() == dim + 1));
+                    assert!(rep.cocycle.iter().all(|s| s.vertex_count() == dim + 1));
 
                     // δ(cocycle) over Z/2.
                     let mut parity: HashMap<Simplex128, bool> = HashMap::new();
@@ -1176,9 +1172,7 @@ mod tests {
                             assert_eq!(tau.filtration(), iv.death);
                             // Youngest survivor (max u128) is exactly τ.
                             assert_eq!(surviving.iter().max(), Some(&tau));
-                            assert!(surviving
-                                .iter()
-                                .all(|c| c.filtration() >= iv.death));
+                            assert!(surviving.iter().all(|c| c.filtration() >= iv.death));
                         }
                         None => {
                             assert!(iv.death.is_infinite());

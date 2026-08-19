@@ -187,7 +187,7 @@ impl EdgeList {
         let mut edges: Vec<Edge> = Vec::with_capacity(vals.len());
         for ((&r, &c), &distance) in rows.iter().zip(cols).zip(vals) {
             debug_assert!((r as usize) < n && (c as usize) < n);
-            if r == c || !(distance < NO_EDGE) {
+            if r == c || distance.partial_cmp(&NO_EDGE) != Some(std::cmp::Ordering::Less) {
                 continue; // diagonal, absent (>= f32::MAX), or NaN
             }
             let (u, v) = if r > c { (r, c) } else { (c, r) };
@@ -212,7 +212,7 @@ impl EdgeList {
             }
             finite_count[u] += 1;
             finite_count[v] += 1;
-            uf_union(&mut parent, &mut comp_size, edge.u as u32, edge.v as u32);
+            uf_union(&mut parent, &mut comp_size, edge.u, edge.v);
         }
 
         let (center, r_cheb) =
@@ -257,7 +257,7 @@ fn pack_panel(
     width: usize,
     packed: &mut [f32],
 ) {
-    let n_groups = (count + width - 1) / width;
+    let n_groups = count.div_ceil(width);
     let used = n_groups * width * d;
     packed[..used].fill(0.0);
 
@@ -280,8 +280,8 @@ fn tile_dist(tile: &[[f32; NR]; MR], m: usize, n: usize) -> f32 {
 }
 
 fn alloc_panels(d: usize) -> (Vec<f32>, Vec<f32>) {
-    let a_buf_len = ((MC + MR - 1) / MR) * MR * d;
-    let b_buf_len = ((NC + NR - 1) / NR) * NR * d;
+    let a_buf_len = MC.div_ceil(MR) * MR * d;
+    let b_buf_len = NC.div_ceil(NR) * NR * d;
     (vec![0.0f32; a_buf_len], vec![0.0f32; b_buf_len])
 }
 
@@ -530,9 +530,9 @@ fn finalize_points(
 fn reduce_minimax(max_dist: &[f32]) -> (usize, f32) {
     let mut center = 0usize;
     let mut radius = max_dist[0];
-    for i in 1..max_dist.len() {
-        if max_dist[i] < radius {
-            radius = max_dist[i];
+    for (i, &distance) in max_dist.iter().enumerate().skip(1) {
+        if distance < radius {
+            radius = distance;
             center = i;
         }
     }
@@ -691,6 +691,112 @@ fn points_single_pass_parallel(
     finalize_points(n, edges, center, threshold, staging, r_cheb)
 }
 
+// ═══════════════════════════════════════════════════════════════════════════════
+// Rectangular cross-neighbourhoods (out-of-sample transform support)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Sparse cross-neighbourhood rows: for query point `q`,
+/// `cols/dists[offsets[q]..offsets[q + 1]]` are the train points within
+/// `radius` (strict), ascending train index.
+pub(crate) struct CrossNeighbors {
+    pub(crate) offsets: Vec<u32>,
+    pub(crate) cols: Vec<u32>,
+    pub(crate) dists: Vec<f32>,
+}
+
+/// All (query, train) pairs closer than `radius`, through the same tiled
+/// micro-kernel as the square pass — no triangular skipping, queries down the
+/// rows and train points across the columns. Deterministic: bands of queries
+/// are processed independently (rayon when `parallel`) and stitched in order,
+/// and each row's entries ascend in train index.
+pub(crate) fn cross_neighbors(
+    queries: &[f32],
+    m: usize,
+    train: &[f32],
+    n: usize,
+    d: usize,
+    radius: f32,
+    parallel: bool,
+) -> CrossNeighbors {
+    debug_assert_eq!(queries.len(), m * d);
+    debug_assert_eq!(train.len(), n * d);
+
+    let bands: Vec<(usize, usize)> = (0..m)
+        .step_by(MC)
+        .map(|start| (start, (m - start).min(MC)))
+        .collect();
+
+    let band_rows = |&(band_start, band_len): &(usize, usize)| -> Vec<Vec<(u32, f32)>> {
+        let (mut a_packed, mut b_packed) = alloc_panels(d);
+        let mut rows: Vec<Vec<(u32, f32)>> = vec![Vec::new(); band_len];
+        pack_panel(queries, d, band_start, band_len, MR, &mut a_packed);
+
+        let mut jc = 0;
+        while jc < n {
+            let nc = (n - jc).min(NC);
+            pack_panel(train, d, jc, nc, NR, &mut b_packed);
+            let mut ir = 0;
+            while ir < band_len {
+                let mr_eff = (band_len - ir).min(MR);
+                let a_off = (ir / MR) * MR * d;
+                let mut jr = 0;
+                while jr < nc {
+                    let nr_eff = (nc - jr).min(NR);
+                    let b_off = (jr / NR) * NR * d;
+                    let tile = micro_kernel(&a_packed[a_off..], &b_packed[b_off..], d);
+                    for row in 0..mr_eff {
+                        let out = &mut rows[ir + row];
+                        for col in 0..nr_eff {
+                            let distance = tile_dist(&tile, row, col);
+                            if distance < radius {
+                                out.push(((jc + jr + col) as u32, distance));
+                            }
+                        }
+                    }
+                    jr += NR;
+                }
+                ir += MR;
+            }
+            jc += NC;
+        }
+        rows
+    };
+
+    let all_rows: Vec<Vec<Vec<(u32, f32)>>> = if parallel && m * n >= PARALLEL_POINT_MIN_PAIRS {
+        bands.par_iter().map(band_rows).collect()
+    } else {
+        bands.iter().map(band_rows).collect()
+    };
+
+    let total: usize = all_rows
+        .iter()
+        .flat_map(|band| band.iter().map(Vec::len))
+        .sum();
+    assert!(
+        total <= u32::MAX as usize,
+        "cross-neighbourhood exceeds u32 entries"
+    );
+    let mut offsets = Vec::with_capacity(m + 1);
+    offsets.push(0u32);
+    let mut cols = Vec::with_capacity(total);
+    let mut dists = Vec::with_capacity(total);
+    for band in all_rows {
+        for row in band {
+            for (col, dist) in row {
+                cols.push(col);
+                dists.push(dist);
+            }
+            offsets.push(cols.len() as u32);
+        }
+    }
+
+    CrossNeighbors {
+        offsets,
+        cols,
+        dists,
+    }
+}
+
 /// Lower-triangular fixture → symmetric square matrix. Test-only helper shared
 /// with the engine fixtures (formerly `_pdist::square_from_lower_tri`).
 #[cfg(test)]
@@ -844,6 +950,56 @@ mod tests {
                 single_parallel.threshold.to_bits()
             );
             assert_eq!(sorted_edges(&single), sorted_edges(&single_parallel));
+        }
+    }
+
+    /// The rectangular pass must agree with brute force: same membership,
+    /// ascending train indices per row, distances within kernel tolerance,
+    /// sequential ≡ parallel.
+    #[test]
+    fn cross_neighbors_matches_brute_force() {
+        let (m, n, d) = (37usize, 71usize, 3usize);
+        let gen = |count: usize, phase: f32| -> Vec<f32> {
+            (0..count * d)
+                .map(|i| {
+                    let x = i as f32 + phase;
+                    (x * 0.137).sin() + (x * 0.071).cos()
+                })
+                .collect()
+        };
+        let queries = gen(m, 0.31);
+        let train = gen(n, 7.7);
+        let radius = 0.8f32;
+
+        for parallel in [false, true] {
+            let cross = cross_neighbors(&queries, m, &train, n, d, radius, parallel);
+            assert_eq!(cross.offsets.len(), m + 1);
+            for q in 0..m {
+                let range = cross.offsets[q] as usize..cross.offsets[q + 1] as usize;
+                let got: Vec<(u32, f32)> = range.map(|e| (cross.cols[e], cross.dists[e])).collect();
+                assert!(got.windows(2).all(|w| w[0].0 < w[1].0), "ascending indices");
+
+                let mut want = Vec::new();
+                for t in 0..n {
+                    let mut sq = 0f32;
+                    for k in 0..d {
+                        let diff = queries[q * d + k] - train[t * d + k];
+                        sq += diff * diff;
+                    }
+                    let dist = sq.sqrt();
+                    if dist < radius {
+                        want.push((t as u32, dist));
+                    }
+                }
+                assert_eq!(
+                    got.iter().map(|e| e.0).collect::<Vec<_>>(),
+                    want.iter().map(|e| e.0).collect::<Vec<_>>(),
+                    "membership mismatch at query {q}"
+                );
+                for (g, w) in got.iter().zip(&want) {
+                    assert!((g.1 - w.1).abs() < 1e-5, "distance mismatch at query {q}");
+                }
+            }
         }
     }
 

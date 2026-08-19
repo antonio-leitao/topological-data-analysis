@@ -19,6 +19,32 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Run core tests
         run: cargo test -p tda_core
+      - name: Check Rust documentation
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: cargo doc -p tda_core --no-deps
+
+  python-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build test wheel
+        uses: PyO3/maturin-action@v1
+        with:
+          working-directory: crates/python
+          args: --release --out dist --find-interpreter
+          sccache: "true"
+      - name: Install test wheel
+        run: python -m pip install numpy gudhi scikit-learn crates/python/dist/*.whl
+      - name: Cross-check persistence against GUDHI
+        run: python crates/python/tests/correctness.py 2
+      - name: Run coordinate tests
+        run: python crates/python/tests/coordinates.py
 
   linux:
     runs-on: ubuntu-latest
@@ -95,7 +121,7 @@ jobs:
     name: Release
     runs-on: ubuntu-latest
     if: startsWith(github.ref, 'refs/tags/')
-    needs: [linux, windows, macos]
+    needs: [test, python-test, linux, windows, macos]
     steps:
       - uses: actions/download-artifact@v4
         with:

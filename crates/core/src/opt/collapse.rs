@@ -254,9 +254,8 @@ fn collapse_impl(edge_list: &mut EdgeList, parallel: bool, use_dense: bool) {
                 // Advance through events while `dom` keeps dominating: each
                 // NEW member costs one lookup; existing members stay valid.
                 loop {
-                    let h = heap.get_or_insert_with(|| {
-                        BinaryHeap::from(std::mem::take(&mut later))
-                    });
+                    let h =
+                        heap.get_or_insert_with(|| BinaryHeap::from(std::mem::take(&mut later)));
                     let Some(&Reverse((t_bits, _))) = h.peek() else {
                         dead = true; // dominated on [f(e), ∞): trim
                         break 'outer;
@@ -365,7 +364,14 @@ mod tests {
 
     #[test]
     fn trivial_inputs_are_noops() {
-        let mut e = edge_list(2, vec![Edge { u: 1, v: 0, distance: 1.0 }]);
+        let mut e = edge_list(
+            2,
+            vec![Edge {
+                u: 1,
+                v: 0,
+                distance: 1.0,
+            }],
+        );
         collapse_in_place(&mut e, false);
         assert_eq!(e.edges.len(), 1);
     }
@@ -413,7 +419,13 @@ mod tests {
     #[test]
     fn complete_graph_collapses_to_tree() {
         let edges: Vec<Edge> = (1..4u32)
-            .flat_map(|u| (0..u).map(move |v| Edge { u, v, distance: 1.0 }))
+            .flat_map(|u| {
+                (0..u).map(move |v| Edge {
+                    u,
+                    v,
+                    distance: 1.0,
+                })
+            })
             .collect();
         let mut e = edge_list(4, edges);
         collapse_in_place(&mut e, false);
@@ -429,12 +441,36 @@ mod tests {
     fn square_keeps_one_diagonal() {
         let s = std::f32::consts::SQRT_2;
         let edges = vec![
-            Edge { u: 1, v: 0, distance: 1.0 },
-            Edge { u: 2, v: 1, distance: 1.0 },
-            Edge { u: 3, v: 2, distance: 1.0 },
-            Edge { u: 3, v: 0, distance: 1.0 },
-            Edge { u: 2, v: 0, distance: s },
-            Edge { u: 3, v: 1, distance: s },
+            Edge {
+                u: 1,
+                v: 0,
+                distance: 1.0,
+            },
+            Edge {
+                u: 2,
+                v: 1,
+                distance: 1.0,
+            },
+            Edge {
+                u: 3,
+                v: 2,
+                distance: 1.0,
+            },
+            Edge {
+                u: 3,
+                v: 0,
+                distance: 1.0,
+            },
+            Edge {
+                u: 2,
+                v: 0,
+                distance: s,
+            },
+            Edge {
+                u: 3,
+                v: 1,
+                distance: s,
+            },
         ];
         let mut e = edge_list(4, edges);
         collapse_in_place(&mut e, false);
@@ -451,9 +487,21 @@ mod tests {
         // Triangle where (1,0) is the SHORTEST edge: vertex 2 becomes a
         // common neighbor only at scale 2.0 > 1.0.
         let edges = vec![
-            Edge { u: 1, v: 0, distance: 1.0 },
-            Edge { u: 2, v: 0, distance: 2.0 },
-            Edge { u: 2, v: 1, distance: 2.0 },
+            Edge {
+                u: 1,
+                v: 0,
+                distance: 1.0,
+            },
+            Edge {
+                u: 2,
+                v: 0,
+                distance: 2.0,
+            },
+            Edge {
+                u: 2,
+                v: 1,
+                distance: 2.0,
+            },
         ];
         let mut e = edge_list(3, edges);
         collapse_in_place(&mut e, false);
@@ -469,18 +517,49 @@ mod tests {
     #[test]
     fn pentagon_chords_are_critical() {
         let edges = vec![
-            Edge { u: 1, v: 0, distance: 1.0 },
-            Edge { u: 2, v: 1, distance: 1.0 },
-            Edge { u: 3, v: 2, distance: 1.0 },
-            Edge { u: 4, v: 3, distance: 1.0 },
-            Edge { u: 4, v: 0, distance: 1.0 },
-            Edge { u: 2, v: 0, distance: 2.0 },
-            Edge { u: 3, v: 0, distance: 2.0 },
+            Edge {
+                u: 1,
+                v: 0,
+                distance: 1.0,
+            },
+            Edge {
+                u: 2,
+                v: 1,
+                distance: 1.0,
+            },
+            Edge {
+                u: 3,
+                v: 2,
+                distance: 1.0,
+            },
+            Edge {
+                u: 4,
+                v: 3,
+                distance: 1.0,
+            },
+            Edge {
+                u: 4,
+                v: 0,
+                distance: 1.0,
+            },
+            Edge {
+                u: 2,
+                v: 0,
+                distance: 2.0,
+            },
+            Edge {
+                u: 3,
+                v: 0,
+                distance: 2.0,
+            },
         ];
         let mut e = edge_list(5, edges);
         collapse_in_place(&mut e, false);
         assert_clean(&e);
         assert_eq!(e.edges.len(), 7, "nothing is dominated in this graph");
-        assert!(e.edges.iter().all(|edge| edge.distance == 1.0 || edge.distance == 2.0));
+        assert!(e
+            .edges
+            .iter()
+            .all(|edge| edge.distance == 1.0 || edge.distance == 2.0));
     }
 }

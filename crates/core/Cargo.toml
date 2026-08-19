@@ -14,6 +14,14 @@ categories.workspace = true
 [lib]
 name = "tda_core"
 
+[features]
+default = ["coords"]
+# The coordinates layer (tda_core::coords + the mod-p engine behind it). It
+# never executes in the persistence path; the gate exists so the pure engine
+# can be built and benchmarked without ~2k lines of cold code shifting binary
+# layout: `cargo bench -p tda_core --no-default-features`.
+coords = []
+
 [dependencies]
 thiserror = "2.0.18"
 rayon = "1.11"

@@ -34,7 +34,7 @@ Repository = "https://github.com/antonio-leitao/topological-data-analysis"
 Issues = "https://github.com/antonio-leitao/topological-data-analysis/issues"
 
 [project.optional-dependencies]
-dev = ["maturin", "ripser", "gudhi", "pandas"]
+dev = ["maturin", "ripser", "gudhi", "scikit-learn", "pandas"]
 
 [tool.maturin]
 features = ["pyo3/extension-module"]

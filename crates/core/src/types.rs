@@ -41,7 +41,7 @@ pub struct RepresentedBarcode {
     pub representatives: Vec<Vec<Representative>>,
 }
 impl BarcodeResult {
-    /// Consume self, yielding one flat Vec<f32> per dimension.
+    /// Consume self, yielding one flat `Vec<f32>` per dimension.
     /// Zero-copy transmute: PersistenceInterval is #[repr(C)] {f32, f32}.
     pub fn into_flat_intervals(self) -> Vec<(usize, Vec<f32>)> {
         self.intervals

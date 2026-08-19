@@ -914,7 +914,17 @@ mod tests {
     fn s256_nine_vertices_roundtrip() {
         // Nine vertices straddling the hi/lo boundary (slots 3 and 4), with
         // ids up to the 24-bit cap.
-        let ids = [16_777_214u32, 1_000_000, 65_536, 65_535, 4_096, 300, 64, 1, 0];
+        let ids = [
+            16_777_214u32,
+            1_000_000,
+            65_536,
+            65_535,
+            4_096,
+            300,
+            64,
+            1,
+            0,
+        ];
         let s = Simplex256::new(3.25, &ids);
         assert_eq!(s.vertex_count(), 9);
         assert_eq!(s.vertices(), ids); // already descending
@@ -940,7 +950,17 @@ mod tests {
         // including the hi/lo boundary (ranks 3..5).
         let base_ids = [900_000u32, 70_000, 65_536, 4_000, 512, 300, 64, 2];
         let base = Simplex256::new(1.0, &base_ids);
-        for &w in &[16_000_000u32, 100_000, 66_000, 65_000, 1_000, 400, 100, 10, 0] {
+        for &w in &[
+            16_000_000u32,
+            100_000,
+            66_000,
+            65_000,
+            1_000,
+            400,
+            100,
+            10,
+            0,
+        ] {
             let cof = base.cofacet(w, encode_filtration(2.0));
             // Reference: sort the 9 ids descending and repack.
             let mut ids: Vec<u32> = base_ids.to_vec();
@@ -975,7 +995,17 @@ mod tests {
 
     #[test]
     fn s256_remove_vertex_matches_reference_at_every_slot() {
-        let ids = [16_777_214u32, 1_000_000, 65_536, 65_535, 4_096, 300, 64, 1, 0];
+        let ids = [
+            16_777_214u32,
+            1_000_000,
+            65_536,
+            65_535,
+            4_096,
+            300,
+            64,
+            1,
+            0,
+        ];
         let s = Simplex256::new(2.0, &ids);
         for k in 0..9 {
             let facet = s.remove_vertex_at(k, encode_filtration(2.0));
