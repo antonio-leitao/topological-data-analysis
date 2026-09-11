@@ -1,12 +1,10 @@
-//! Sound strong-collapse truncation over a weighted edge list.
+//! Strong-collapse truncation over a weighted edge list.
 //!
 //! [`peel`] sorts and tightens an [`EdgeList`] in place. If its cutoff is `R`,
 //! the resulting cutoff `R' <= R` is certified so that `VR(X, t)` is
 //! contractible for every `t >= R'`.
 //!
-//! Neighborhoods are stored as block-sparse bitset rows ([`SparseRows`]):
-//! O(E) memory instead of the dense n²/64 bytes, with the same word-parallel
-//! subset/intersection walks over the occupied 64-bit blocks.
+//! Block-sparse bitset rows keep neighbourhood storage proportional to edges.
 
 use crate::preprocess::edgelist::{Edge, EdgeList};
 use rayon::prelude::*;
@@ -16,10 +14,8 @@ fn bit_set(bits: &[u64], i: usize) -> bool {
     (bits[i >> 6] >> (i & 63)) & 1 == 1
 }
 
-/// Block-sparse closed neighborhoods: per vertex, the sorted nonzero 64-bit
-/// blocks of its adjacency bitset (self bit included), flattened CSR-style.
-/// After construction bits are only ever CLEARED, so the block skeleton is
-/// immutable; emptied words stay as zeros and are skipped by the walks.
+/// CSR-style closed neighbourhoods over nonzero 64-bit blocks.
+/// Bits are only cleared, so block positions remain stable.
 struct SparseRows {
     row_ptr: Vec<u32>,
     block_ids: Vec<u32>,
@@ -27,10 +23,7 @@ struct SparseRows {
 }
 
 impl SparseRows {
-    /// Build from a canonical edge list. `deg` are closed-neighborhood sizes
-    /// (self included), as maintained by the caller for the precheck.
     fn build(n: usize, edges: &[Edge], deg: &[u32]) -> Self {
-        // Transient CSR neighbor lists (2 B per directed edge).
         let mut adj_ptr = vec![0u32; n + 1];
         for v in 0..n {
             adj_ptr[v + 1] = adj_ptr[v] + (deg[v] - 1);
@@ -44,8 +37,7 @@ impl SparseRows {
             fill[edge.v as usize] += 1;
         }
 
-        // Scatter each row into a dense scratch row, then harvest the touched
-        // blocks in sorted order. O(deg) per row, one nw-word scratch total.
+        // Reuse one dense scratch row while harvesting touched blocks.
         let nw = (n + 63) >> 6;
         let mut scratch = vec![0u64; nw];
         let mut touched: Vec<u32> = Vec::new();
@@ -89,7 +81,7 @@ impl SparseRows {
         self.row_ptr[v] as usize..self.row_ptr[v + 1] as usize
     }
 
-    /// N[w] ⊆ N[z], via a two-pointer walk over the sorted block ids.
+    /// Test `N[w]` containment in `N[z]`.
     #[inline]
     fn is_subset(&self, w: usize, z: usize) -> bool {
         let rw = self.range(w);
@@ -112,7 +104,6 @@ impl SparseRows {
         true
     }
 
-    /// Clear neighbor bit `u` in row `v`. The block exists by construction.
     #[inline]
     fn clear(&mut self, v: usize, u: usize) {
         let r = self.range(v);
@@ -124,11 +115,7 @@ impl SparseRows {
     }
 }
 
-/// Tighten an edge list's cutoff via sound strong-collapse peeling.
-///
-/// The list is sorted by ascending `(distance, endpoints)`, truncated to the
-/// certified radius, and left sorted for subsequent optimizations. Its center is
-/// the fixed cone apex and is not changed.
+/// Tighten the cutoff and leave edges sorted at the certified radius.
 pub(crate) fn peel(edge_list: &mut EdgeList, parallel: bool) {
     if !edge_list.sorted {
         if parallel {
@@ -159,15 +146,10 @@ pub(crate) fn peel(edge_list: &mut EdgeList, parallel: bool) {
 
     let nw = (n + 63) >> 6;
 
-    // Center ball at the starting cutoff. One dense row of n bits is cheap;
-    // only the per-vertex neighborhoods need the sparse representation.
     let mut ball_bits = vec![0u64; nw];
     ball_bits[center >> 6] |= 1u64 << (center & 63);
 
-    // Closed-neighborhood sizes, used both to size the sparse rows and for the
-    // O(1) domination precheck: N[w] ⊆ N[z] requires |N[w]| <= |N[z]|. Kept
-    // exact under edge removals, so the precheck only ever skips subset tests
-    // that would fail.
+    // Exact sizes make `|N[w]| <= |N[z]|` a sound containment precheck.
     let mut deg: Vec<u32> = vec![1; n];
     for edge in &edge_list.edges {
         let u = edge.u as usize;
@@ -175,8 +157,6 @@ pub(crate) fn peel(edge_list: &mut EdgeList, parallel: bool) {
         deg[u] += 1;
         deg[v] += 1;
 
-        // At the starting cutoff, the center ball is exactly the center and its
-        // present neighbors. Missing center edges are outside the ball.
         if u == center {
             ball_bits[v >> 6] |= 1u64 << (v & 63);
         } else if v == center {
@@ -184,7 +164,6 @@ pub(crate) fn peel(edge_list: &mut EdgeList, parallel: bool) {
         }
     }
 
-    // Neighborhoods at the current cutoff, including the diagonal.
     let mut rows = SparseRows::build(n, &edge_list.edges, &deg);
 
     let mut dirty: Vec<u32> = Vec::with_capacity(n);
@@ -196,20 +175,17 @@ pub(crate) fn peel(edge_list: &mut EdgeList, parallel: bool) {
         }
     }
 
-    // Cached dominators and their reverse users. Reverse entries may become
-    // stale and are filtered against `dominator` when revisited.
+    // Reverse dominator entries may be stale and are checked when reused.
     let mut dominator: Vec<i32> = vec![-1; n];
     let mut users: Vec<Vec<u32>> = vec![Vec::new(); n];
 
     let mut certified_radius = edge_list.threshold;
     let mut top = edge_list.edges.len();
 
-    // Descend through distinct edge radii, high to low.
     'levels: while top > 0 {
         let radius_bits = edge_list.edges[top - 1].distance.to_bits();
         let radius = f32::from_bits(radius_bits);
 
-        // Neighborhood and ball bitsets currently represent scale `radius`.
         while let Some(w_u32) = dirty.pop() {
             let w = w_u32 as usize;
             in_dirty[w] = false;
@@ -225,7 +201,6 @@ pub(crate) fn peel(edge_list: &mut EdgeList, parallel: bool) {
                 }
             }
 
-            // Candidates z ∈ N(w) ∩ ball, ascending id over w's occupied blocks.
             let w_block = (w >> 6) as u32;
             let w_mask = !(1u64 << (w & 63));
             let mut found = false;
@@ -255,7 +230,7 @@ pub(crate) fn peel(edge_list: &mut EdgeList, parallel: bool) {
 
         certified_radius = radius;
 
-        // Descend just below this radius by removing the entire tied edge level.
+        // Remove a tied level atomically before descending.
         while top > 0 && edge_list.edges[top - 1].distance.to_bits() == radius_bits {
             top -= 1;
             let a = edge_list.edges[top].u as usize;
@@ -281,8 +256,6 @@ pub(crate) fn peel(edge_list: &mut EdgeList, parallel: bool) {
                 }
             }
 
-            // Removing an edge incident to the center is exactly the event where
-            // the other endpoint leaves the center ball.
             let departure = if a == center {
                 Some(b)
             } else if b == center {
@@ -323,7 +296,6 @@ mod tests {
 
     #[test]
     fn sparse_rows_subset_and_clear() {
-        // Triangle 0-1-2 plus pendant 3 attached to 0.
         let edges = vec![
             unit_edge(1, 0),
             unit_edge(2, 0),
@@ -337,13 +309,10 @@ mod tests {
         }
         let mut rows = SparseRows::build(4, &edges, &deg);
 
-        // N[1] = {0,1,2} ⊆ N[0] = {0,1,2,3}; the converse fails.
         assert!(rows.is_subset(1, 0));
         assert!(!rows.is_subset(0, 1));
-        // Pendant: N[3] = {0,3} ⊆ N[0].
         assert!(rows.is_subset(3, 0));
 
-        // Remove edge (2,1): N[1] = {0,1} and N[2] = {0,2}, both still ⊆ N[0].
         rows.clear(2, 1);
         rows.clear(1, 2);
         assert!(rows.is_subset(1, 0));
@@ -353,7 +322,6 @@ mod tests {
 
     #[test]
     fn sparse_rows_cross_block_ids() {
-        // Star centered at 100 with leaves straddling three 64-bit blocks.
         let n = 200usize;
         let leaves = [3u32, 63, 64, 65, 127, 128, 199];
         let edges: Vec<Edge> = leaves
@@ -374,13 +342,10 @@ mod tests {
             assert!(rows.is_subset(l as usize, 100), "leaf {l} ⊆ center");
             assert!(!rows.is_subset(100, l as usize), "center ⊄ leaf {l}");
         }
-        // Distinct leaves are incomparable (each contains itself).
         assert!(!rows.is_subset(3, 199));
         assert!(!rows.is_subset(199, 3));
     }
 
-    /// End-to-end peel on a point cloud large enough that rows span multiple
-    /// 64-bit blocks (n = 144 > 128).
     #[test]
     fn multi_block_grid_peels_soundly() {
         let mut points = Vec::new();
@@ -454,8 +419,6 @@ mod tests {
 
     #[test]
     fn peel_must_not_skip_cycle_inside_center_distance_gap() {
-        // 5-point kite plus center P. The H1 bar (1.1, 1.5) lies entirely
-        // inside the center-distance gap (1.05, 1.5).
         let lower = [1.5, 1.05, 1.0, 1.05, 1.5, 1.0, 1.5, 1.1, 1.5, 1.0];
         let matrix = square_from_lower_tri(5, &lower);
         let mut edge_list = EdgeList::from_distance_matrix(&matrix, 5, 1.5);

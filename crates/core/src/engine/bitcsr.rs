@@ -1,28 +1,11 @@
-// ═══════════════════════════════════════════════════════════════════════════════
-// bitcsr.rs — tail-truncated bitset sparse distance matrix (the data structure)
-// ═══════════════════════════════════════════════════════════════════════════════
-//
-// `BitCsrDistanceMatrix` stores one tail-truncated adjacency bitset per vertex,
-// flattened into `words`. Distances are stored per word in descending bit order,
-// so a neighbour id is implicit in the bit position and its distance is found by
-// one popcount rank inside the word. The hot cofacet operation is therefore a
-// k-way AND over aligned `u64` blocks followed by set-bit iteration.
-//
-// This file owns ONLY the representation and its primitive bit/neighbour
-// operations. It knows nothing about simplices, cofacets, apparent pairs, or
-// reduction columns — those live in the Ripser algorithm layer (`algorithm.rs`),
-// which drives this structure through the `pub(crate)` primitives below.
+// Each row is a tail-truncated adjacency bitset. Distances follow set bits in
+// descending bit order, so a popcount rank locates each value.
 
 use crate::preprocess::edgelist::EdgeList;
 
-/// Sparse distance matrix as flattened tail-truncated bitsets plus per-bit
-/// distances.
-///
 /// Row `v` occupies `words[word_ptr[v]..word_ptr[v + 1]]`; word index `b` in
-/// that row represents neighbour ids `64*b..64*b+63`. Rows are truncated after
-/// their highest nonzero word. `val_ptr` has one entry per flattened word plus a
-/// sentinel; distances for set bits in word `wi` live in
-/// `val[val_ptr[wi]..val_ptr[wi + 1]]`, ordered from high bit to low bit.
+/// that row represents ids `64*b..64*b+63`. `val_ptr` maps each word to values
+/// ordered from high bit to low bit.
 pub struct BitCsrDistanceMatrix {
     n: usize,
     word_ptr: Vec<u32>,
@@ -32,9 +15,7 @@ pub struct BitCsrDistanceMatrix {
 }
 
 impl BitCsrDistanceMatrix {
-    // ── Construction ──────────────────────────────────────────────────────────
-
-    /// Consume a canonical half-edge list and build the symmetric BitCSR layout.
+    /// Build symmetric rows from canonical half-edges.
     pub(crate) fn from_edge_list(edge_list: EdgeList) -> Self {
         let EdgeList { n, edges, .. } = edge_list;
 
@@ -101,8 +82,6 @@ impl BitCsrDistanceMatrix {
         }
     }
 
-    // ── Accessors ─────────────────────────────────────────────────────────────
-
     #[inline(always)]
     pub(crate) fn n(&self) -> usize {
         self.n
@@ -132,7 +111,7 @@ impl BitCsrDistanceMatrix {
         unsafe { *self.val.get_unchecked(start + rank) }
     }
 
-    /// Distance between an existing edge `(a, b)`. Debug-asserts the edge exists.
+    /// `a` and `b` must be adjacent.
     #[inline(always)]
     pub(crate) fn edge_dist(&self, a: u32, b: u32) -> f32 {
         let block = (b as usize) >> 6;
@@ -151,18 +130,13 @@ impl BitCsrDistanceMatrix {
         self.word_distance_unchecked(flat, word, bit)
     }
 
-    /// Encoded (raw u32 bits) distance of edge `(a, b)`.
     #[inline(always)]
     pub(crate) fn edge_dist_bits(&self, a: u32, b: u32) -> u32 {
         self.edge_dist(a, b).to_bits()
     }
 
-    // ── Neighbour enumeration primitives ──────────────────────────────────────
-
-    /// Enumerate the common neighbours of `verts[0..vc]` whose id exceeds `floor`
-    /// (pass `-1` for no floor), youngest-first (descending id). For each, `f`
-    /// receives the neighbour id and `max_extra` — the largest distance from that
-    /// neighbour to any vertex in the set. Return `false` from `f` to stop.
+    /// Enumerate common neighbours above `floor` in descending id order.
+    /// The callback also receives the largest incident distance.
     #[inline]
     pub(crate) fn for_each_common_neighbor<const K: usize>(
         &self,
@@ -218,9 +192,7 @@ impl BitCsrDistanceMatrix {
         }
     }
 
-    /// Specialised common-neighbour enumeration for an edge `(v0, v1)` that
-    /// yields BOTH edge distances `(w, d(w,v0), d(w,v1))`, youngest-first above
-    /// `floor`. Return `false` from `f` to stop.
+    /// Enumerate common neighbours as `(w, d(w,v0), d(w,v1))`.
     #[inline]
     pub(crate) fn for_each_common_neighbor_edges(
         &self,
@@ -270,9 +242,7 @@ impl BitCsrDistanceMatrix {
         }
     }
 
-    /// Enumerate vertex `v`'s neighbours with id `> v`, youngest-first, each with
-    /// its edge distance. This is the per-row primitive H0 edge enumeration is
-    /// built from. Return `false` from `f` to stop.
+    /// Enumerate neighbours above `v` in descending id order.
     #[inline]
     pub(crate) fn for_each_neighbor_above(&self, v: usize, mut f: impl FnMut(u32, f32) -> bool) {
         let row_start = self.row_start(v);
@@ -322,10 +292,7 @@ impl BitCsrDistanceMatrix {
                 return acc;
             }
 
-            // Rows 2..K-1. `K` is a monomorphisation constant, so this loop
-            // fully unrolls to exactly the depth the layout needs — for
-            // Simplex128 (K = 6) this is the historical 6-deep chain, with
-            // no dead arms from wider layouts in the instruction stream.
+            // `K` is constant per monomorphisation, allowing full unrolling.
             let mut k = 2;
             while k + 1 < K {
                 let w = *words.get_unchecked(row_start[k] + block);
@@ -339,7 +306,6 @@ impl BitCsrDistanceMatrix {
                 k += 1;
             }
 
-            // Reaching here means vc == K: the last row is unconditional.
             let w = *words.get_unchecked(row_start[K - 1] + block);
             if w == 0 {
                 return 0;
@@ -473,8 +439,6 @@ mod tests {
         true
     }
 
-    /// Build BitCSR from a lower-triangular fixture through the real pdist
-    /// distance-matrix path.
     fn bitcsr_from_lower_tri(lt: &[f32], n: usize, threshold: f32) -> (BitCsrDistanceMatrix, f32) {
         let sq = square_from_lower_tri(n, lt);
         let edges = EdgeList::from_distance_matrix(&sq, n, threshold);
@@ -482,8 +446,6 @@ mod tests {
         (BitCsrDistanceMatrix::from_edge_list(edges), effective)
     }
 
-    /// The sequential and parallel assembly paths must produce bit-identical
-    /// barcodes on the same input.
     fn seq_par_check(lt: &[f32], n: usize, threshold: f32, max_dim: usize) {
         let (bitcsr, eff) = bitcsr_from_lower_tri(lt, n, threshold);
         let seq = compute::<6, Simplex128>(&bitcsr, max_dim, false);
@@ -575,10 +537,13 @@ mod tests {
                 })
                 .collect();
             for &thr in &[0.4f32, 0.8, f32::INFINITY] {
-                // max_dim 3 (finite threshold only, to bound cost) exercises the
-                // parallel `build_pool` path that concatenates the next-dimension
-                // simplex pool across workers.
-                let max_dims: &[usize] = if thr.is_finite() { &[1, 2, 3] } else { &[1, 2] };
+                // max_dim 3 exercises the parallel `build_pool` path that
+                // concatenates the next-dimension simplex pool across workers.
+                // It runs at the tightest threshold only: there the dim-2 pool
+                // is still ~5k simplices (far above `PARALLEL_ASSEMBLE_THRESHOLD`,
+                // so the path is genuinely taken) while the filtration is ~37x
+                // smaller than at thr=0.8, which alone cost 68% of this test.
+                let max_dims: &[usize] = if thr < 0.5 { &[1, 2, 3] } else { &[1, 2] };
                 for &max_dim in max_dims {
                     seq_par_check(&data, n, thr, max_dim);
                 }

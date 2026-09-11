@@ -4,13 +4,10 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 use tda_core::{filtration_size_with, persistent_homology_with, Config};
 
-/// The variants run in every table: (label, quotient, peel, collapse).
-/// Plain transforms first, then the quotient combinations.
 const VARIANTS: [(&str, bool, bool, bool); 7] = [
     ("Vanilla", false, false, false),
     ("Peel", false, true, false),
     ("Clps", false, false, true),
-    // Peel truncates the radius first, so collapse enumerates a smaller graph.
     ("Peel+Clps", false, true, true),
     ("Quot", true, false, false),
     ("Quot+Peel", true, true, false),
@@ -18,11 +15,9 @@ const VARIANTS: [(&str, bool, bool, bool); 7] = [
 ];
 
 const N: usize = VARIANTS.len();
-const W_NAME: usize = 12; // dataset column
-const W_COL: usize = 9; // every other column
+const W_NAME: usize = 12;
+const W_COL: usize = 9;
 
-/// Variant config: point-cloud input, no threshold, the three transforms plus
-/// the parallel switch.
 fn cfg(quotient: bool, peel: bool, collapse: bool, parallel: bool) -> Config {
     Config {
         quotient,
@@ -37,7 +32,6 @@ fn data_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../data")
 }
 
-/// The datasets to run are controlled by data/datasets.txt (order included).
 fn dataset_files() -> Vec<String> {
     fs::read_to_string(data_dir().join("datasets.txt"))
         .expect("failed to read data/datasets.txt")
@@ -48,8 +42,6 @@ fn dataset_files() -> Vec<String> {
         .collect()
 }
 
-/// Loads the dataset from a text file into a flat `Vec<f32>`,
-/// alongside the number of points `n` and dimensions `d`.
 fn load_points(path: &str) -> (Vec<f32>, usize, usize) {
     let text = fs::read_to_string(data_dir().join(path))
         .unwrap_or_else(|_| panic!("Failed to read file: {}", path));
@@ -72,7 +64,6 @@ fn load_points(path: &str) -> (Vec<f32>, usize, usize) {
     (flat, n, d)
 }
 
-/// Header line + separator, one column per variant.
 fn print_header() {
     print!("{:<w$}", "Dataset", w = W_NAME);
     for (label, ..) in VARIANTS {
@@ -87,7 +78,6 @@ fn print_header() {
     println!();
 }
 
-/// One dataset row; the cells are pre-formatted strings.
 fn print_row(name: &str, cells: &[String; N]) {
     print!("{:<w$}", name, w = W_NAME);
     for cell in cells {
@@ -97,14 +87,9 @@ fn print_row(name: &str, cells: &[String; N]) {
 }
 
 fn main() {
-    // Check if the "--parallel" flag was passed in the command line arguments.
-    // Defaults to false if not found.
     let is_parallel = env::args().any(|arg| arg == "--parallel" || arg == "parallel");
     let max_dim = 2;
 
-    // ═══════════════════════════════════════════════════════════════════════════════
-    // 1. Runtime Analysis
-    // ═══════════════════════════════════════════════════════════════════════════════
     println!(
         "=== RUNTIME (max_dim = {}, parallel = {}) ===",
         max_dim, is_parallel
@@ -123,15 +108,11 @@ fn main() {
             cells[i] = format!("{:.2?}", start.elapsed());
         }
 
-        // Print row as it processes
         print_row(name, &cells);
     }
 
     println!();
 
-    // ═══════════════════════════════════════════════════════════════════════════════
-    // 2. Filtration Size Analysis (sizes and runtimes in two separate tables)
-    // ═══════════════════════════════════════════════════════════════════════════════
     struct Row {
         name: String,
         sizes: [usize; N],

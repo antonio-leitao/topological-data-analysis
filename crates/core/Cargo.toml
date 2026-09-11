@@ -10,16 +10,12 @@ readme.workspace = true
 keywords.workspace = true
 categories.workspace = true
 
-# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 [lib]
 name = "tda_core"
 
 [features]
 default = ["coords"]
-# The coordinates layer (tda_core::coords + the mod-p engine behind it). It
-# never executes in the persistence path; the gate exists so the pure engine
-# can be built and benchmarked without ~2k lines of cold code shifting binary
-# layout: `cargo bench -p tda_core --no-default-features`.
+# Excluding coordinates keeps their code layout out of engine benchmarks.
 coords = []
 
 [dependencies]

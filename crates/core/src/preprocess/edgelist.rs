@@ -1,12 +1,5 @@
-//! Sparse weighted edge-list construction from point clouds, distance
-//! matrices, and sparse COO distance graphs.
-//!
-//! This is the common data boundary between distance preprocessing and the
-//! optional filtration transforms. Each undirected edge is stored once with
-//! `u > v`. Point-cloud construction runs the tiled distance kernel in a
-//! single buffered pass; the staging buffer is kept small by a sampled
-//! eccentricity bound ([`staging_cutoff`]) that provably exceeds the final
-//! truncation radius.
+//! Canonical weighted edge lists from points, dense distances, or sparse COO.
+//! Each undirected edge is stored once with `u > v`.
 
 use rayon::prelude::*;
 
@@ -17,10 +10,9 @@ const NC: usize = 256;
 
 const NO_EDGE: f32 = f32::MAX;
 const PARALLEL_POINT_MIN_PAIRS: usize = 1 << 18;
-/// Number of vertices whose exact eccentricity seeds the staging cutoff.
 const STAGING_SAMPLES: usize = 8;
 
-/// One weighted undirected edge, stored canonically with `u > v`.
+/// Weighted undirected edge with `u > v`.
 #[derive(Clone, Copy, Debug, PartialEq)]
 #[repr(C)]
 pub(crate) struct Edge {
@@ -29,18 +21,16 @@ pub(crate) struct Edge {
     pub(crate) distance: f32,
 }
 
-/// The truncated weighted 1-skeleton produced by distance preprocessing.
 pub(crate) struct EdgeList {
     pub(crate) n: usize,
     pub(crate) edges: Vec<Edge>,
     pub(crate) center: u32,
     pub(crate) threshold: f32,
-    /// True only when `edges` is in ascending `(distance, endpoints)` order.
+    /// Whether edges are sorted by `(distance, endpoints)`.
     pub(crate) sorted: bool,
 }
 
 impl EdgeList {
-    /// Build the truncated edge list of a row-major `(n, d)` point cloud.
     pub(crate) fn from_points(
         data: &[f32],
         n: usize,
@@ -62,9 +52,7 @@ impl EdgeList {
             };
         }
 
-        // Sound staging cutoff: an upper bound on the enclosing radius from a
-        // few exact eccentricities. Edges above it can never survive the final
-        // truncation, so they are never staged.
+        // Sampled eccentricities bound the final truncation radius from above.
         let staging = staging_cutoff(data, n, d, threshold);
 
         let pairs = n * (n - 1) / 2;
@@ -76,8 +64,7 @@ impl EdgeList {
         }
     }
 
-    /// Build the truncated edge list of a row-major `(n, n)` distance matrix.
-    /// Only the strict lower triangle is read; entries `>= f32::MAX` are absent.
+    /// Read the strict lower triangle; values at least `f32::MAX` are absent.
     pub(crate) fn from_distance_matrix(mat: &[f32], n: usize, threshold: f32) -> Self {
         debug_assert_eq!(mat.len(), n * n);
         debug_assert!(n <= crate::MAX_POINTS);
@@ -93,12 +80,7 @@ impl EdgeList {
             };
         }
 
-        // One pass over the strict lower triangle: per-row max over FINITE
-        // entries, per-row finite-entry count, and union-find components over
-        // the finite-distance relation. Finite entries exist only within a
-        // component (by construction of the components), so `max_dist[i]` is
-        // vertex i's intra-component eccentricity and `finite_count[i]` tells
-        // us whether i sees its whole component.
+        // Track component membership, row maxima, and finite neighbour counts.
         let mut max_dist = vec![f32::NEG_INFINITY; n];
         let mut finite_count = vec![0u32; n];
         let mut parent: Vec<u32> = (0..n as u32).collect();
@@ -152,13 +134,8 @@ impl EdgeList {
         }
     }
 
-    /// Build the truncated edge list from COO entries of a sparse distance
-    /// graph. The graph is undirected: entries may come in either or both
-    /// orientations, duplicates are allowed, and the smallest finite distance
-    /// for a pair wins. Diagonal entries are ignored. Entries `>= f32::MAX`
-    /// (or NaN) are absent — a pair with no finite entry is never connected,
-    /// exactly like an infinite entry in the dense distance-matrix path, and
-    /// truncation uses the same per-component minimax certificate.
+    /// Build from an undirected COO graph. The minimum finite duplicate wins;
+    /// diagonal, NaN, and values at least `f32::MAX` are ignored.
     ///
     /// Indices must be `< n` (validated by the caller; debug-asserted here).
     pub(crate) fn from_coo(
@@ -183,7 +160,6 @@ impl EdgeList {
             };
         }
 
-        // Canonical (u > v) finite edges, deduplicated to the minimum distance.
         let mut edges: Vec<Edge> = Vec::with_capacity(vals.len());
         for ((&r, &c), &distance) in rows.iter().zip(cols).zip(vals) {
             debug_assert!((r as usize) < n && (c as usize) < n);
@@ -196,8 +172,6 @@ impl EdgeList {
         edges.sort_unstable_by_key(|edge| (edge.u, edge.v, edge.distance.to_bits()));
         edges.dedup_by_key(|edge| (edge.u, edge.v)); // keeps the first = smallest
 
-        // Same statistics as the dense path: per-vertex max finite distance,
-        // distinct-neighbor counts, and components over the finite relation.
         let mut max_dist = vec![f32::NEG_INFINITY; n];
         let mut finite_count = vec![0u32; n];
         let mut parent: Vec<u32> = (0..n as u32).collect();
@@ -451,19 +425,10 @@ fn tiled_pass(
     }
 }
 
-/// Upper bound on the truncation radius from a few exact eccentricities,
-/// combined with the user threshold.
+/// Sampled eccentricity upper bound for the enclosing radius.
 ///
-/// The enclosing radius is `min_v ecc(v)`, so the eccentricity of ANY vertex
-/// bounds it from above, and the final cutoff `min(threshold, r_enc)` can
-/// never exceed `min(threshold, ecc(sample))`. Staging edges only up to this
-/// bound is therefore sound, and it shrinks the staging buffer from "every
-/// pair under the user threshold" to roughly the surviving edge count (a
-/// sampled eccentricity is at most `2 * r_enc` by the triangle inequality).
-///
-/// The bound is widened by a d-scaled epsilon so that float summation-order
-/// differences between this scalar loop and the tiled kernel cannot push the
-/// certified radius above it; `finalize_points` asserts that invariant.
+/// A dimension-scaled epsilon covers summation-order differences with the
+/// tiled distance kernel.
 fn staging_cutoff(data: &[f32], n: usize, d: usize, threshold: f32) -> f32 {
     let mut bound_sq = f32::INFINITY;
     let step = (n / STAGING_SAMPLES).max(1);
@@ -487,14 +452,10 @@ fn staging_cutoff(data: &[f32], n: usize, d: usize, threshold: f32) -> f32 {
         }
         p += step;
     }
-    // Absorb summation-order float noise between this loop and the tiled
-    // kernel (relative error is O(d * eps) on the squared distances).
     let safety = 1.0 + (d as f32) * f32::EPSILON * 8.0;
     threshold.min(bound_sq.sqrt() * safety)
 }
 
-/// Shared tail of the point paths: tighten to the certified radius, drop the
-/// staged edges above it, and release the staging slack.
 fn finalize_points(
     n: usize,
     mut edges: Vec<Edge>,
@@ -504,16 +465,13 @@ fn finalize_points(
     r_cheb: f32,
 ) -> EdgeList {
     let effective = threshold.min(r_cheb);
-    // The staging cutoff bounds the certified radius by construction (with
-    // the float-noise cushion); a violation would mean silently dropped edges.
+    // Failure would mean the staging pass omitted required edges.
     assert!(
         effective <= staging,
         "staging cutoff {staging} fell below the certified radius {r_cheb}"
     );
     if effective < staging {
         edges.retain(|edge| edge.distance <= effective);
-        // The staging buffer was sized for the staging cutoff; release the
-        // dead capacity so it doesn't ride along through peel/coperto/BitCSR.
         edges.shrink_to_fit();
     }
 
@@ -539,9 +497,8 @@ fn reduce_minimax(max_dist: &[f32]) -> (usize, f32) {
     (center, radius)
 }
 
-/// Union-find lookup with path halving (parents are vertex ids in `0..n`).
 #[inline]
-fn uf_find(parent: &mut [u32], mut i: u32) -> u32 {
+pub(crate) fn uf_find(parent: &mut [u32], mut i: u32) -> u32 {
     while parent[i as usize] != i {
         let grand = parent[parent[i as usize] as usize];
         parent[i as usize] = grand;
@@ -550,7 +507,6 @@ fn uf_find(parent: &mut [u32], mut i: u32) -> u32 {
     i
 }
 
-/// Union by component size; `comp_size` is meaningful at roots only.
 #[inline]
 fn uf_union(parent: &mut [u32], comp_size: &mut [u32], a: u32, b: u32) {
     let ra = uf_find(parent, a);
@@ -567,20 +523,11 @@ fn uf_union(parent: &mut [u32], comp_size: &mut [u32], a: u32, b: u32) {
     comp_size[big as usize] += comp_size[small as usize];
 }
 
-/// Sound truncation radius for a possibly-disconnected distance matrix.
+/// Component-wise cone certificate for disconnected distance data.
 ///
-/// VR of a disjoint union is the disjoint union of the VRs, so every component
-/// is coned independently by its own apex — a vertex with a finite entry to
-/// every OTHER member of its component. The certified global cutoff is the MAX
-/// over components of the per-component minimax radius; a component with no
-/// valid apex contributes infinity (no finite certificate exists for it).
-///
-/// A global minimax over finite row maxima would understate rows that are
-/// missing entries and unsoundly truncate late features in other components.
-///
-/// Returns `(center, radius)`: the apex realising the winning component's
-/// radius (downstream, peel's cone apex) and the cutoff itself. Singleton
-/// components are cones of radius 0.
+/// Each component uses an apex adjacent to every member. The global cutoff is
+/// the largest component radius; a component without an apex contributes
+/// infinity. Singletons contribute zero.
 fn per_component_minimax(
     parent: &mut [u32],
     comp_size: &[u32],
@@ -593,8 +540,7 @@ fn per_component_minimax(
     for i in 0..n {
         let root = uf_find(parent, i as u32) as usize;
         if finite_count[i] == comp_size[root] - 1 {
-            // Valid apex: i sees its whole component. (For singletons,
-            // max_dist is still the -inf sentinel; their cone radius is 0.)
+            // Singletons retain the negative-infinity row sentinel.
             let radius = if comp_size[root] == 1 {
                 0.0
             } else {
@@ -614,8 +560,6 @@ fn per_component_minimax(
             continue; // roots only
         }
         let radius = r_enc[v];
-        // A component with no valid apex has no apex to offer; any of its
-        // vertices is a sound (if unhelpful) peel center.
         let candidate = if radius.is_finite() {
             apex[v] as usize
         } else {
@@ -691,11 +635,7 @@ fn points_single_pass_parallel(
     finalize_points(n, edges, center, threshold, staging, r_cheb)
 }
 
-// ═══════════════════════════════════════════════════════════════════════════════
-// Rectangular cross-neighbourhoods (out-of-sample transform support)
-// ═══════════════════════════════════════════════════════════════════════════════
-
-/// Sparse cross-neighbourhood rows: for query point `q`,
+/// For query `q`,
 /// `cols/dists[offsets[q]..offsets[q + 1]]` are the train points within
 /// `radius` (strict), ascending train index.
 pub(crate) struct CrossNeighbors {
@@ -704,11 +644,7 @@ pub(crate) struct CrossNeighbors {
     pub(crate) dists: Vec<f32>,
 }
 
-/// All (query, train) pairs closer than `radius`, through the same tiled
-/// micro-kernel as the square pass — no triangular skipping, queries down the
-/// rows and train points across the columns. Deterministic: bands of queries
-/// are processed independently (rayon when `parallel`) and stitched in order,
-/// and each row's entries ascend in train index.
+/// Find cross pairs below `radius`, preserving query and train index order.
 pub(crate) fn cross_neighbors(
     queries: &[f32],
     m: usize,
@@ -797,8 +733,7 @@ pub(crate) fn cross_neighbors(
     }
 }
 
-/// Lower-triangular fixture → symmetric square matrix. Test-only helper shared
-/// with the engine fixtures (formerly `_pdist::square_from_lower_tri`).
+/// Expand a lower-triangular test fixture to a symmetric matrix.
 #[cfg(test)]
 pub(crate) fn square_from_lower_tri(n: usize, lt: &[f32]) -> Vec<f32> {
     debug_assert_eq!(lt.len(), n * (n - 1) / 2);
@@ -835,14 +770,8 @@ mod tests {
         d[j * n + i] = v;
     }
 
-    /// REGRESSION (disconnected enclosing radius): a global minimax over
-    /// finite row maxima would truncate at the SMALLEST component's radius
-    /// (1.0 here) and drop component A's diagonals. The sound cutoff is the
-    /// per-component maximum.
     #[test]
     fn disconnected_truncation_uses_max_component_radius() {
-        // Component A: unit 4-cycle (0-1-2-3) with diagonals 2.0 => r_enc = 2.
-        // Component B: pair (4, 5) at distance 1.0 => r_enc = 1.
         let n = 6;
         let mut d = vec![f32::INFINITY; n * n];
         for i in 0..n {
@@ -864,8 +793,6 @@ mod tests {
 
     #[test]
     fn isolated_vertex_does_not_affect_truncation() {
-        // Unit triangle (0,1,2) plus a fully-isolated vertex 3: the singleton
-        // is a cone of radius 0 and must not push the cutoff to infinity.
         let n = 4;
         let mut d = vec![f32::INFINITY; n * n];
         for i in 0..n {
@@ -880,15 +807,8 @@ mod tests {
         assert_eq!(e.edges.len(), 3);
     }
 
-    /// A component in which NO vertex sees every other member admits no
-    /// finite cone certificate: the cutoff must fall back to the user
-    /// threshold (here infinity), keeping every finite edge.
     #[test]
     fn component_without_apex_disables_truncation() {
-        // 4-cycle with BOTH diagonal entries missing: every row is incomplete
-        // (each vertex sees 2 of its 3 co-members), so there is no apex.
-        // Note a star center WOULD be a valid apex even with missing entries
-        // elsewhere — the cone argument only needs the apex row complete.
         let n = 4;
         let mut d = vec![f32::INFINITY; n * n];
         for i in 0..n {
@@ -904,9 +824,6 @@ mod tests {
         assert_eq!(e.edges.len(), 4);
     }
 
-    /// The sampled staging cutoff must be transparent: the output (edges,
-    /// center, effective threshold) is identical to staging at the full user
-    /// threshold, for finite and infinite thresholds.
     #[test]
     fn staging_cutoff_is_transparent() {
         for &(n, d) in &[(5, 2), (17, 3), (33, 5), (70, 2)] {
@@ -918,8 +835,6 @@ mod tests {
                 .collect();
             for threshold in [0.25, 0.9, f32::INFINITY] {
                 let staged = EdgeList::from_points(&points, n, d, threshold, false);
-                // Reference: no sampled bound — stage every pair under the
-                // user threshold, tighten afterwards exactly as before.
                 let reference = points_single_pass(&points, n, d, threshold, threshold);
                 assert_eq!(staged.n, reference.n);
                 assert_eq!(staged.center, reference.center);
@@ -953,9 +868,6 @@ mod tests {
         }
     }
 
-    /// The rectangular pass must agree with brute force: same membership,
-    /// ascending train indices per row, distances within kernel tolerance,
-    /// sequential ≡ parallel.
     #[test]
     fn cross_neighbors_matches_brute_force() {
         let (m, n, d) = (37usize, 71usize, 3usize);
@@ -1003,8 +915,6 @@ mod tests {
         }
     }
 
-    /// COO input: duplicates resolve to the minimum, orientation and the
-    /// diagonal are irrelevant, and truncation uses the per-component minimax.
     #[test]
     fn coo_dedups_to_min_and_canonicalizes() {
         let rows = [0u32, 1, 1, 2, 2];
@@ -1012,7 +922,6 @@ mod tests {
         let vals = [3.0f32, 1.0, 5.0, 5.0, 9.0];
         let e = EdgeList::from_coo(3, &rows, &cols, &vals, f32::INFINITY);
 
-        // (1, 0) given twice → min 1.0; (2, 1) given twice → 5.0.
         assert_eq!(sorted_edges(&e).len(), 2);
         assert!(e.edges.iter().all(|edge| edge.u > edge.v));
         assert!(e
@@ -1023,16 +932,12 @@ mod tests {
             .edges
             .iter()
             .any(|edge| (edge.u, edge.v, edge.distance) == (2, 1, 5.0)));
-        // Vertex 1 is the only valid apex (sees 0 and 2): r_enc = max(1, 5).
         assert_eq!(e.threshold, 5.0);
         assert_eq!(e.center, 1);
     }
 
-    /// A dense matrix and its COO expansion must produce identical edge lists,
-    /// including the disconnected-component truncation behaviour.
     #[test]
     fn coo_matches_dense_matrix_path() {
-        // Same fixture as `disconnected_truncation_uses_max_component_radius`.
         let n = 6;
         let mut d = vec![f32::INFINITY; n * n];
         for i in 0..n {
@@ -1046,7 +951,6 @@ mod tests {
         set_sym(&mut d, n, 1, 3, 2.0);
         set_sym(&mut d, n, 4, 5, 1.0);
 
-        // COO expansion of every entry, including infinities and the diagonal.
         let mut rows = Vec::new();
         let mut cols = Vec::new();
         let mut vals = Vec::new();

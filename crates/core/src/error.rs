@@ -1,17 +1,10 @@
 use thiserror::Error;
 
-/// Anything that can go wrong inside the `tda` crate.
+/// Errors returned by the core and coordinate APIs.
 ///
-/// All variants are O(1) detectable at the entry-function boundary. The crate
-/// deliberately does **not** validate distance matrix contents (negativity,
-/// finiteness, symmetry, zero diagonal) — those are documented preconditions,
-/// not enforced invariants. Sweeping an n×n matrix just to produce a friendly
-/// error costs as much as the minimax computation itself, and this library
-/// optimises for the path where inputs are well-formed.
-///
-/// In particular, `f32::INFINITY` is a legitimate distance value (used to
-/// represent disconnected pairs in graph inputs) and is allowed to flow
-/// through unchecked.
+/// Dense distance matrices must be symmetric and non-negative with a zero
+/// diagonal. The crate does not scan them to enforce these preconditions.
+/// Infinite entries represent disconnected pairs.
 #[derive(Debug, Clone, Error)]
 pub enum Error {
     #[error("need at least 2 points, got {got}")]
@@ -55,31 +48,17 @@ pub enum Error {
     #[error("sparse entry ({u}, {v}) is out of range for n={n}")]
     SparseIndexOutOfRange { u: u32, v: u32, n: usize },
 
-    #[error(
-        "coordinates: requested class {requested} but only {available} \
-         classes exist in dimension {dim}"
-    )]
-    NotEnoughClasses {
-        requested: usize,
-        available: usize,
-        dim: usize,
-    },
+    #[error("coordinates: requested class {requested} but only {available} H1 classes exist")]
+    NotEnoughClasses { requested: usize, available: usize },
 
     #[error("coordinates: scale {scale} outside the class interval [{birth}, {death})")]
     InvalidScale { scale: f32, birth: f32, death: f32 },
 
-    #[error("coordinates: target_dim must be in 1..={max} for {points} input points, got {got}")]
-    InvalidTargetDim {
-        got: usize,
-        max: usize,
-        points: usize,
-    },
-
     #[error(
-        "coordinates: the balanced integer lift of the selected H^{dim} cocycle over Z/{prime} \
+        "coordinates: the balanced integer lift of the selected H^1 cocycle over Z/{prime} \
          is not closed at scale {scale}; choose another class, scale, or prime"
     )]
-    NonIntegralCocycleLift { dim: usize, prime: u32, scale: f32 },
+    NonIntegralCocycleLift { prime: u32, scale: f32 },
 
     #[error("coordinates: prime must be an odd prime below 65536, got {0}")]
     InvalidPrime(u32),
@@ -88,5 +67,4 @@ pub enum Error {
     NotImplemented(&'static str),
 }
 
-/// Crate-wide `Result` alias.
 pub type Result<T> = std::result::Result<T, Error>;

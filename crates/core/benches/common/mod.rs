@@ -22,7 +22,6 @@ pub fn max_dim_from_env() -> usize {
         .expect("TDA_MAX_DIM must be 1 or 2")
 }
 
-/// Which optional preprocessing to exercise on top of the vanilla pipeline.
 #[derive(Clone, Copy)]
 pub struct Variant {
     pub name: &'static str,
@@ -70,8 +69,7 @@ pub fn variant_from_env() -> Variant {
         .expect("TDA_VARIANT must be vanilla, peel, quot, or clps")
 }
 
-/// Group / directory label: the historical `bitcsr_h{d}` for vanilla (keeps
-/// existing criterion baselines comparable), `bitcsr_h{d}_{variant}` otherwise.
+/// Preserve the vanilla Criterion group name; suffix transformed variants.
 pub fn group_name(max_dim: usize, variant: Variant) -> String {
     if variant.peel || variant.quotient || variant.collapse {
         format!("bitcsr_h{max_dim}_{}", variant.name)
@@ -93,7 +91,6 @@ pub fn parse_max_dim(value: &str) -> Result<usize, String> {
     }
 }
 
-/// The datasets to run are controlled by data/datasets.txt (order included).
 pub fn dataset_files() -> Vec<String> {
     fs::read_to_string(data_dir().join("datasets.txt"))
         .expect("failed to read data/datasets.txt")

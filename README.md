@@ -83,8 +83,8 @@ For a guided introduction, see the runnable notebooks:
 
 - [`persistent_homology.ipynb`](examples/persistent_homology.ipynb) covers
   circles, spheres, distance matrices, and quotient preprocessing.
-- [`coordinates.ipynb`](examples/coordinates.ipynb) shows circular,
-  projective, and fitted coordinates.
+- [`coordinates.ipynb`](examples/coordinates.ipynb) shows circular, toroidal,
+  and fitted coordinates.
 
 ### Inputs
 
@@ -192,27 +192,40 @@ scales.
 
 ### Coordinates
 
-Coordinates bring a selected persistent cohomology class back to the original
-observations. Circular coordinates, for example, assign every point an angle
-on S¹:[^circcoords]
+Coordinates bring selected persistent cohomology classes back to the original
+observations. One H¹ class assigns every point an angle on S¹:[^circcoords]
 
 ```python
 result = tda.coords.circular(points)
 angles = result.coordinates  # (n, 1), values in [0, 2π)
 ```
 
-TDA's coordinate constructions are adapted from
+Asking for several classes gives one column each. Classes that are alive at a
+common scale are jointly decorrelated by lattice reduction into a single map to
+a torus; `result.groups` reports which columns were decorrelated together:[^toroidal]
+
+```python
+two_circles = np.concatenate([points, points + [4.0, 0.0]])
+
+result = tda.coords.circular(two_circles, n_classes=2)
+result.coordinates  # (n, 2)
+result.groups       # [[0, 1]] — both columns in one toroidal block
+```
+
+Classes that are not co-alive stay independent and come back as singleton
+groups (`[[0], [1]]`), which are plain circular coordinates.
+
+These constructions are adapted from
 [DREiMAC](https://dreimac.scikit-tda.org/en/latest/), the reference
-implementation.[^dreimac] The API also includes toroidal coordinates and real
-and complex projective targets.[^toroidal][^projcoords] See the
+implementation.[^dreimac] See the
 [`coordinates` notebook](examples/coordinates.ipynb) for the geometric
-intuition, target selection, quotient coordinates, and fitted maps for new
+intuition, class selection, quotient coordinates, and fitted maps for new
 data.
 
-Circular and complex projective coordinates check the balanced finite-field
-lift. DREiMAC can repair a failed lift with mixed-integer optimization; TDA
-instead returns an error and leaves the choice of another class, scale, or
-prime to the user.[^dreimac-lift]
+The integer lift of the selected cocycle is checked for closedness. DREiMAC can
+repair a failed lift with mixed-integer optimization; TDA instead returns an
+error and leaves the choice of another class, scale, or prime to the
+user.[^dreimac-lift]
 
 ## Additional APIs
 
@@ -223,9 +236,9 @@ preprocessing options without computing persistence:
 size = tda.filtration_size(points, max_dim=2, quotient=True)
 ```
 
-Fitted `circular_map`, `projective_map`, and `complex_projective_map` objects
-can transform new point-cloud observations without recomputing persistence.
-See the [coordinates notebook](examples/coordinates.ipynb) for examples.
+A fitted `circular_map` transforms new point-cloud observations without
+recomputing persistence. See the
+[coordinates notebook](examples/coordinates.ipynb) for examples.
 
 ### Rust
 
@@ -288,10 +301,6 @@ options are available through `Config` and the corresponding `_with` and
     and J. A. Perea. _Toroidal Coordinates: Decorrelating Circular
     Coordinates with Lattice Reduction_. SoCG 2023.
     [DOI:10.4230/LIPIcs.SoCG.2023.57](https://doi.org/10.4230/LIPIcs.SoCG.2023.57).
-
-[^projcoords]:
-    J. A. Perea. _Multiscale Projective Coordinates via Persistent
-    Cohomology of Sparse Filtrations_. Discrete & Computational Geometry, 2018. [arXiv:1612.02861](https://arxiv.org/abs/1612.02861).
 
 [^dreimac]:
     J. A. Perea, L. Scoccola, and C. J. Tralie. _DREiMac: Dimensionality

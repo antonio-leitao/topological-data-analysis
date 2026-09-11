@@ -1,13 +1,7 @@
-// FastHeap: a collection of local N-ary heaps (N = ARITY), with a small binary
-// heap containing one head per local heap. Consecutive pushes form a batch;
-// the first read Floyd-heapifies that batch in O(k), instead of paying k
-// dependent sift-ups through one potentially huge global heap.
+// Batched pushes form local 8-ary heaps. A binary heap tracks their heads.
 
 use std::collections::{binary_heap::PeekMut, BinaryHeap};
 
-/// The heap needs only value semantics and the Ripser total order — NOT the
-/// full `PackedSimplex` contract. Binding to the minimal bounds keeps this
-/// file independent of the layout's `K` const parameter.
 pub trait HeapKey: Copy + Ord + std::fmt::Debug {}
 impl<T: Copy + Ord + std::fmt::Debug> HeapKey for T {}
 
@@ -80,8 +74,6 @@ impl<S: HeapKey> FastHeap<S> {
         self.live_len += 1;
     }
 
-    /// Append to the current batch. Kept as the explicit bulk-build spelling
-    /// used by the initial coboundary path.
     #[inline(always)]
     pub fn append_raw(&mut self, item: S) {
         self.push(item);
@@ -160,14 +152,12 @@ impl<S: HeapKey> FastHeap<S> {
         self.pending_start = write;
     }
 
-    // ── Z/2 cancellation (unchanged from original) ─────────────────────────
-
     pub fn pop_pivot(&mut self) -> Option<S> {
         loop {
             let top = self.pop()?;
             match self.peek() {
                 Some(&next) if next == top => {
-                    self.pop(); // cancels in Z/2
+                    self.pop();
                 }
                 _ => return Some(top),
             }
@@ -197,8 +187,7 @@ unsafe fn sift_down<S: HeapKey>(ptr: *mut S, mut pos: usize, end: usize, item: S
         }
 
         let (best, best_val) = if first + 7 < end {
-            // Fast path: all 8 children present. Tournament in 3 rounds.
-            // The 8 loads are independent; the compiler issues them in parallel.
+            // All eight children are compared as a three-round tournament.
             let v0 = *ptr.add(first);
             let v1 = *ptr.add(first + 1);
             let v2 = *ptr.add(first + 2);
@@ -208,7 +197,6 @@ unsafe fn sift_down<S: HeapKey>(ptr: *mut S, mut pos: usize, end: usize, item: S
             let v6 = *ptr.add(first + 6);
             let v7 = *ptr.add(first + 7);
 
-            // Round 1: 4 parallel pair-compares.
             let (i01, v01) = if v1 > v0 {
                 (first + 1, v1)
             } else {
@@ -230,19 +218,15 @@ unsafe fn sift_down<S: HeapKey>(ptr: *mut S, mut pos: usize, end: usize, item: S
                 (first + 6, v6)
             };
 
-            // Round 2: 2 parallel.
             let (i0123, v0123) = if v23 > v01 { (i23, v23) } else { (i01, v01) };
             let (i4567, v4567) = if v67 > v45 { (i67, v67) } else { (i45, v45) };
 
-            // Round 3: final.
             if v4567 > v0123 {
                 (i4567, v4567)
             } else {
                 (i0123, v0123)
             }
         } else {
-            // Tail: < 8 children present. Runs at most once per pop (the very
-            // last internal node), so sequential is fine.
             let last_excl = end;
             let mut best = first;
             let mut best_val = *ptr.add(first);
@@ -292,10 +276,6 @@ unsafe fn pop_heap<S: HeapKey>(ptr: *mut S, len: &mut usize) -> S {
     }
     result
 }
-
-// ═══════════════════════════════════════════════════════════════════════════════
-// Tests
-// ═══════════════════════════════════════════════════════════════════════════════
 
 #[cfg(test)]
 mod tests {
@@ -366,7 +346,6 @@ mod tests {
     #[test]
     fn z2_with_smaller_pivot_below() {
         let mut h = FastHeap::new();
-        // Two 9s cancel, 5 should survive.
         h.push(s(9));
         h.push(s(5));
         h.push(s(9));
@@ -442,20 +421,17 @@ mod tests {
             values.push(s((x as u128) & 0xffff_ffff));
         }
 
-        // Build via sequential push (the reference).
         let mut h_push = FastHeap::with_capacity(values.len());
         for &v in &values {
             h_push.push(v);
         }
 
-        // Build via append_raw + heapify (the optimized path).
         let mut h_bulk = FastHeap::with_capacity(values.len());
         for &v in &values {
             h_bulk.append_raw(v);
         }
         h_bulk.heapify();
 
-        // Drain both and compare. Heap order is not unique, but pop order IS.
         let mut out_push = Vec::new();
         while let Some(v) = h_push.pop() {
             out_push.push(v);

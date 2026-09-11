@@ -1,0 +1,8 @@
+panel,engine,n,dim,max_dim,rep,status,seconds
+b,giotto,5000,7,1,0,oom,
+b,gudhi,5000,7,1,0,timeout,
+b,tda,5000,7,1,0,timeout,
+b,tda_quotient,5000,7,1,0,ok,23.231938374927267
+b,tda_quotient,5000,7,1,1,ok,12.719296500086784
+b,tda_quotient,5000,7,1,2,ok,9.295903875026852
+b,tda_quotient,5000,7,2,0,timeout,

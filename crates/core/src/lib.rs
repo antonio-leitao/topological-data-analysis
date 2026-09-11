@@ -12,33 +12,18 @@ use preprocess::edgelist::EdgeList;
 pub use error::{Error, Result};
 pub use types::{BarcodeResult, PersistenceInterval};
 
-/// Maximum number of points: bounded by `Simplex256`'s 24-bit vertex slots
-/// (`id + 1 < 2^24`, ids `0..n-1` ⇒ `n <= 2^24 - 1`).
+/// Maximum point count allowed by the 24-bit simplex vertex slots.
 pub const MAX_POINTS: usize = (1 << 24) - 1;
-/// Maximum homology dimension: bounded by `Simplex256`'s 9 vertex slots
-/// (columns of dimension 7 have 8 vertices; their cofacets have 9).
+/// Maximum homology dimension allowed by the nine-slot simplex layout.
 pub const MAX_DIM: usize = 7;
 
-/// Bounds of the narrow (`Simplex128`) engine arm: 16-bit vertex slots
-/// (`id + 1 <= u16::MAX` ⇒ `n <= u16::MAX`) and 6 vertex slots (max_dim 4).
-/// Inputs within BOTH bounds take the narrow arm; anything else takes
-/// `Simplex256`.
 const S128_MAX_POINTS: usize = u16::MAX as usize;
 const S128_MAX_DIM: usize = 4;
 
-// ═══════════════════════════════════════════════════════════════════════════════
-// Configuration
-// ═══════════════════════════════════════════════════════════════════════════════
-
 /// Optional knobs for [`persistent_homology_with`] and [`filtration_size_with`].
 ///
-/// `Config::default()` is the recommended configuration: point-cloud input, no
-/// user threshold (the certified truncation radius alone caps the filtration),
-/// `peel` on (exact, strictly cheaper, identical barcode), `parallel` on, and
-/// the `quotient` / `collapse` transforms off. The plain
-/// [`persistent_homology`] / [`filtration_size`] entry points use it
-/// implicitly; reach for `Config` only to deviate. Override individual fields
-/// with functional-record-update syntax:
+/// The default uses point-cloud input, the certified cutoff, exact peeling,
+/// and parallel preprocessing. Quotient coning and edge collapse are disabled.
 ///
 /// ```
 /// use tda_core::Config;
@@ -59,14 +44,11 @@ pub struct Config {
     /// `min(threshold, certified radius)`; `None` means the certified radius
     /// alone. Must be non-negative and not NaN.
     pub threshold: Option<f32>,
-    /// Tighten the truncation radius via sound strong-collapse peeling:
-    /// strictly cheaper, identical barcode. Default `true`.
+    /// Tighten the cutoff by exact strong-collapse peeling. Default `true`.
     pub peel: bool,
-    /// Rewrite the filtration into a quotient-cover coning: strictly smaller,
-    /// `log 3`-interleaved with VR rather than equal. Default `false`.
+    /// Use a log(3)-interleaved quotient-cover filtration. Default `false`.
     pub quotient: bool,
-    /// Remove filtration-dominated edges (exact edge collapse): strictly
-    /// smaller, identical barcode, but expensive. Default `false`.
+    /// Remove filtration-dominated edges without changing the barcode. Default `false`.
     pub collapse: bool,
     /// Enable rayon in sufficiently large point preprocessing, edge sorts, and
     /// engine candidate assembly. Default `true`.
@@ -86,10 +68,6 @@ impl Default for Config {
     }
 }
 
-// ═══════════════════════════════════════════════════════════════════════════════
-// Persistent homology
-// ═══════════════════════════════════════════════════════════════════════════════
-
 /// Vietoris–Rips persistent homology of a point cloud, with the default
 /// [`Config`].
 ///
@@ -100,32 +78,15 @@ pub fn persistent_homology(data: &[f32], n: usize, max_dim: usize) -> Result<Bar
     persistent_homology_with(data, n, max_dim, &Config::default())
 }
 
-/// Vietoris–Rips persistent homology over the BitCSR sparse backend.
+/// Vietoris–Rips persistent homology with explicit configuration.
 ///
-/// `data` is a row-major `&[f32]` whose length is:
-///   * `n * n` when `config.distance_matrix` is true — the strict lower
-///     triangle is read; symmetry, zero diagonal, and non-negativity are
-///     documented preconditions, not enforced invariants, and `f32::INFINITY`
-///     is a valid "disconnected" entry; or
-///   * `n * d` otherwise — a point cloud, with `d` inferred as `data.len() / n`.
+/// `data` is row-major. With `distance_matrix`, it has length `n * n` and only
+/// the strict lower triangle is read. Otherwise it has length `n * d` and the
+/// ambient dimension is inferred. Infinite distances represent missing edges.
 ///
-/// The two layouts collide at `d == n` (square data): they are byte-identical,
-/// so `config.distance_matrix` is the *only* thing that disambiguates them —
-/// set it correctly. (The Python layer warns on this case; the core cannot,
-/// since its hot caller is the benchmark loop.)
+/// Square data is ambiguous, so `config.distance_matrix` must be set correctly.
 ///
-/// `config.peel` tightens the truncation radius via a sound strong collapse
-/// — strictly cheaper, identical barcode. `config.quotient` rewrites the
-/// filtration into a quotient-cover (complete-linkage) coning — strictly
-/// smaller, and `log 3`-interleaved with VR rather than equal.
-/// `config.collapse` removes filtration-dominated edges — strictly smaller,
-/// identical barcode. The canonical
-/// order is peel → quotient → collapse: peel first (fewer edges, leaves them
-/// sorted), collapse last (it is exact on any weighted graph's flag
-/// filtration, including the coned quotient, whereas the quotient's
-/// complete-linkage counting needs the un-collapsed graph). `config.parallel`
-/// enables Rayon in sufficiently large point preprocessing, edge sorts, and
-/// engine candidate assembly.
+/// Optional transforms run in the order peel, quotient, collapse.
 pub fn persistent_homology_with(
     data: &[f32],
     n: usize,
@@ -135,10 +96,6 @@ pub fn persistent_homology_with(
     let edges = build_edges(data, n, max_dim, config)?;
     Ok(compute_barcode(edges, max_dim, config.parallel))
 }
-
-// ═══════════════════════════════════════════════════════════════════════════════
-// Persistent homology — sparse (COO) distance graphs
-// ═══════════════════════════════════════════════════════════════════════════════
 
 /// Vietoris–Rips persistent homology of a sparse distance graph in COO form,
 /// with the default [`Config`]. See [`persistent_homology_sparse_with`].
@@ -156,7 +113,7 @@ pub fn persistent_homology_sparse(
 ///
 /// `(rows[k], cols[k], vals[k])` is one entry `d(rows[k], cols[k]) = vals[k]`
 /// of an undirected distance graph on `n` vertices. Orientation and duplicates
-/// are irrelevant — the smallest finite value given for a pair wins — and
+/// are irrelevant. The smallest finite value given for a pair wins, and
 /// diagonal entries are ignored. A pair with no finite entry is never
 /// connected (infinite distance), and truncation uses the same per-component
 /// certificate as the dense distance-matrix path, so disconnected inputs are
@@ -206,10 +163,6 @@ pub fn filtration_size_sparse_with(
     ))
 }
 
-// ═══════════════════════════════════════════════════════════════════════════════
-// Filtration size
-// ═══════════════════════════════════════════════════════════════════════════════
-
 /// Truncated Vietoris–Rips filtration size (simplices of dimension ≤
 /// `max_dim`) of a point cloud, with the default [`Config`]. See
 /// [`filtration_size_with`].
@@ -227,9 +180,6 @@ pub fn filtration_size_with(
     config: &Config,
 ) -> Result<usize> {
     let edges = build_edges(data, n, max_dim, config)?;
-    // `max_dim` is a simplex dimension; `count_cliques` is clique-size oriented.
-    // A simplex of dimension d is a clique of size d + 1, so counting simplices
-    // of dimension <= max_dim means cliques of size <= max_dim + 1.
     Ok(utils::cliques::count_cliques(
         edges,
         max_dim + 1,
@@ -237,16 +187,7 @@ pub fn filtration_size_with(
     ))
 }
 
-// ═══════════════════════════════════════════════════════════════════════════════
-// Shared construction (the hourglass waist)
-// ═══════════════════════════════════════════════════════════════════════════════
-
-/// Validate, build the truncated `EdgeList` for whichever input layout, then
-/// apply the optional transforms. The single boundary shared by the homology and
-/// filtration-size paths and by both input modes.
-///
-/// `max_dim` is validated up front, before the O(n²·d) distance build, so an
-/// out-of-range value fails fast rather than after the work.
+/// Build and transform the truncated edge list.
 fn build_edges(data: &[f32], n: usize, max_dim: usize, config: &Config) -> Result<EdgeList> {
     validate_params(n, max_dim, config.threshold)?;
     let t = config.threshold.unwrap_or(f32::INFINITY);
@@ -263,8 +204,6 @@ fn build_edges(data: &[f32], n: usize, max_dim: usize, config: &Config) -> Resul
     Ok(edges)
 }
 
-/// The sparse sibling of [`build_edges`]: validate, build the truncated
-/// `EdgeList` from COO entries, then apply the optional transforms.
 fn build_sparse_edges(
     rows: &[u32],
     cols: &[u32],
@@ -291,7 +230,6 @@ fn validate_sparse(rows: &[u32], cols: &[u32], vals: &[f32], n: usize) -> Result
             vals: vals.len(),
         });
     }
-    // n <= MAX_POINTS (already validated) so the cast is lossless.
     let bound = n as u32;
     for (&r, &c) in rows.iter().zip(cols) {
         if r >= bound || c >= bound {
@@ -301,10 +239,7 @@ fn validate_sparse(rows: &[u32], cols: &[u32], vals: &[f32], n: usize) -> Result
     Ok(())
 }
 
-/// Apply the optional transforms in canonical order: `peel` first (exact,
-/// barcode-preserving, leaves the edges sorted), then `quotient` coning
-/// (`coperto`, which reuses that sort and needs the un-collapsed graph), then
-/// `collapse` last (exact on whatever flag filtration it receives).
+/// Quotient construction needs the uncollapsed graph, so collapse runs last.
 #[inline]
 fn apply_optimizations(edges: &mut EdgeList, config: &Config) {
     if config.peel {
@@ -318,18 +253,7 @@ fn apply_optimizations(edges: &mut EdgeList, config: &Config) {
     }
 }
 
-/// Reduce an `EdgeList` to a barcode through the BitCSR backend. The homology
-/// back-half, mirroring `count_cliques` for the filtration-size path.
-///
-/// SIMPLEX DISPATCH: the engine is generic over the packed-simplex layout
-/// (`PackedSimplex<K>`, where `K` is the layout's vertex capacity and sizes
-/// every engine scratch array at compile time); this is where the
-/// instantiation is chosen. Inputs fitting `Simplex128` (16-bit ids, 6
-/// slots) take the narrow arm — the fast path for `n <= 65_535` and
-/// `max_dim <= 4`, bit-identical to the pre-generic engine. Everything else
-/// (more points, or deeper dimensions at any size) takes `Simplex256`
-/// (24-bit ids, 9 slots). Both arms produce identical barcodes on shared
-/// inputs — the packing changes, the reduction order does not.
+/// Select the narrow packing when both its point and dimension limits fit.
 #[inline]
 fn compute_barcode(edges: EdgeList, max_dim: usize, parallel: bool) -> BarcodeResult {
     let use_s128 = edges.n <= S128_MAX_POINTS && max_dim <= S128_MAX_DIM;
@@ -341,8 +265,6 @@ fn compute_barcode(edges: EdgeList, max_dim: usize, parallel: bool) -> BarcodeRe
     }
 }
 
-/// Recover the ambient dimension of a row-major point cloud from its flat length.
-/// `n` is already validated (`>= 2`), so the division is safe.
 #[inline]
 fn infer_dimension(points: &[f32], n: usize) -> Result<usize> {
     let len = points.len();
@@ -400,8 +322,6 @@ fn validate_params(n: usize, max_dim: usize, threshold: Option<f32>) -> Result<(
 mod pipeline_tests {
     use super::*;
 
-    /// A `Config` for the point-cloud path with no threshold; the four flags
-    /// every test varies, in one place.
     fn config(peel: bool, quotient: bool, collapse: bool, parallel: bool) -> Config {
         Config {
             peel,
@@ -501,8 +421,6 @@ mod pipeline_tests {
 
     #[test]
     fn finite_cutoff_peel_preserves_barcode() {
-        // Four-cycle at scale 1 with both diagonals outside the 1.5 cutoff. The
-        // stored center has vertices outside its starting ball.
         let lower = [1.0, 10.0, 1.0, 1.0, 10.0, 1.0];
         let n = 4;
         let mut distances = vec![0.0; n * n];
@@ -534,13 +452,8 @@ mod pipeline_tests {
         assert_same_barcode(&plain, &peeled);
     }
 
-    /// REGRESSION (disconnected enclosing radius): the H1 bar of the far
-    /// component must DIE at 2.0, not be truncated into an essential class by
-    /// the near component's smaller enclosing radius.
     #[test]
     fn disconnected_matrix_preserves_late_h1_death() {
-        // Component A: unit 4-cycle (0-1-2-3) with diagonals 2.0 → H1 [1, 2).
-        // Component B: pair (4, 5) at distance 1.0 (enclosing radius 1.0).
         let n = 6;
         let mut d = vec![f32::INFINITY; n * n];
         for i in 0..n {
@@ -565,14 +478,12 @@ mod pipeline_tests {
         };
         let bc = persistent_homology_with(&d, n, 1, &base).unwrap();
 
-        // H0: exactly two essential components.
         let h0_essential = bc.intervals[0]
             .iter()
             .filter(|iv| iv.death.is_infinite())
             .count();
         assert_eq!(h0_essential, 2);
 
-        // H1: exactly one bar, [1, 2), finite.
         assert_eq!(bc.intervals[1].len(), 1, "H1 = {:?}", bc.intervals[1]);
         let h1 = &bc.intervals[1][0];
         assert!((h1.birth - 1.0).abs() < 1e-6, "H1 birth = {}", h1.birth);
@@ -582,7 +493,6 @@ mod pipeline_tests {
             h1.death
         );
 
-        // Peel must remain barcode-preserving on disconnected inputs.
         let peeled = persistent_homology_with(
             &d,
             n,
@@ -596,8 +506,6 @@ mod pipeline_tests {
         assert_same_barcode(&bc, &peeled);
     }
 
-    /// Edge collapse is exact: identical barcode (bit-for-bit as a multiset)
-    /// on deterministic random point clouds, alone and composed with peel.
     #[test]
     fn collapse_preserves_barcode_random() {
         let mut s: u64 = 0x51ce_b00c_1234_5678;
@@ -638,8 +546,6 @@ mod pipeline_tests {
         }
     }
 
-    /// Collapse composed AFTER the quotient must preserve the quotient's own
-    /// barcode exactly (collapse is exact on any flag filtration).
     #[test]
     fn collapse_preserves_quotient_barcode() {
         let (points, _) = ring_distances();
@@ -650,7 +556,6 @@ mod pipeline_tests {
         assert_same_barcode(&quot, &quot_collapsed);
     }
 
-    /// Collapse must strictly shrink the filtration on clique-rich inputs.
     #[test]
     fn collapse_reduces_filtration_size() {
         let mut points = Vec::new();
@@ -673,7 +578,6 @@ mod pipeline_tests {
 
     #[test]
     fn parallel_flag_preserves_barcode() {
-        // The flag must be behaviour-neutral: seq and par assembly agree.
         let points = [
             0.0, 0.0, 0.1, 0.0, 0.0, 0.1, 0.1, 0.1, 0.05, 0.05, 0.2, 0.05, 0.05, 0.2,
         ];
@@ -724,8 +628,6 @@ mod pipeline_tests {
 
     #[test]
     fn quotient_persistent_homology_matches_input_modes() {
-        // Regression anchor for the sparse quotient path: both input modes feed
-        // coperto the same edge set, so the barcodes agree.
         let (points, distances) = ring_distances();
         let point_cfg = config(true, true, false, true);
         let matrix_cfg = Config {
@@ -739,7 +641,6 @@ mod pipeline_tests {
 
     #[test]
     fn points_dimension_is_inferred() {
-        // 4 points in 2-D: length 8, n=4 ⇒ d=2 inferred, matching the explicit-d era.
         let (points, _) = ring_distances();
         let cfg = Config {
             threshold: Some(1.0),
@@ -749,8 +650,6 @@ mod pipeline_tests {
         assert_eq!(count, 8);
     }
 
-    /// The sparse COO pipeline must produce the same barcode as the dense
-    /// distance-matrix pipeline on the same metric.
     #[test]
     fn sparse_pipeline_matches_dense_matrix() {
         let (_, distances) = ring_distances();
@@ -782,12 +681,8 @@ mod pipeline_tests {
         }
     }
 
-    /// Sparse input with missing pairs: disconnected components keep their
-    /// late deaths, and duplicate entries resolve to the minimum.
     #[test]
     fn sparse_disconnected_preserves_late_h1_death() {
-        // Component A: unit 4-cycle with diagonals 2.0 → H1 [1, 2).
-        // Component B: pair (4, 5). One duplicate entry that must lose.
         let entries: &[(u32, u32, f32)] = &[
             (0, 1, 1.0),
             (1, 2, 1.0),
@@ -822,7 +717,6 @@ mod pipeline_tests {
         assert!((h1.birth - 1.0).abs() < 1e-6);
         assert!(h1.death.is_finite() && (h1.death - 2.0).abs() < 1e-6);
 
-        // Peel must remain barcode-preserving on sparse inputs too.
         let peeled = persistent_homology_sparse_with(
             &rows,
             &cols,
@@ -835,6 +729,63 @@ mod pipeline_tests {
         assert_same_barcode(&bc, &peeled);
     }
 
+    /// The default-`Config` sparse wrapper must agree with its `_with` sibling
+    /// and with the dense path. The 4x4 grid is chosen because peeling changes
+    /// the count here (98 vs 106 at `max_dim=1`), so a wrapper that forwarded
+    /// the wrong `Config` would fail rather than coincide.
+    #[test]
+    fn filtration_size_sparse_matches_with_and_dense() {
+        let n = 16;
+        let mut points: Vec<f32> = Vec::with_capacity(n * 2);
+        for i in 0..4 {
+            for j in 0..4 {
+                points.push(i as f32);
+                points.push(j as f32);
+            }
+        }
+
+        let mut distances = vec![0f32; n * n];
+        for i in 0..n {
+            for j in 0..n {
+                let (dx, dy) = (
+                    points[i * 2] - points[j * 2],
+                    points[i * 2 + 1] - points[j * 2 + 1],
+                );
+                distances[i * n + j] = (dx * dx + dy * dy).sqrt();
+            }
+        }
+
+        let mut rows = Vec::new();
+        let mut cols = Vec::new();
+        let mut vals = Vec::new();
+        for i in 0..n {
+            for j in 0..n {
+                rows.push(i as u32);
+                cols.push(j as u32);
+                vals.push(distances[i * n + j]); // diagonal zeros are ignored
+            }
+        }
+
+        let dense_cfg = Config {
+            distance_matrix: true,
+            ..Config::default()
+        };
+        for max_dim in 1..=2 {
+            let plain = filtration_size_sparse(&rows, &cols, &vals, n, max_dim).unwrap();
+            assert_eq!(
+                plain,
+                filtration_size_sparse_with(&rows, &cols, &vals, n, max_dim, &Config::default())
+                    .unwrap(),
+                "wrapper must delegate with the default Config (max_dim={max_dim})"
+            );
+            assert_eq!(
+                plain,
+                filtration_size_with(&distances, n, max_dim, &dense_cfg).unwrap(),
+                "sparse complete graph must match dense (max_dim={max_dim})"
+            );
+        }
+    }
+
     #[test]
     fn sparse_input_validation_errors() {
         let err = persistent_homology_sparse(&[0, 1], &[1], &[1.0, 2.0], 4, 1).unwrap_err();
@@ -844,9 +795,6 @@ mod pipeline_tests {
         assert!(matches!(err, Error::SparseIndexOutOfRange { .. }));
     }
 
-    /// max_dim > 4 forces the Simplex256 arm even for tiny inputs; the
-    /// shared dimensions must match the Simplex128 arm bit-for-bit, and the
-    /// deep dimensions of a 4-point space are empty.
     #[test]
     fn deep_dimension_dispatches_to_simplex256() {
         let (points, _) = ring_distances();
@@ -873,9 +821,6 @@ mod pipeline_tests {
         }
     }
 
-    /// Deep dimensions composed with the quotient transform (the intended
-    /// HPC configuration): the wide arm must run the coned filtration and
-    /// agree with the narrow arm on shared dimensions.
     #[test]
     fn quotient_composes_with_deep_dimensions() {
         let mut s: u64 = 0x0dd5_eed5_4321_8765;

@@ -14,11 +14,9 @@ import tda
 ROOT = Path(__file__).resolve().parents[3]
 DATA_DIR = ROOT / "data"
 REFERENCE_TOL = 3e-3
-# The quotient (coperto) filtration is multiplicatively 3-interleaved with VR,
-# i.e. additively log(3)-interleaved in log scale, so by stability the
-# bottleneck distance between log-transformed diagrams is <= log(3).
+# Multiplicative 3-interleaving becomes additive log(3) after transformation.
 LOG3_TOL = math.log(3.0) + 1e-4
-LOG_EPS = 1e-30  # clamp for log(0) births; both sides clamp identically
+LOG_EPS = 1e-30
 
 
 def default_max_dim():
@@ -42,8 +40,6 @@ def load_points(file):
     return np.loadtxt(DATA_DIR / file).astype(np.float32)
 
 
-# peel defaults to True; each variant pins it so the four columns stay
-# "vanilla" and "each transform in isolation".
 def run_tda(data, max_dim):
     return tda.persistent_homology(data, max_dim=max_dim, peel=False)
 
@@ -66,7 +62,7 @@ def gudhi_reference(data, max_dim):
         homology_dimensions=dimensions,
         n_jobs=1,
         input_type="point cloud",
-        num_collapses=0,  # Do not use strong collapses for the baseline.
+        num_collapses=0,
         homology_coeff_field=2,
     ).fit_transform([data])[0]
 
@@ -132,8 +128,6 @@ def main():
         clps, clps_time = timed(run_tda_collapse, data, args.max_dim)
         ref, gudhi_time = timed(gudhi_reference, data, args.max_dim)
 
-        # Plain, peel, and collapse must all match GUDHI exactly: peel and
-        # edge collapse are barcode-preserving.
         for label, dgms in (("plain", got), ("peel", peeled), ("collapse", clps)):
             ok, dim, bd, n_got, n_ref = bottleneck_ok(
                 dgms, ref, args.max_dim, REFERENCE_TOL
@@ -144,7 +138,6 @@ def main():
                     f"tda={n_got}, gudhi={n_ref}"
                 )
 
-        # Quotient is an approximation: enforce the log(3) interleaving bound.
         ok, dim, bd = interleaving_ok(quot, ref, args.max_dim, LOG3_TOL)
         if not ok:
             raise AssertionError(

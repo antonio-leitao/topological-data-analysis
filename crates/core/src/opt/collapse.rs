@@ -1,48 +1,9 @@
-//! Exact edge collapse of a flag filtration (the `collapse` step).
+//! Exact edge collapse for a weighted flag filtration.
 //!
-//! [`collapse_in_place`] simplifies a weighted edge list while preserving the
-//! persistent homology of its flag (Vietoris–Rips) filtration EXACTLY —
-//! identical barcode (Boissonnat–Pritam "Edge Collapse and Persistence of
-//! Flag Complexes"; Glisse–Pritam "Swap, Shift and Trim", the algorithm GUDHI
-//! exposes as `reduce_graph`). Contrast `opt::peel`, which uses *vertex*
-//! domination to certify a tail truncation: peel shrinks the filtration's
-//! range, edge collapse thins its interior at every scale. Both are exact.
-//!
-//! ## Criterion
-//!
-//! Edge `e = (u, v)` with value `f(e)` is *dominated at time t* when some
-//! common neighbor `z` is adjacent at scale <= t to every member of the
-//! common neighborhood `N_t[e]` (over the retained edges with value <= t).
-//! If `e` is dominated on `[f(e), T)`, its insertion can be delayed to `T`
-//! (the SHIFT) without changing the persistence; if `T = ∞` the edge is
-//! removed outright (the TRIM). An edge not dominated at its own scale keeps
-//! its value.
-//!
-//! Discretization: the member set of `N_t[e]` changes only at appearance
-//! times `t_w = max(f(u,w), f(v,w))`, and between events adjacencies among a
-//! fixed member set only accumulate, so domination is monotone within an
-//! interval. Checking at `f(e)` and at each event is sound and complete.
-//!
-//! ## Algorithm (after GUDHI's rewrite by Glisse)
-//!
-//! Edges are processed in decreasing value order over the current graph.
-//! Per edge, one merge walk over the two id-sorted adjacency lists splits the
-//! common neighbors into the active set (id-sorted) and a "later" event list,
-//! which is heapified only if the edge survives its first domination check —
-//! most edges never need it. While a dominator holds, each event costs one
-//! adjacency lookup for the NEW member only (existing members stay valid by
-//! monotonicity); a full dominator search re-runs only when the current
-//! dominator breaks. Every adjacency list carries a `(v, -inf)` self-sentinel
-//! so witness membership needs no special-casing.
-//!
-//! ## Order in the pipeline
-//!
-//! Runs LAST among the optional transforms (peel → quotient → collapse):
-//! after peel because peel leaves fewer, already-sorted edges; after the
-//! quotient because coperto's complete-linkage counting assumes the full
-//! metric graph, while collapse is exact on ANY weighted graph's flag
-//! filtration — including the coned quotient graph, so the log(3) guarantee
-//! survives the composition.
+//! An edge dominated on `[f(e), T)` is shifted to `T`, or removed when
+//! `T = infinity`. Domination changes only when a common neighbour appears, so
+//! checks at `f(e)` and those event times are complete. This step runs after
+//! peel and quotient; exact collapse preserves the quotient guarantee.
 
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
@@ -50,20 +11,13 @@ use std::collections::BinaryHeap;
 use crate::preprocess::edgelist::EdgeList;
 use rayon::prelude::*;
 
-/// Adjacency entry: (neighbor id, edge value), kept sorted by id. Each list
-/// also holds a `(self, -inf)` sentinel.
+/// Id-sorted adjacency entry; each row includes `(self, -inf)`.
 type Nbr = (u32, f32);
 
-/// Memory budget for the optional dense n×n value matrix (GUDHI's
-/// `GUDHI_COLLAPSE_USE_DENSE_ARRAY`): O(1) adjacency-value lookups make a
-/// FAILED domination candidate cost ~2 probes instead of an O(deg) merge
-/// walk, which dominates the runtime on dense graphs. 256 MiB ⇒ n ≤ 8192;
-/// larger inputs fall back to the merge walk (O(E) memory).
+/// Memory cap for constant-time adjacency lookups; larger inputs use merge walks.
 const DENSE_BUDGET_BYTES: usize = 1 << 28;
 
-/// Is the id-sorted `active` set contained in `N_t[c]`? Linear merge walk
-/// against the id-sorted adjacency of `c`; the self-sentinel makes `c`'s own
-/// membership pass automatically. Degree precheck up front.
+/// Test `active` containment in `N_t[c]` by merge walk.
 #[inline]
 fn is_dominated_by(active: &[u32], adj_c: &[Nbr], t: f32) -> bool {
     if adj_c.len() < active.len() {
@@ -88,9 +42,7 @@ fn is_dominated_by(active: &[u32], adj_c: &[Nbr], t: f32) -> bool {
     true
 }
 
-/// First dominator of the `active` set at scale `t`, or None. With the dense
-/// matrix, each candidate is O(|active|) with ~O(1) expected early exit; the
-/// fallback needs `active` id-sorted for the merge walk.
+/// First dominator of `active` at scale `t`.
 #[inline]
 fn find_dominator(
     adj: &[Vec<Nbr>],
@@ -106,8 +58,6 @@ fn find_dominator(
             .find(|&c| is_dominated_by(active, &adj[c as usize], t))
     } else {
         active.iter().copied().find(|&c| {
-            // Degree precheck, then O(1) probes (self handled by the -inf
-            // sentinel on the diagonal).
             adj[c as usize].len() >= active.len() && {
                 let row = (c as usize) * n;
                 active.iter().all(|&w| dense[row + w as usize] <= t)
@@ -132,10 +82,7 @@ fn set_neighbor_value(list: &mut [Nbr], w: u32, value: f32) {
     list[pos].1 = value;
 }
 
-/// Collapse the edge list in place: dominated edges are removed or delayed
-/// (their value increased to the first time they become critical). `n`,
-/// `center`, and `threshold` are preserved; the output is left in ascending
-/// `(distance, u, v)` order with `sorted` true.
+/// Remove or delay dominated edges, leaving sorted output.
 pub(crate) fn collapse_in_place(edge_list: &mut EdgeList, parallel: bool) {
     let use_dense = edge_list
         .n
@@ -145,8 +92,6 @@ pub(crate) fn collapse_in_place(edge_list: &mut EdgeList, parallel: bool) {
     collapse_impl(edge_list, parallel, use_dense);
 }
 
-/// Both paths produce identical output; `use_dense` only trades memory for
-/// O(1) adjacency probes (tests exercise both).
 fn collapse_impl(edge_list: &mut EdgeList, parallel: bool, use_dense: bool) {
     let n = edge_list.n;
     if n < 3 || edge_list.edges.len() < 3 {
@@ -166,8 +111,7 @@ fn collapse_impl(edge_list: &mut EdgeList, parallel: bool, use_dense: bool) {
         edge_list.sorted = true;
     }
 
-    // Id-sorted closed adjacency (self-sentinel at -inf), mutated in place as
-    // edges are removed or delayed.
+    // Closed adjacency is mutated as edges are removed or delayed.
     let mut adj: Vec<Vec<Nbr>> = vec![Vec::new(); n];
     for edge in &edge_list.edges {
         adj[edge.u as usize].push((edge.v, edge.distance));
@@ -185,8 +129,7 @@ fn collapse_impl(edge_list: &mut EdgeList, parallel: bool, use_dense: bool) {
         }
     }
 
-    // Optional dense value matrix (see DENSE_BUDGET_BYTES). Missing edges are
-    // +inf; the diagonal is the -inf self-sentinel.
+    // Missing dense entries are `+inf`; diagonal sentinels are `-inf`.
     let mut dense: Vec<f32> = Vec::new();
     if use_dense {
         dense = vec![f32::INFINITY; n * n];
@@ -202,19 +145,15 @@ fn collapse_impl(edge_list: &mut EdgeList, parallel: bool, use_dense: bool) {
 
     let mut keep = vec![true; edge_list.edges.len()];
     let mut any_shift = false;
-    // Reused scratch: active members (id-sorted in the fallback path, where
-    // the merge walk needs it) and future appearance events.
     let mut active: Vec<u32> = Vec::new();
     let mut later: Vec<Reverse<(u32, u32)>> = Vec::new();
 
-    // Decreasing value order; ties in deterministic (u, v) order.
     for idx in (0..edge_list.edges.len()).rev() {
         let edge = edge_list.edges[idx];
         let (u, v) = (edge.u, edge.v);
         let (ui, vi) = (u as usize, v as usize);
         let start_time = edge.distance;
 
-        // One merge walk: split common neighbors into active-now vs later.
         active.clear();
         later.clear();
         {
@@ -245,14 +184,10 @@ fn collapse_impl(edge_list: &mut EdgeList, parallel: bool, use_dense: bool) {
         let mut dead = false;
 
         if !active.is_empty() {
-            // Lazily heapified: edges that are never dominated, or dominated
-            // through infinity with no future events, never pay for it.
             let mut heap: Option<BinaryHeap<Reverse<(u32, u32)>>> = None;
 
             'outer: while let Some(dom) = find_dominator(&adj, &dense, n, &active, time) {
                 let adj_dom = &adj[dom as usize];
-                // Advance through events while `dom` keeps dominating: each
-                // NEW member costs one lookup; existing members stay valid.
                 loop {
                     let h =
                         heap.get_or_insert_with(|| BinaryHeap::from(std::mem::take(&mut later)));
@@ -306,7 +241,6 @@ fn collapse_impl(edge_list: &mut EdgeList, parallel: bool, use_dense: bool) {
                 dense[vi * n + ui] = f32::INFINITY;
             }
         } else if time.to_bits() != start_time.to_bits() {
-            // SHIFT: dominated on [f(e), time) — delay the edge to `time`.
             any_shift = true;
             edge_list.edges[idx].distance = time;
             set_neighbor_value(&mut adj[ui], v, time);
@@ -325,7 +259,6 @@ fn collapse_impl(edge_list: &mut EdgeList, parallel: bool, use_dense: bool) {
         k
     });
 
-    // Shifts break the ascending order; restore it.
     if any_shift {
         if parallel {
             edge_list
@@ -376,8 +309,6 @@ mod tests {
         assert_eq!(e.edges.len(), 1);
     }
 
-    /// The dense-matrix and merge-walk paths must produce identical output
-    /// (same removals, same shifted values) on deterministic random graphs.
     #[test]
     fn dense_and_sparse_paths_agree() {
         let mut s: u64 = 0xc0_ffee_1234_5678;
@@ -413,9 +344,6 @@ mod tests {
         }
     }
 
-    /// K4 at a single scale collapses to a spanning tree: every removal needs
-    /// a dominating common neighbor, and the process stops exactly when the
-    /// graph is triangle-free.
     #[test]
     fn complete_graph_collapses_to_tree() {
         let edges: Vec<Edge> = (1..4u32)
@@ -434,9 +362,6 @@ mod tests {
         assert!(e.edges.iter().all(|edge| edge.distance == 1.0));
     }
 
-    /// Unit square with both diagonals: the first diagonal processed is
-    /// dominated through infinity (trimmed); the second has no witness at its
-    /// own scale and must keep its value so the H1 bar [1, √2) dies on time.
     #[test]
     fn square_keeps_one_diagonal() {
         let s = std::f32::consts::SQRT_2;
@@ -480,12 +405,8 @@ mod tests {
         assert_eq!(diagonals, 1);
     }
 
-    /// An edge whose common neighbors appear only later must stay at its own
-    /// value: on [f(e), t_w) its neighborhood is just its endpoints.
     #[test]
     fn late_common_neighbors_do_not_dominate() {
-        // Triangle where (1,0) is the SHORTEST edge: vertex 2 becomes a
-        // common neighbor only at scale 2.0 > 1.0.
         let edges = vec![
             Edge {
                 u: 1,
@@ -505,15 +426,10 @@ mod tests {
         ];
         let mut e = edge_list(3, edges);
         collapse_in_place(&mut e, false);
-        // (1,0) kept at 1.0 (its H0 merge is real); the longest edge (2,1) is
-        // dominated by vertex 0 from its own scale onwards and is trimmed.
         assert_eq!(e.edges.len(), 2);
         assert!(e.edges.iter().any(|edge| edge.distance == 1.0));
     }
 
-    /// A pentagon with two chords from vertex 0: neither chord has a valid
-    /// witness (their two common members are never adjacent), so both must
-    /// keep their exact values — no spurious trim or shift.
     #[test]
     fn pentagon_chords_are_critical() {
         let edges = vec![

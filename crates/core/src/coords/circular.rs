@@ -1,25 +1,8 @@
-//! Circular coordinates: H¹ mod p → S¹, jointly Tᵏ.
+//! Circular and toroidal coordinates from persistent H1 over Z/p.
 //!
-//! After de Silva–Morozov–Vejdemo-Johansson, *Persistent Cohomology and
-//! Circular Coordinates* (2011), with the multi-class decorrelation of
-//! Scoccola–Gakhar–Bush–Perea, *Toroidal Coordinates* (SoCG 2023), on the
-//! full-vertex complex: persistent H¹ over Z/p with representative cocycles
-//! ([`crate::engine::zp`]) → select classes by persistence rank → group them
-//! into co-alive blocks → per block, restrict each cocycle to edges ≤ t,
-//! lift the mod-p coefficients to integers in (−p/2, p/2), verify that
-//! the lift is still an integer cocycle, harmonic-smooth
-//! (one Jacobi-preconditioned conjugate-gradient solve of the t-skeleton
-//! graph Laplacian per class, in f64), LLL-reduce the Gram matrix of the
-//! harmonic representatives and apply the unimodular transform (least
-//! squares is linear, so transformed solutions need no re-solve) → the
-//! coordinate of vertex v in column i is 2π·(fᵢ(v) mod 1). Every data point
-//! is a vertex, so values are assigned directly.
-//!
-//! "Toroidal" is not an API concept: singleton blocks are plain circular
-//! coordinates, and blocks of size > 1 are automatically decorrelated. Within
-//! such a block the columns form the lattice-reduced basis of the block's
-//! classes — the map to Tᵏ is the meaningful object, not a 1:1
-//! column-to-class correspondence.
+//! Selected cocycles are grouped by a common live scale, balanced-lifted to
+//! integers, harmonic-smoothed, and LLL-decorrelated. A multi-class block
+//! defines one map to a torus; its columns need not match input classes.
 
 use std::collections::HashMap;
 
@@ -35,30 +18,19 @@ type BlockSolutions = (Vec<Vec<f64>>, Vec<EdgeCocycle>);
 
 const CG_TOL: f64 = 1e-9;
 const CG_MAX_ITERS: usize = 2000;
-/// Lovász parameter for the lattice reduction.
 const LLL_DELTA: f64 = 0.75;
-/// Step cap for ill-conditioned Gram matrices (never reached on sane input;
-/// bailing keeps the current — still unimodular — transform).
+/// Preserve a valid unimodular transform if an ill-conditioned reduction stalls.
 const LLL_MAX_STEPS: usize = 10_000;
 
-/// Circular coordinates with the default [`Config`] (the single most
-/// persistent H¹ class). See [`circular_with`].
+/// Circular coordinates for the most persistent H1 class.
 pub fn circular(data: &[f32], n: usize) -> Result<CircularCoordinates> {
     circular_with(data, n, &Config::default())
 }
 
-/// Circular coordinates from H¹ classes selected by persistence rank.
+/// Circular coordinates from H1 classes selected by persistence rank.
 ///
-/// `data` follows the same layout contract as
-/// [`crate::persistent_homology_with`]. Returns one angle column per selected
-/// class, in `[0, 2π)`, in selection order. Co-alive classes are jointly
-/// harmonised and lattice-decorrelated (the `group` field of
-/// [`SelectedClass`] names the blocks). `config.prime` is the coefficient
-/// field behind the integer lift (odd prime). An empty explicit selection
-/// (`classes: Some(vec![])`) returns an `(n, 0)` result. An explicit
-/// `config.scale` keeps only the selected classes alive at it (dropped
-/// classes lose their column); if none survive, the scale is reported
-/// invalid against the first selected class.
+/// Returns angle columns in `[0, 2*pi)`. An empty selection returns shape
+/// `(n, 0)`. At an explicit scale, selected classes not alive there are omitted.
 pub fn circular_with(data: &[f32], n: usize, config: &Config) -> Result<CircularCoordinates> {
     validate_prime(config.prime)?;
 
@@ -71,7 +43,6 @@ pub fn circular_with(data: &[f32], n: usize, config: &Config) -> Result<Circular
         });
     }
 
-    // Full pipeline at the certified radius, peel on (transparent here).
     let core_config = crate::Config {
         distance_matrix: config.distance_matrix,
         quotient: config.quotient,
@@ -83,11 +54,9 @@ pub fn circular_with(data: &[f32], n: usize, config: &Config) -> Result<Circular
     let bitcsr = BitCsrDistanceMatrix::from_edge_list(edges);
     let h1 = h1_classes(&bitcsr, n, config.prime, config.parallel);
 
-    // Resolve ranks to classes, then group into co-alive blocks.
     let chosen = resolve_selection(&selection, &h1, threshold)?;
     let (chosen, blocks) = make_blocks(chosen, config.scale)?;
 
-    // Per block: joint harmonisation and (for size > 1) decorrelation.
     let k = chosen.len();
     let mut coordinates = vec![0f32; n * k];
     let mut classes = vec![
@@ -129,7 +98,6 @@ struct Chosen {
     death_cap: f32,
 }
 
-/// Selection ranks from the config, deduplicated preserving order.
 fn selection_ranks(config: &Config) -> Vec<usize> {
     match &config.classes {
         Some(list) => {
@@ -145,7 +113,6 @@ fn selection_ranks(config: &Config) -> Vec<usize> {
     }
 }
 
-/// Resolve persistence ranks to classes with validated intervals.
 fn resolve_selection(selection: &[usize], h1: &H1Classes, threshold: f32) -> Result<Vec<Chosen>> {
     let ranked = rank_classes(&h1.intervals, threshold);
     let mut chosen: Vec<Chosen> = Vec::with_capacity(selection.len());
@@ -154,7 +121,6 @@ fn resolve_selection(selection: &[usize], h1: &H1Classes, threshold: f32) -> Res
             return Err(Error::NotEnoughClasses {
                 requested: rank + 1,
                 available: ranked.len(),
-                dim: 1,
             });
         };
         let interval = h1.intervals[class];
@@ -180,8 +146,6 @@ fn resolve_selection(selection: &[usize], h1: &H1Classes, threshold: f32) -> Res
     Ok(chosen)
 }
 
-/// Group the chosen classes into co-alive blocks (or one block at the
-/// explicit scale, dropping classes not alive at it).
 fn make_blocks(chosen: Vec<Chosen>, scale: Option<f32>) -> Result<(Vec<Chosen>, Vec<Block>)> {
     if let Some(scale) = scale {
         let first = &chosen[0];
@@ -213,8 +177,6 @@ fn make_blocks(chosen: Vec<Chosen>, scale: Option<f32>) -> Result<(Vec<Chosen>, 
     }
 }
 
-/// One toroidal block: selection-order column indices, jointly evaluated at
-/// one scale.
 struct Block {
     members: Vec<usize>,
     scale: f32,
@@ -229,18 +191,8 @@ fn angle(value: f64) -> f32 {
     (2.0 * std::f64::consts::PI * t) as f32
 }
 
-// ═══════════════════════════════════════════════════════════════════════════════
-// Co-alive grouping
-// ═══════════════════════════════════════════════════════════════════════════════
-
-/// Greedy co-alive grouping over `(birth, death)` intervals: repeatedly take
-/// the scale where the most remaining classes are simultaneously alive
-/// (ties: widest common intersection, then earliest), form a block at the
-/// midpoint of the members' common intersection, remove them, repeat.
-/// Every interval is nonempty by the caller's validation, so the sweep
-/// always finds a block. Pairwise-overlapping intervals share a common point
-/// (Helly on the line), so blocks are exactly the co-alive sets the design
-/// promises.
+/// Greedily group the most classes sharing a live scale.
+/// Ties prefer the widest intersection, then the earliest.
 fn group_by_coalive(intervals: &[(f32, f32)]) -> Vec<Block> {
     let mut remaining: Vec<usize> = (0..intervals.len()).collect();
     let mut blocks = Vec::new();
@@ -253,7 +205,6 @@ fn group_by_coalive(intervals: &[(f32, f32)]) -> Vec<Block> {
         events.sort_by(f32::total_cmp);
         events.dedup_by(|a, b| a.to_bits() == b.to_bits());
 
-        // Best window: (count, width, −birth) lexicographic.
         let mut best: Option<(usize, f32, f32, Vec<usize>)> = None;
         for window in events.windows(2) {
             if window[1] <= window[0] {
@@ -303,13 +254,7 @@ fn group_by_coalive(intervals: &[(f32, f32)]) -> Vec<Block> {
     blocks
 }
 
-// ═══════════════════════════════════════════════════════════════════════════════
-// Per-block solve: lift, harmonic smoothing, decorrelation
-// ═══════════════════════════════════════════════════════════════════════════════
-
-/// The harmonic potentials of a block's classes, decorrelated when the block
-/// has more than one member. `fs[position]` aligns with
-/// `block.members[position]`.
+/// Harmonic potentials aligned with `block.members`.
 fn block_solutions(
     bitcsr: &BitCsrDistanceMatrix,
     n: usize,
@@ -321,9 +266,7 @@ fn block_solutions(
     Ok(block_solutions_full(bitcsr, n, h1, chosen, block, prime)?.0)
 }
 
-/// [`block_solutions`] plus the lifted integer cocycles, both carried through
-/// the LLL transform (η and f transform identically — everything is linear).
-/// The cocycles are what a fitted [`CircularMap`] evaluates on new points.
+/// Return potentials and lifted cocycles after the same LLL transform.
 fn block_solutions_full(
     bitcsr: &BitCsrDistanceMatrix,
     n: usize,
@@ -338,8 +281,7 @@ fn block_solutions_full(
     let mut etas: Vec<EdgeCocycle> = Vec::with_capacity(block.members.len());
     let mut fs: Vec<Vec<f64>> = Vec::with_capacity(block.members.len());
     for &column in &block.members {
-        // Integer lift of the restricted cocycle: coefficients in
-        // (−p/2, p/2), keyed by the canonical (u > v) edge.
+        // Balanced integer lift on canonical edges `(u > v)`.
         let mut eta: EdgeCocycle = HashMap::new();
         for &(u, v, c) in &h1.cocycles[chosen[column].class] {
             if bitcsr.edge_dist(u, v) <= block.scale {
@@ -355,8 +297,7 @@ fn block_solutions_full(
         }
         verify_integral_lift(bitcsr, block.scale, &eta, prime)?;
 
-        // Harmonic smoothing: minimise ‖η − δf‖² with the orientation
-        // δf([u > v]) = f(v) − f(u). Normal equations: L f = δᵀη.
+        // Minimise `||eta - delta(f)||^2` with `delta(f)[u > v] = f(v) - f(u)`.
         let mut rhs = vec![0f64; n];
         for (&(u, v), &value) in &eta {
             rhs[v as usize] += value;
@@ -367,9 +308,7 @@ fn block_solutions_full(
     }
 
     if fs.len() > 1 {
-        // Toroidal decorrelation: LLL on the Gram matrix of the harmonic
-        // representatives; least squares is linear in η, so the transformed
-        // potentials are the exact solutions for the transformed cocycles.
+        // Linearity lets the same LLL transform act on cocycles and potentials.
         let gram = harmonic_gram(&adjacency, &etas, &fs);
         let transform = lll_reduce(gram);
         fs = apply_transform(&transform, &fs, n);
@@ -378,10 +317,7 @@ fn block_solutions_full(
     Ok((fs, etas))
 }
 
-/// The coefficient-wise balanced lift from Z/p to Z is only a heuristic: a
-/// mod-p cocycle can acquire a non-zero integer coboundary. Never feed such a
-/// cochain to the harmonic-coordinate construction, because the resulting
-/// circle-valued map need not be continuous.
+/// Reject balanced lifts with nonzero integer coboundary.
 fn verify_integral_lift(
     bitcsr: &BitCsrDistanceMatrix,
     scale: f32,
@@ -406,18 +342,12 @@ fn verify_integral_lift(
         });
     }
     if coboundary.values().any(|&value| value != 0) {
-        Err(Error::NonIntegralCocycleLift {
-            dim: 1,
-            prime,
-            scale,
-        })
+        Err(Error::NonIntegralCocycleLift { prime, scale })
     } else {
         Ok(())
     }
 }
 
-/// The unimodular transform applied to the lifted integer cocycles (integer
-/// linear combinations of edge maps; zero entries are dropped).
 fn apply_transform_etas(
     transform: &[Vec<i64>],
     etas: &[HashMap<(u32, u32), f64>],
@@ -440,8 +370,7 @@ fn apply_transform_etas(
     out
 }
 
-/// Gram matrix of the harmonic representatives h = η − δf over the block's
-/// skeleton edges.
+/// Gram matrix of `h = eta - delta(f)` over skeleton edges.
 #[allow(clippy::needless_range_loop)] // paired matrix indices are clearer here
 fn harmonic_gram(
     adjacency: &Skeleton,
@@ -497,15 +426,7 @@ fn apply_transform(transform: &[Vec<i64>], fs: &[Vec<f64>], n: usize) -> Vec<Vec
     out
 }
 
-// ═══════════════════════════════════════════════════════════════════════════════
-// LLL over a Gram matrix
-// ═══════════════════════════════════════════════════════════════════════════════
-
-/// LLL (δ = [`LLL_DELTA`]) in the Gram-only formulation: row operations
-/// update `G ← E G Eᵀ` alongside `U ← E U`, so no explicit basis vectors are
-/// needed. Returns the unimodular `U` whose rows express the reduced basis
-/// in input coordinates. `k` is a handful, so the from-scratch Gram–Schmidt
-/// per step (O(k³)) is irrelevant.
+/// Gram-only LLL, returning the unimodular reduced-basis transform.
 fn lll_reduce(mut gram: Vec<Vec<f64>>) -> Vec<Vec<i64>> {
     let k = gram.len();
     let mut u: Vec<Vec<i64>> = (0..k)
@@ -530,8 +451,6 @@ fn lll_reduce(mut gram: Vec<Vec<f64>>) -> Vec<Vec<i64>> {
                 row_subtract(&mut gram, &mut u, i, j, r as i64);
             }
         }
-        // Recompute after size reduction (O(k³) with k a handful: clarity
-        // over caching).
         let (mu, bstar) = gram_schmidt(&gram);
 
         if bstar[i] >= (LLL_DELTA - mu[i][i - 1] * mu[i][i - 1]) * bstar[i - 1] {
@@ -544,7 +463,7 @@ fn lll_reduce(mut gram: Vec<Vec<f64>>) -> Vec<Vec<i64>> {
     u
 }
 
-/// Gram–Schmidt data (μ and ‖b*‖²) straight from a Gram matrix.
+/// Gram-Schmidt data derived from a Gram matrix.
 #[allow(clippy::needless_range_loop)] // triangular recurrence uses prior rows
 fn gram_schmidt(gram: &[Vec<f64>]) -> (Vec<Vec<f64>>, Vec<f64>) {
     let k = gram.len();
@@ -568,7 +487,7 @@ fn gram_schmidt(gram: &[Vec<f64>]) -> (Vec<Vec<f64>>, Vec<f64>) {
     (mu, bstar)
 }
 
-/// `b_i ← b_i − r·b_j` on the Gram matrix (row and column) and the transform.
+/// Apply `b_i = b_i - r*b_j` to the Gram matrix and transform.
 #[allow(clippy::needless_range_loop)] // simultaneous row/column operation
 fn row_subtract(gram: &mut [Vec<f64>], u: &mut [Vec<i64>], i: usize, j: usize, r: i64) {
     let k = gram.len();
@@ -592,48 +511,31 @@ fn swap_basis(gram: &mut [Vec<f64>], u: &mut [Vec<i64>], a: usize, b: usize) {
     }
 }
 
-// ═══════════════════════════════════════════════════════════════════════════════
-// Fitted maps: out-of-sample evaluation
-// ═══════════════════════════════════════════════════════════════════════════════
-
 /// A fitted circular-coordinates map.
 ///
-/// Fitting is [`circular_with`] with the model retained: training points,
-/// per-column cover radius `r = scale / 2`, harmonic potentials `f`, and the
-/// lifted integer cocycles `η` (both post-decorrelation). A new point `x`
-/// inside the cover evaluates, in the chart of its nearest covered training
-/// vertex `j`,
+/// In the chart of the nearest covered training vertex `j`, a query evaluates as
 ///
 /// ```text
-/// θ(x) = f_j + Σ_k φ_k(x) · ( f_k − f_j − η(j, k) )   (mod 1, × 2π)
+/// theta(x) = f_j + sum_k phi_k(x) * (f_k - f_j - eta(j, k))  (mod 1)
 /// ```
 ///
-/// which is chart-independent mod 1 (switching charts shifts by an integer,
-/// by δη = 0 and Σφ = 1), concentrates to `f_j` at the chart centre, and
-/// changes by exactly −(η − δf) across an edge — the same map the training
-/// coordinates sample. At training points the transform returns the
-/// PoU-smoothed value: close to, but not bit-identical with, the fit output
-/// (the gap is the local harmonic residual). Points farther than `r` from
-/// every training vertex are outside the cover and evaluate to NaN.
+/// Since `delta(eta) = 0` and weights sum to one, chart changes add an integer.
+/// Points outside every cover ball evaluate to NaN.
 #[derive(Debug)]
 pub struct CircularMap {
     train: Vec<f32>,
     dim: usize,
     n: usize,
-    /// Number of coordinate columns.
     pub k: usize,
-    /// Training coordinates, row-major `(n, k)` — identical to what
-    /// [`circular_with`] returns for the same input and config.
+    /// Training coordinates in row-major `(n, k)` layout.
     pub coordinates: Vec<f32>,
-    /// Per-column metadata (interval, scale, toroidal block).
     pub classes: Vec<SelectedClass>,
     potentials: Vec<Vec<f64>>,
     cocycles: Vec<SortedCocycle>,
     parallel: bool,
 }
 
-/// A lifted integer cocycle as a sorted edge array: canonical `(u > v)` keys
-/// packed `(u << 32) | v`, alternating evaluation.
+/// Lifted cocycle keyed by packed canonical edges.
 #[derive(Debug)]
 struct SortedCocycle {
     keys: Vec<u64>,
@@ -653,8 +555,7 @@ impl SortedCocycle {
         }
     }
 
-    /// Alternating η(a, b): the stored value on the canonical orientation
-    /// (larger index first), negated when evaluated against it.
+    /// Alternating cocycle value on `(a, b)`.
     #[inline]
     fn eval(&self, a: u32, b: u32) -> f64 {
         if a == b {
@@ -669,19 +570,15 @@ impl SortedCocycle {
     }
 }
 
-/// Fit a circular-coordinates map with the default [`Config`]. See
-/// [`circular_map_with`] and [`CircularMap`].
+/// Fit a circular map with the default configuration.
 pub fn circular_map(data: &[f32], n: usize) -> Result<CircularMap> {
     circular_map_with(data, n, &Config::default())
 }
 
-/// Fit a circular-coordinates map: [`circular_with`]'s pipeline with the
-/// model retained for out-of-sample evaluation.
+/// Fit a circular map for out-of-sample evaluation.
 ///
-/// Not supported here: `distance_matrix` input (evaluating new points would
-/// need user-supplied cross distances) and `quotient` (quotient scales are
-/// not ambient distances, so the cover test is meaningless); both are
-/// rejected explicitly.
+/// Distance matrices lack query cross-distances, and quotient scales are not
+/// ambient distances, so both modes are rejected.
 pub fn circular_map_with(data: &[f32], n: usize, config: &Config) -> Result<CircularMap> {
     if config.distance_matrix {
         return Err(Error::NotImplemented(
@@ -763,17 +660,15 @@ pub fn circular_map_with(data: &[f32], n: usize, config: &Config) -> Result<Circ
 }
 
 impl CircularMap {
-    /// Number of training points.
     pub fn n_points(&self) -> usize {
         self.n
     }
 
-    /// Ambient dimension of the fitted point cloud.
     pub fn ambient_dim(&self) -> usize {
         self.dim
     }
 
-    /// Evaluate the fitted map on `m` new points (row-major `m × dim`).
+    /// Evaluate row-major `(m, dim)` queries.
     /// Returns row-major `(m, k)` angles in `[0, 2π)`; entries are NaN where
     /// the point lies outside a column's cover (farther than `r` from every
     /// training point).
@@ -811,8 +706,7 @@ impl CircularMap {
             for column in 0..self.k {
                 let r = 0.5 * self.classes[column].scale;
 
-                // Chart = nearest covered training vertex (ties: lowest
-                // index, from the ascending-index row order).
+                // Ascending rows break nearest-chart ties by index.
                 let mut chart: Option<(u32, f32)> = None;
                 let mut bump_total = 0f64;
                 for e in start..end {
@@ -851,17 +745,10 @@ impl CircularMap {
     }
 }
 
-// ═══════════════════════════════════════════════════════════════════════════════
-// Mod-p persistence, converted out of the generic packing
-// ═══════════════════════════════════════════════════════════════════════════════
-
-/// H¹ intervals plus cocycles as canonical edges: the non-generic form the
-/// coordinate assembly consumes (the simplex packing stays inside the
-/// dispatch arms).
+/// H1 intervals and cocycles converted from packed simplices.
 struct H1Classes {
     intervals: Vec<PersistenceInterval>,
-    /// `cocycles[i]` aligns with `intervals[i]`; entries `(u, v, coeff)` with
-    /// `u > v` and `coeff` in `1..p`.
+    /// Aligned cocycles as `(u, v, coeff)`, with `u > v`.
     cocycles: Vec<Vec<(u32, u32, u16)>>,
 }
 
@@ -893,12 +780,7 @@ fn convert<const K: usize, S: PackedSimplex<K>>(raw: DimCocycles<S>) -> H1Classe
     }
 }
 
-// ═══════════════════════════════════════════════════════════════════════════════
-// t-skeleton and the Laplacian solve
-// ═══════════════════════════════════════════════════════════════════════════════
-
-/// Symmetric CSR adjacency (neighbour ids only) of the VR skeleton at
-/// `scale`.
+/// Symmetric CSR adjacency at the selected scale.
 struct Skeleton {
     offsets: Vec<u32>,
     cols: Vec<u32>,
@@ -942,11 +824,8 @@ fn skeleton(bitcsr: &BitCsrDistanceMatrix, n: usize, scale: f32) -> Skeleton {
     Skeleton { offsets, cols }
 }
 
-/// Jacobi-preconditioned conjugate gradients on the graph Laplacian
-/// `(Lf)(v) = deg(v)·f(v) − Σ_{w ~ v} f(w)`. The system is singular (constant
-/// per component), but the right-hand side of a coboundary fit sums to zero
-/// on every component, so CG converges to a valid minimiser. f64 throughout —
-/// the result is taken mod 1, so accumulated error must stay far below one.
+/// Solve the singular graph Laplacian with Jacobi-preconditioned CG.
+/// The coboundary-fit right side sums to zero on each component.
 fn laplacian_cg(adjacency: &Skeleton, rhs: &[f64]) -> Vec<f64> {
     let n = rhs.len();
     let degree = |v: usize| (adjacency.offsets[v + 1] - adjacency.offsets[v]) as f64;
@@ -1027,10 +906,6 @@ fn validate_prime(p: u32) -> Result<()> {
     }
 }
 
-// ═══════════════════════════════════════════════════════════════════════════════
-// Tests
-// ═══════════════════════════════════════════════════════════════════════════════
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1057,7 +932,6 @@ mod tests {
         points
     }
 
-    /// Winding number of a column of angles along a sampled closed loop.
     fn winding(coordinates: &[f32], k: usize, column: usize, range: std::ops::Range<usize>) -> f64 {
         let ids: Vec<usize> = range.collect();
         let m = ids.len();
@@ -1099,21 +973,13 @@ mod tests {
         let err = verify_integral_lift(&bitcsr, 1.0, &bad, 3).unwrap_err();
         assert!(matches!(
             err,
-            Error::NonIntegralCocycleLift {
-                dim: 1,
-                prime: 3,
-                ..
-            }
+            Error::NonIntegralCocycleLift { prime: 3, .. }
         ));
 
-        // δf with f=(0, 1, 1): η(1,0)=η(2,0)=-1 and η(2,1)=0.
         let exact = HashMap::from([((1, 0), -1.0), ((2, 0), -1.0)]);
         verify_integral_lift(&bitcsr, 1.0, &exact, 3).unwrap();
     }
 
-    /// The circle's dominant H¹ class must produce a coordinate that winds
-    /// exactly once around S¹ — the defining property of circular
-    /// coordinates, invariant to harmonic wobble.
     #[test]
     fn circle_coordinate_winds_once() {
         let n = 48;
@@ -1160,8 +1026,6 @@ mod tests {
             assert!(matches!(err, Error::InvalidPrime(_)), "prime {bad_prime}");
         }
 
-        // A single circle has one dominant class: asking for two must report
-        // the availability.
         let err = circular_with(
             &points,
             n,
@@ -1185,7 +1049,6 @@ mod tests {
         assert_eq!(empty.k, 0);
         assert!(empty.coordinates.is_empty());
 
-        // Duplicated ranks deduplicate to a single column.
         let dedup = circular_with(
             &points,
             n,
@@ -1197,7 +1060,6 @@ mod tests {
         .unwrap();
         assert_eq!(dedup.k, 1);
 
-        // Explicit rank 0 equals the default selection.
         let explicit = circular_with(
             &points,
             n,
@@ -1211,8 +1073,6 @@ mod tests {
         assert_eq!(explicit.coordinates, default.coordinates);
     }
 
-    /// Two circles side by side, single class: the dominant class winds on
-    /// exactly one of the circles and is ~flat on the other.
     #[test]
     fn two_circles_single_class() {
         let per = 24;
@@ -1228,9 +1088,6 @@ mod tests {
         );
     }
 
-    /// Two circles, two classes: one co-alive block of two columns; after
-    /// decorrelation each column winds exactly one circle (the Gram matrix
-    /// is near-diagonal, so LLL must not mix them).
     #[test]
     fn two_circles_toroidal_block() {
         let per = 24;
@@ -1248,7 +1105,6 @@ mod tests {
         .unwrap();
         assert_eq!(cc.k, 2);
         assert_eq!(cc.coordinates.len(), n * 2);
-        // Equal circles: co-alive classes, one block.
         assert_eq!(cc.classes[0].group, cc.classes[1].group);
         assert_eq!(cc.classes[0].scale.to_bits(), cc.classes[1].scale.to_bits());
 
@@ -1265,10 +1121,6 @@ mod tests {
         );
     }
 
-    /// The topological guarantee must survive the quotient approximation:
-    /// the circle's coordinate, computed on the coperto-coned complex (class
-    /// correspondence through the log-3 interleaving), still winds exactly
-    /// once — and every original point receives its own value.
     #[test]
     fn quotient_circle_winds_once() {
         let n = 48;
@@ -1296,9 +1148,6 @@ mod tests {
         d
     }
 
-    /// Round trip: the fitted map evaluated back on the training points is
-    /// the PoU-smoothed version of the fit — same winding, values within the
-    /// harmonic-residual tolerance.
     #[test]
     fn map_round_trips_on_training_points() {
         let n = 48;
@@ -1307,7 +1156,6 @@ mod tests {
         assert_eq!(map.k, 1);
         assert_eq!(map.coordinates.len(), n);
 
-        // The stored training coordinates equal the plain function's output.
         let plain = circular(&points, n).unwrap();
         assert_eq!(map.coordinates, plain.coordinates);
 
@@ -1329,8 +1177,6 @@ mod tests {
         );
     }
 
-    /// Fresh points on the same circle (different phases) are covered, get
-    /// finite values, and wind exactly once.
     #[test]
     fn map_transforms_fresh_points() {
         let n = 48;
@@ -1350,8 +1196,6 @@ mod tests {
         assert!(winds(w), "fresh loop must wind once, got {w}");
     }
 
-    /// Outside the cover → NaN; near the data → finite. Shape errors and
-    /// unsupported configs are rejected.
     #[test]
     fn map_coverage_and_validation() {
         let n = 32;
@@ -1388,7 +1232,6 @@ mod tests {
         .unwrap_err();
         assert!(matches!(err, Error::NotImplemented(_)));
 
-        // Empty selection: a k = 0 map that transforms to (m, 0).
         let empty = circular_map_with(
             &points,
             n,
@@ -1402,8 +1245,6 @@ mod tests {
         assert!(empty.transform(&[1.0, 0.0], 1).unwrap().is_empty());
     }
 
-    /// Toroidal maps: two circles, two columns; fresh loops on each circle
-    /// wind in exactly one column each (same pattern as the fit).
     #[test]
     fn map_transforms_toroidal_blocks() {
         let per = 24;
@@ -1446,8 +1287,6 @@ mod tests {
         );
     }
 
-    /// The greedy sweep: overlapping intervals form one block at the midpoint
-    /// of their common intersection; a disjoint interval gets its own block.
     #[test]
     fn grouping_sweep() {
         let intervals = [(0.0f32, 10.0f32), (1.0, 9.0), (20.0, 30.0)];
@@ -1461,8 +1300,6 @@ mod tests {
         assert!((blocks[1].scale - 25.0).abs() < 1e-6);
     }
 
-    /// LLL on the Gram of the basis (1, 0), (3, 1): the reduced basis is the
-    /// standard one — unit diagonal, unimodular transform.
     #[test]
     fn lll_reduces_skewed_basis() {
         let gram = vec![vec![1.0, 3.0], vec![3.0, 10.0]];
@@ -1470,7 +1307,6 @@ mod tests {
         let det = u[0][0] * u[1][1] - u[0][1] * u[1][0];
         assert_eq!(det.abs(), 1, "transform must be unimodular");
 
-        // Reduced Gram = U G Uᵀ.
         let mut reduced = [[0f64; 2]; 2];
         for i in 0..2 {
             for j in 0..2 {

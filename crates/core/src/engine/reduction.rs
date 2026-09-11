@@ -1,25 +1,11 @@
-// ═══════════════════════════════════════════════════════════════════════════════
-// reduction.rs — Implicit cohomological matrix reduction over Z/2
-// ═══════════════════════════════════════════════════════════════════════════════
-
 use crate::engine::algorithm::{for_each_cofacet, zero_apparent_facet};
 use crate::engine::bitcsr::BitCsrDistanceMatrix;
 use crate::engine::heap::FastHeap;
-use crate::engine::simplex::{FxHashMap, PackedSimplex};
+use crate::engine::simplex::PackedSimplex;
 use crate::types::PersistenceInterval;
+use crate::utils::fxhash::FxHashMap;
 
-/// Engine-internal representative for one EMITTED interval: the birth simplex,
-/// the death simplex (`None` for essential classes), and the representative
-/// cocycle — the birth simplex plus the recorded reduction (V) column, over
-/// Z/2. Aligned index-for-index with the emitted intervals of its dimension.
-pub(crate) struct RawRepresentative<S> {
-    pub(crate) birth: S,
-    pub(crate) death: Option<S>,
-    pub(crate) cocycle: Vec<S>,
-}
-
-/// Sort and Z/2-cancel `working_v` in place, emitting each surviving entry.
-/// Since elements may appear with multiplicity, equal pairs cancel.
+/// Sort and cancel equal pairs over Z/2.
 #[inline]
 fn for_each_cancelled<S: Copy + Ord>(working_v: &mut [S], mut f: impl FnMut(S)) {
     working_v.sort_unstable();
@@ -27,17 +13,13 @@ fn for_each_cancelled<S: Copy + Ord>(working_v: &mut [S], mut f: impl FnMut(S)) 
     while i < working_v.len() {
         let s = working_v[i];
         if i + 1 < working_v.len() && working_v[i + 1] == s {
-            i += 2; // pair cancels in Z/2
+            i += 2;
         } else {
             f(s);
             i += 1;
         }
     }
 }
-
-// ═══════════════════════════════════════════════════════════════════════════════
-// CompressedSparseMatrix — storage for the reduction matrix V
-// ═══════════════════════════════════════════════════════════════════════════════
 
 pub struct CompressedSparseMatrix<S: Copy> {
     entries: Vec<S>,
@@ -77,12 +59,6 @@ impl<S: Copy> CompressedSparseMatrix<S> {
     }
 }
 
-//
-// ═══════════════════════════════════════════════════════════════════════════════
-// Coboundary expansion
-// ═══════════════════════════════════════════════════════════════════════════════
-
-//hottest loop accounts for 55% of runtime
 #[inline]
 fn add_simplex_coboundary<const K: usize, S: PackedSimplex<K>>(
     simplex: S,
@@ -113,10 +89,6 @@ fn add_coboundary<const K: usize, S: PackedSimplex<K>>(
     }
 }
 
-// ═══════════════════════════════════════════════════════════════════════════════
-// Initial pivot search with emergent-pair shortcut
-// ═══════════════════════════════════════════════════════════════════════════════
-
 fn init_coboundary_and_get_pivot<const K: usize, S: PackedSimplex<K>>(
     sigma: S,
     dist: &BitCsrDistanceMatrix,
@@ -132,7 +104,7 @@ fn init_coboundary_and_get_pivot<const K: usize, S: PackedSimplex<K>>(
             if !pivot_column_index.contains_key(&cofacet)
                 && zero_apparent_facet(dist, cofacet).is_none()
             {
-                working_coboundary.clear(); // discard pollution
+                working_coboundary.clear();
                 emergent = Some(cofacet);
                 return false;
             }
@@ -150,24 +122,12 @@ fn init_coboundary_and_get_pivot<const K: usize, S: PackedSimplex<K>>(
     working_coboundary.get_pivot()
 }
 
-// ═══════════════════════════════════════════════════════════════════════════════
-// compute_pairs — the main reduction loop
-// ═══════════════════════════════════════════════════════════════════════════════
-
 /// Reduce `columns`, appending intervals to `dim_intervals`. Returns the
-/// pivot → column-index map; its key set is exactly the pivots recorded this
-/// dimension, which the caller feeds to `assemble_candidates` as the clearing
-/// set (avoiding a second, duplicate hash table).
-///
-/// `RECORD` gates cocycle-representative capture at compile time: the plain
-/// path monomorphises with every recording block removed, so it stays exactly
-/// the hot loop it was. When recording, one `RawRepresentative` is pushed to
-/// `dim_reps` per EMITTED interval, in the same order.
-pub(crate) fn compute_pairs<const K: usize, S: PackedSimplex<K>, const RECORD: bool>(
+/// pivot-to-column map, whose keys are the next dimension's clearing set.
+pub(crate) fn compute_pairs<const K: usize, S: PackedSimplex<K>>(
     columns: &[S],
     dist: &BitCsrDistanceMatrix,
     dim_intervals: &mut Vec<PersistenceInterval>,
-    dim_reps: &mut Vec<RawRepresentative<S>>,
 ) -> FxHashMap<S, usize> {
     let mut pivot_column_index: FxHashMap<S, usize> =
         FxHashMap::with_capacity_and_hasher(columns.len(), Default::default());
@@ -177,9 +137,7 @@ pub(crate) fn compute_pairs<const K: usize, S: PackedSimplex<K>, const RECORD: b
 
     let mut v_matrix: CompressedSparseMatrix<S> = CompressedSparseMatrix::new();
 
-    // Working buffers grow on demand; the prealloc is a warm start, not a bound.
-    // Cap it so huge column counts don't reserve gigabytes speculatively
-    // (2 buffers x 16 B/entry: the cap bounds the upfront cost to ~16 MiB each).
+    // Bound speculative capacity; buffers still grow on demand.
     let cap = (columns.len() * 4).clamp(1024, 1 << 20);
     let mut working_v: Vec<S> = Vec::with_capacity(cap);
     let mut working_coboundary: FastHeap<S> = FastHeap::with_capacity(cap);
@@ -203,14 +161,6 @@ pub(crate) fn compute_pairs<const K: usize, S: PackedSimplex<K>, const RECORD: b
                         birth: sigma.filtration(),
                         death: tau.filtration(),
                     });
-                    if RECORD {
-                        // No columns were added: the cocycle is σ alone.
-                        dim_reps.push(RawRepresentative {
-                            birth: sigma,
-                            death: Some(tau),
-                            cocycle: vec![sigma],
-                        });
-                    }
                 }
                 pivot_column_index.insert(tau, j);
                 continue;
@@ -219,13 +169,6 @@ pub(crate) fn compute_pairs<const K: usize, S: PackedSimplex<K>, const RECORD: b
                 birth: sigma.filtration(),
                 death: f32::INFINITY,
             });
-            if RECORD {
-                dim_reps.push(RawRepresentative {
-                    birth: sigma,
-                    death: None,
-                    cocycle: vec![sigma],
-                });
-            }
             continue;
         }
 
@@ -236,18 +179,6 @@ pub(crate) fn compute_pairs<const K: usize, S: PackedSimplex<K>, const RECORD: b
                         birth: sigma.filtration(),
                         death: f32::INFINITY,
                     });
-                    if RECORD {
-                        // Essential class (only reachable under a user
-                        // threshold): the accumulated column is its cocycle
-                        // within the truncated complex.
-                        let mut cocycle = vec![sigma];
-                        for_each_cancelled(&mut working_v, |s| cocycle.push(s));
-                        dim_reps.push(RawRepresentative {
-                            birth: sigma,
-                            death: None,
-                            cocycle,
-                        });
-                    }
                     break;
                 }
                 Some(tau) => {
@@ -270,8 +201,7 @@ pub(crate) fn compute_pairs<const K: usize, S: PackedSimplex<K>, const RECORD: b
                         continue;
                     }
 
-                    let emitted = tau.filtration_encoded() != sigma.filtration_encoded();
-                    if emitted {
+                    if tau.filtration_encoded() != sigma.filtration_encoded() {
                         dim_intervals.push(PersistenceInterval {
                             birth: sigma.filtration(),
                             death: tau.filtration(),
@@ -279,22 +209,7 @@ pub(crate) fn compute_pairs<const K: usize, S: PackedSimplex<K>, const RECORD: b
                     }
                     pivot_column_index.insert(tau, j);
 
-                    // Sort and Z/2-cancel, then drain into the reduction matrix.
                     for_each_cancelled(&mut working_v, |s| v_matrix.push(s));
-
-                    if RECORD && emitted {
-                        // The cocycle of the class killed by τ: σ plus the
-                        // just-recorded V column.
-                        let column = v_matrix.column(j);
-                        let mut cocycle = Vec::with_capacity(column.len() + 1);
-                        cocycle.push(sigma);
-                        cocycle.extend_from_slice(column);
-                        dim_reps.push(RawRepresentative {
-                            birth: sigma,
-                            death: Some(tau),
-                            cocycle,
-                        });
-                    }
                     break;
                 }
             }

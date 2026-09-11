@@ -1,32 +1,11 @@
-// ═══════════════════════════════════════════════════════════════════════════════
-// algorithm.rs — the Ripser driver over the BitCSR data structure
-// ═══════════════════════════════════════════════════════════════════════════════
-//
-// This file owns the algorithm logic that turns a `BitCsrDistanceMatrix` into a
-// barcode: the dimension driver (`compute`), H0 via union-find, cofacet/edge
-// enumeration into packed simplices, apparent-pair detection, and next-dimension
-// candidate assembly (including the rayon-parallel path). The matrix reduction
-// loop itself lives in `reduction.rs`. Everything is generic over the
-// `PackedSimplex` layout; `lib.rs` chooses the instantiation from `n`.
-//
-// Everything here drives the data structure through its primitive bit/neighbour
-// operations (`for_each_common_neighbor`, `edge_dist`, …); the `BitCsr` type
-// exposes no Ripser concepts.
-
 use crate::engine::bitcsr::BitCsrDistanceMatrix;
-use crate::engine::reduction::{compute_pairs, RawRepresentative};
-use crate::engine::simplex::{encode_filtration, CofacetBuilder, FxHashMap, PackedSimplex};
-use crate::types::{BarcodeResult, PersistenceInterval, Representative, RepresentedBarcode};
+use crate::engine::reduction::compute_pairs;
+use crate::engine::simplex::{encode_filtration, CofacetBuilder, PackedSimplex};
+use crate::types::{BarcodeResult, PersistenceInterval};
+use crate::utils::fxhash::FxHashMap;
 
-/// Minimum number of input simplices before `assemble_candidates` uses rayon.
-/// Below this the per-task overhead and buffer merges outweigh the work, so we
-/// stay on the sequential, single-allocation path (this also covers H1 and
-/// small datasets even when the caller requests `parallel`).
+/// Minimum input size for parallel candidate assembly.
 const PARALLEL_ASSEMBLE_THRESHOLD: usize = 512;
-
-// ═══════════════════════════════════════════════════════════════════════════════
-// Union-Find (path halving + union by rank)
-// ═══════════════════════════════════════════════════════════════════════════════
 
 struct UnionFind {
     parent: Vec<usize>,
@@ -50,7 +29,7 @@ impl UnionFind {
         x
     }
 
-    /// Link two DISTINCT roots, returning the surviving root.
+    /// Link distinct roots and return the survivor.
     #[inline]
     fn link(&mut self, ra: usize, rb: usize) -> usize {
         debug_assert!(ra != rb);
@@ -67,13 +46,7 @@ impl UnionFind {
     }
 }
 
-// ═══════════════════════════════════════════════════════════════════════════════
-// Edge & cofacet enumeration — build packed simplices from the BitCSR primitives
-// ═══════════════════════════════════════════════════════════════════════════════
-
-/// Enumerate every stored 1-simplex (edge), each exactly once (the larger
-/// endpoint stored first), with its diameter encoded. Used to seed H0. Return
-/// `false` from `f` to stop early.
+/// Enumerate stored edges once, with the larger endpoint first.
 pub(crate) fn for_each_edge<const K: usize, S: PackedSimplex<K>>(
     dist: &BitCsrDistanceMatrix,
     mut f: impl FnMut(S) -> bool,
@@ -93,16 +66,10 @@ pub(crate) fn for_each_edge<const K: usize, S: PackedSimplex<K>>(
     }
 }
 
-/// Enumerate the cofacets of `sigma`, youngest-first (descending inserted-vertex
-/// order), each carrying its cofacet diameter. The matrix already contains only
-/// edges admitted by preprocessing.
+/// Enumerate cofacets youngest first with their diameters.
 ///
-/// - `all_cofacets = true`  → every cofacet (reduction / coboundary).
-/// - `all_cofacets = false` → only cofacets whose inserted vertex exceeds σ's
-///   largest vertex, so each (d+1)-simplex is produced once when assembling the
-///   next dimension's column pool.
-///
-/// Return `false` from `f` to stop early.
+/// Unless `all_cofacets`, emit only insertions above the largest base vertex so
+/// each simplex is assembled once.
 #[inline]
 pub(crate) fn for_each_cofacet<const K: usize, S: PackedSimplex<K>>(
     dist: &BitCsrDistanceMatrix,
@@ -122,9 +89,7 @@ pub(crate) fn for_each_cofacet<const K: usize, S: PackedSimplex<K>>(
     } else {
         sigma.largest_vertex() as i32
     };
-    // The builder caches the cofacet-construction masks; they depend only on
-    // the insertion rank `vi`, which advances monotonically as the
-    // youngest-first neighbour id descends past σ's vertices.
+    // Descending neighbour ids make the insertion rank monotone.
     let mut builder = sigma.cofacet_builder();
     let mut vi = 0usize;
 
@@ -142,16 +107,10 @@ pub(crate) fn for_each_cofacet<const K: usize, S: PackedSimplex<K>>(
     });
 }
 
-// ═══════════════════════════════════════════════════════════════════════════════
-// Apparent-pair detection (Ripser paper, Proposition 3.9)
-// ═══════════════════════════════════════════════════════════════════════════════
-//
-// A pair (σ, τ) with dim τ = dim σ + 1 is a zero-persistence apparent pair iff
-//   (C1) τ is the youngest same-diameter cofacet of σ, and
-//   (C2) σ is the oldest  same-diameter facet   of τ.
+// An apparent pair `(sigma, tau)` has `tau` as the youngest same-diameter
+// cofacet of `sigma`, and `sigma` as the oldest same-diameter facet of `tau`.
 
-/// First common neighbour whose max edge distance to the set is ≤ `max_extra`
-/// (youngest-first), or `None`.
+/// Youngest common neighbour within `max_extra`.
 #[inline]
 fn first_common_neighbor_le<const K: usize>(
     dist: &BitCsrDistanceMatrix,
@@ -171,7 +130,6 @@ fn first_common_neighbor_le<const K: usize>(
     result
 }
 
-/// Diameter of the facet of `verts[0..vc]` obtained by removing slot `skip`.
 #[inline]
 fn facet_diameter<const K: usize>(
     dist: &BitCsrDistanceMatrix,
@@ -197,8 +155,7 @@ fn facet_diameter<const K: usize>(
     diam
 }
 
-/// Bitmask (over `edge_bit(i, j)`) of the edges whose encoded distance equals
-/// `diam_bits` — the "diameter edges" of the vertex set.
+/// Mask of edges whose encoded distance equals `diam_bits`.
 #[inline]
 fn diameter_edge_mask<const K: usize>(
     dist: &BitCsrDistanceMatrix,
@@ -217,7 +174,6 @@ fn diameter_edge_mask<const K: usize>(
     mask
 }
 
-/// Oldest same-diameter facet of `tau`, or `None`.
 #[inline]
 fn zero_pivot_facet<const K: usize, S: PackedSimplex<K>>(
     dist: &BitCsrDistanceMatrix,
@@ -244,7 +200,6 @@ fn zero_pivot_facet<const K: usize, S: PackedSimplex<K>>(
     None
 }
 
-/// Youngest same-diameter cofacet of `sigma`, or `None`.
 #[inline]
 fn zero_pivot_cofacet<const K: usize, S: PackedSimplex<K>>(
     dist: &BitCsrDistanceMatrix,
@@ -260,8 +215,7 @@ fn zero_pivot_cofacet<const K: usize, S: PackedSimplex<K>>(
     Some(sigma.cofacet(w, sigma.filtration_encoded()))
 }
 
-/// If `tau` is the cofacet side of an apparent pair, return its facet partner φ.
-/// Used as the reduction shortcut.
+/// Return `tau`'s apparent facet partner.
 #[inline]
 pub(crate) fn zero_apparent_facet<const K: usize, S: PackedSimplex<K>>(
     dist: &BitCsrDistanceMatrix,
@@ -276,8 +230,7 @@ pub(crate) fn zero_apparent_facet<const K: usize, S: PackedSimplex<K>>(
     }
 }
 
-/// If `sigma` is the facet side of an apparent pair, return its cofacet partner
-/// τ. Used by H0 to skip already-paired edges.
+/// Return `sigma`'s apparent cofacet partner.
 #[inline]
 fn zero_apparent_cofacet<const K: usize, S: PackedSimplex<K>>(
     dist: &BitCsrDistanceMatrix,
@@ -292,14 +245,9 @@ fn zero_apparent_cofacet<const K: usize, S: PackedSimplex<K>>(
     }
 }
 
-// ═══════════════════════════════════════════════════════════════════════════════
-// H0: enumerate edges, Kruskal, split into simplices + columns_to_reduce
-// ═══════════════════════════════════════════════════════════════════════════════
-
-pub(crate) fn compute_h0<const K: usize, S: PackedSimplex<K>, const RECORD: bool>(
+pub(crate) fn compute_h0<const K: usize, S: PackedSimplex<K>>(
     dist: &BitCsrDistanceMatrix,
     intervals: &mut Vec<PersistenceInterval>,
-    reps: &mut Vec<RawRepresentative<S>>,
     parallel: bool,
 ) -> (Vec<S>, Vec<S>) {
     let n = dist.n();
@@ -310,10 +258,7 @@ pub(crate) fn compute_h0<const K: usize, S: PackedSimplex<K>, const RECORD: bool
         true
     });
 
-    // Kruskal needs SMALLEST DIAMETER FIRST (= oldest-first). Under the
-    // Ripser-compatible Ord, oldest is "greater", so descending sort gives
-    // oldest-first iteration here. Keys are distinct (one per edge), so the
-    // parallel unstable sort is deterministic.
+    // Packed order is reversed by diameter, so descending gives Kruskal order.
     if parallel {
         use rayon::prelude::*;
         edges.par_sort_unstable_by(|a, b| b.cmp(a));
@@ -322,17 +267,6 @@ pub(crate) fn compute_h0<const K: usize, S: PackedSimplex<K>, const RECORD: bool
     }
 
     let mut uf = UnionFind::new(n);
-    // Minimum vertex id per component root, maintained only when recording.
-    // Every vertex is born at 0, so the elder rule reduces to an id
-    // convention: the surviving class keeps the smaller minimum, the dying
-    // class is named by the larger one (matching Ripser's vertex pairing).
-    let mut comp_min: Vec<u32> = if RECORD {
-        (0..n).map(|v| v as u32).collect()
-    } else {
-        Vec::new()
-    };
-    // No prealloc: only non-merging, non-apparent edges land here (usually a
-    // small fraction), and a full-edge-count reservation would dwarf the result.
     let mut columns_to_reduce = Vec::new();
 
     let mut num_merges: usize = 0;
@@ -342,39 +276,20 @@ pub(crate) fn compute_h0<const K: usize, S: PackedSimplex<K>, const RECORD: bool
         let rb = uf.find(verts[1] as usize);
         if ra != rb {
             num_merges += 1;
-            // ZERO-PERSISTENCE FILTER: edges with diam=0 (duplicate points)
-            // produce H0 pairs (0, 0) which Ripser excludes from output by
-            // default. Skip them here too to match.
+            // Match Ripser by omitting zero-persistence H0 pairs.
             let death = edge.filtration();
             if death > 0.0 {
                 intervals.push(PersistenceInterval { birth: 0.0, death });
-                if RECORD {
-                    let dying = comp_min[ra].max(comp_min[rb]);
-                    reps.push(RawRepresentative {
-                        birth: S::from_sorted_desc(0.0, &[dying]),
-                        death: Some(edge),
-                        cocycle: Vec::new(),
-                    });
-                }
             }
-            let winner = uf.link(ra, rb);
-            if RECORD {
-                comp_min[winner] = comp_min[ra].min(comp_min[rb]);
-            }
+            uf.link(ra, rb);
         } else {
-            // Edge did NOT merge components — it closes a 1-cycle candidate.
-            // Filter: if the edge is already the cofacet side of an apparent pair
-            // with one of its endpoints, it's guaranteed to be paired in the H1
-            // reduction and we can skip it here (Ripser, compute_dim_0_pairs).
             if zero_apparent_cofacet(dist, edge).is_none() {
                 columns_to_reduce.push(edge);
             }
         }
     }
 
-    // Number of connected components at the matrix cutoff = n - num_merges. This is
-    // always ≥ 1 (the whole space is at least one component). Each component
-    // contributes one essential H0 class.
+    // Each component at the cutoff contributes one essential H0 class.
     let num_essential = n - num_merges;
     for _ in 0..num_essential {
         intervals.push(PersistenceInterval {
@@ -382,41 +297,14 @@ pub(crate) fn compute_h0<const K: usize, S: PackedSimplex<K>, const RECORD: bool
             death: f32::INFINITY,
         });
     }
-    if RECORD {
-        for (v, &minimum) in comp_min.iter().enumerate() {
-            if uf.find(v) == v {
-                reps.push(RawRepresentative {
-                    birth: S::from_sorted_desc(0.0, &[minimum]),
-                    death: None,
-                    cocycle: Vec::new(),
-                });
-            }
-        }
-    }
-
-    // Release growth slack: this vector stays alive through the whole H1
-    // reduction, so dead capacity here is a long-lived cost.
     columns_to_reduce.shrink_to_fit();
     columns_to_reduce.reverse();
     (edges, columns_to_reduce)
 }
 
-// ═══════════════════════════════════════════════════════════════════════════════
-// Assemble columns_to_reduce for the next dimension
-// ═══════════════════════════════════════════════════════════════════════════════
-
-/// Build the next dimension's column list from `simplices` (the d-simplices
-/// surviving from the previous dimension). For each cofacet τ enumerated:
-///   1. Push into `next_simplices` (becomes the d+1-simplex pool for the
-///      dimension after this), when `build_pool`.
-///   2. Add to `columns_to_reduce` UNLESS τ is filtered out by clearing
-///      (already a known pivot) or apparent-pair filtering.
+/// Assemble the next dimension after clearing and apparent-pair filtering.
 ///
-/// Each simplex expands independently — inputs are the immutable matrix and the
-/// frozen `cleared_pivots`, outputs are pure appends — so the loop parallelises
-/// by giving each worker its own buffers and concatenating; the final sort makes
-/// the merge order irrelevant. The size guard keeps small inputs (and every
-/// H1/small-dataset case) on the allocation-free sequential path.
+/// Parallel workers use private buffers; sorting removes merge-order dependence.
 pub(crate) fn assemble_candidates<const K: usize, S: PackedSimplex<K>>(
     dist: &BitCsrDistanceMatrix,
     simplices: &mut Vec<S>,
@@ -432,8 +320,6 @@ pub(crate) fn assemble_candidates<const K: usize, S: PackedSimplex<K>>(
 
     let (next_simplices, mut columns_to_reduce) = if use_par {
         use rayon::prelude::*;
-        // Collect per-worker buffers, then merge once with an exact reservation.
-        // (A tree reduce would recopy each element O(log workers) times.)
         let workers: Vec<(Vec<S>, Vec<S>)> = simplices
             .par_iter()
             .fold(
@@ -598,8 +484,7 @@ fn assemble_generic_candidates<const K: usize, S: PackedSimplex<K>>(
     });
 }
 
-/// A cofacet τ survives iff it is NOT the facet side and NOT the cofacet side of
-/// an apparent pair (the fused apparent-pair filter).
+/// Reject either side of an apparent pair.
 #[inline]
 fn keep_fused_candidate<const K: usize, S: PackedSimplex<K>>(
     dist: &BitCsrDistanceMatrix,
@@ -666,13 +551,8 @@ fn is_zero_apparent_facet_side<const K: usize, S: PackedSimplex<K>>(
     oldest_same_diam_facet_slot::<K>(vc + 1, rho_edges) == Some(rank)
 }
 
-// ── Small combinatorial helpers for the apparent-pair / assembly logic ────────
-
 /// Encode edge `(i, j)` (with `i < j < K`) as a single bit in a 64-bit mask.
-/// Row-major `i * K + j` when that fits 64 bits (K <= 8; for Simplex128's
-/// K = 6 this is the historical one-`lea` packing), triangular
-/// `j*(j-1)/2 + i` otherwise (supports K <= 11). The branch is a constant
-/// per monomorphisation, and masks never cross instantiations.
+/// Uses row-major indexing when `K * K <= 64`, otherwise triangular indexing.
 #[inline(always)]
 fn edge_bit<const K: usize>(i: usize, j: usize) -> u64 {
     debug_assert!(i < j && j < K);
@@ -683,8 +563,7 @@ fn edge_bit<const K: usize>(i: usize, j: usize) -> u64 {
     }
 }
 
-/// Given the mask of diameter edges, which slot to remove to obtain the oldest
-/// same-diameter facet, or `None` if there is no same-diameter facet.
+/// Slot whose removal gives the oldest same-diameter facet.
 #[inline]
 fn oldest_same_diam_facet_slot<const K: usize>(vc: usize, diam_edges: u64) -> Option<usize> {
     if vc < 3 || diam_edges == 0 {
@@ -705,8 +584,6 @@ fn oldest_same_diam_facet_slot<const K: usize>(vc: usize, diam_edges: u64) -> Op
     None
 }
 
-/// Insert `w` into the descending vertex array, returning the new array and the
-/// insertion rank.
 #[inline]
 fn insert_vertex_desc<const K: usize>(verts: &[u32; K], vc: usize, w: u32) -> ([u32; K], usize) {
     let mut out = [0u32; K];
@@ -724,7 +601,6 @@ fn insert_vertex_desc<const K: usize>(verts: &[u32; K], vc: usize, w: u32) -> ([
     (out, rank)
 }
 
-/// Adjust an edge mask after inserting a new vertex at `rank`.
 #[inline]
 fn remap_edge_mask_after_insert<const K: usize>(mask: u64, vc: usize, rank: usize) -> u64 {
     let mut out = 0u64;
@@ -741,123 +617,41 @@ fn remap_edge_mask_after_insert<const K: usize>(mask: u64, vc: usize, rank: usiz
     out
 }
 
-// ═══════════════════════════════════════════════════════════════════════════════
-// Main loop
-// ═══════════════════════════════════════════════════════════════════════════════
-
-/// Barcode only — the hot entry point. Monomorphised with recording compiled
-/// out, so it pays nothing for the representatives machinery.
+/// Compute the barcode.
 pub fn compute<const K: usize, S: PackedSimplex<K>>(
     dist: &BitCsrDistanceMatrix,
     max_dim: usize,
     parallel: bool,
 ) -> BarcodeResult {
-    compute_impl::<K, S, false>(dist, max_dim, parallel).0
-}
-
-/// Barcode plus cocycle representatives (persistent cohomology), aligned
-/// index-for-index with the emitted intervals of each dimension.
-pub fn compute_with_representatives<const K: usize, S: PackedSimplex<K>>(
-    dist: &BitCsrDistanceMatrix,
-    max_dim: usize,
-    parallel: bool,
-) -> RepresentedBarcode {
-    let (barcode, raw) = compute_impl::<K, S, true>(dist, max_dim, parallel);
-    let representatives = raw
-        .into_iter()
-        .map(|dim| {
-            dim.into_iter()
-                .map(convert_representative::<K, S>)
-                .collect()
-        })
-        .collect();
-    RepresentedBarcode {
-        barcode,
-        representatives,
-    }
-}
-
-/// Vertex ids (descending) of a packed simplex, for external consumption.
-fn simplex_vertices<const K: usize, S: PackedSimplex<K>>(simplex: S) -> Vec<u32> {
-    let vc = simplex.vertex_count();
-    simplex.vertices()[..vc].to_vec()
-}
-
-fn convert_representative<const K: usize, S: PackedSimplex<K>>(
-    raw: RawRepresentative<S>,
-) -> Representative {
-    Representative {
-        birth: simplex_vertices::<K, S>(raw.birth),
-        death: raw.death.map(simplex_vertices::<K, S>),
-        cocycle: raw
-            .cocycle
-            .into_iter()
-            .map(simplex_vertices::<K, S>)
-            .collect(),
-    }
-}
-
-fn compute_impl<const K: usize, S: PackedSimplex<K>, const RECORD: bool>(
-    dist: &BitCsrDistanceMatrix,
-    max_dim: usize,
-    parallel: bool,
-) -> (BarcodeResult, Vec<Vec<RawRepresentative<S>>>) {
     let mut intervals: Vec<Vec<PersistenceInterval>> = Vec::with_capacity(max_dim + 1);
-    let mut representatives: Vec<Vec<RawRepresentative<S>>> = Vec::new();
 
-    // H0: union-find. No clearing input needed (no previous dim).
     let mut h0 = Vec::new();
-    let mut h0_reps = Vec::new();
-    let (mut simplices, mut columns_to_reduce) =
-        compute_h0::<K, S, RECORD>(dist, &mut h0, &mut h0_reps, parallel);
+    let (mut simplices, mut columns_to_reduce) = compute_h0::<K, S>(dist, &mut h0, parallel);
     intervals.push(h0);
-    if RECORD {
-        representatives.push(h0_reps);
-    }
 
     if max_dim <= 1 {
-        // The edge pool only feeds assemble_candidates (max_dim >= 2); free it
-        // before the H1 reduction rather than carrying it through.
         simplices = Vec::new();
     }
 
-    // H1 .. H_{max_dim}
     for dim in 1..=max_dim {
         let mut dim_intervals = Vec::new();
-        let mut dim_reps = Vec::new();
 
-        // Reduce this dimension's columns. The returned pivot map holds exactly
-        // the pivots recorded at THIS dimension; its key set is the clearing
-        // set consumed by assemble_candidates for dim+1.
-        let pivots = compute_pairs::<K, S, RECORD>(
-            &columns_to_reduce,
-            dist,
-            &mut dim_intervals,
-            &mut dim_reps,
-        );
+        // This dimension's pivots clear the next dimension.
+        let pivots = compute_pairs::<K, S>(&columns_to_reduce, dist, &mut dim_intervals);
         intervals.push(dim_intervals);
-        if RECORD {
-            representatives.push(dim_reps);
-        }
 
         if dim < max_dim {
             let build_pool = dim + 1 < max_dim;
             columns_to_reduce =
                 assemble_candidates(dist, &mut simplices, &pivots, build_pool, parallel);
             if !build_pool {
-                // Last assembly: the d-simplex pool is dead weight from here on;
-                // free it before the final (largest) reduction.
                 simplices = Vec::new();
             }
         }
     }
 
-    (BarcodeResult { intervals }, representatives)
+    BarcodeResult { intervals }
 }
-
-// ═══════════════════════════════════════════════════════════════════════════════
-// End-to-end correctness tests (driven through the BitCSR backend)
-// ═══════════════════════════════════════════════════════════════════════════════
 
 #[cfg(test)]
 mod tests {
@@ -866,7 +660,6 @@ mod tests {
     use crate::preprocess::edgelist::square_from_lower_tri;
     use crate::preprocess::edgelist::EdgeList;
 
-    /// Sorted (birth, death) bit-pairs per dimension — an exact multiset key.
     fn barcode_key(bc: &BarcodeResult) -> Vec<Vec<(u32, u32)>> {
         bc.intervals
             .iter()
@@ -881,12 +674,6 @@ mod tests {
             .collect()
     }
 
-    /// The Simplex256 instantiation must reproduce Simplex128's output
-    /// EXACTLY: the packing changes, but the Ripser order (filtration
-    /// descending, colex ties) — and therefore every pivot, apparent pair,
-    /// and emitted interval — does not. Random fixtures with and without
-    /// diameter ties, several thresholds and dimensions, barcodes AND
-    /// cocycle representatives.
     #[test]
     fn simplex256_engine_matches_simplex128() {
         let mut s: u64 = 0x5eed_cafe_0123_4567;
@@ -922,27 +709,11 @@ mod tests {
                         barcode_key(&wide),
                         "barcode mismatch (n={n}, levels={levels}, thr={thr}, max_dim={max_dim})"
                     );
-
-                    let narrow_reps =
-                        compute_with_representatives::<6, Simplex128>(&bitcsr, max_dim, false);
-                    let wide_reps =
-                        compute_with_representatives::<9, Simplex256>(&bitcsr, max_dim, false);
-                    assert_eq!(
-                        barcode_key(&narrow_reps.barcode),
-                        barcode_key(&wide_reps.barcode)
-                    );
-                    assert_eq!(
-                        narrow_reps.representatives, wide_reps.representatives,
-                        "representative mismatch (n={n}, thr={thr}, max_dim={max_dim})"
-                    );
                 }
             }
         }
     }
 
-    /// Octahedron through the wide engine: the H2 sphere class must appear
-    /// exactly as in the narrow engine (see `octahedron_h2`), and dimensions
-    /// 3..=5 of a 6-point space are empty.
     #[test]
     fn simplex256_deep_dims_on_octahedron() {
         let s = std::f32::consts::SQRT_2;
@@ -965,8 +736,6 @@ mod tests {
         }
     }
 
-    /// Build a BitCSR from a lower-triangular fixture (through the real pdist
-    /// distance-matrix path) and run the engine.
     fn run(lt: &[f32], n: usize, threshold: f32, max_dim: usize) -> BarcodeResult {
         let sq = square_from_lower_tri(n, lt);
         let edges = EdgeList::from_distance_matrix(&sq, n, threshold);
@@ -992,26 +761,19 @@ mod tests {
             .count()
     }
 
-    /// Two-point space: H0 has one essential class (1 component, never dies)
-    /// and one finite class [0, d(0,1)). H1 is empty.
     #[test]
     fn h0_two_points() {
         let bc = run(&[1.0], 2, f32::INFINITY, 1);
         assert_eq!(bc.intervals.len(), 2);
-        // H0: one finite [0,1) and one essential [0, ∞)
         assert_eq!(bc.intervals[0].len(), 2);
         let mut h0_sorted: Vec<_> = bc.intervals[0].clone();
         h0_sorted.sort_by(|a, b| a.death.partial_cmp(&b.death).unwrap());
         assert!(approx_eq(h0_sorted[0].birth, 0.0, 1e-6));
         assert!(approx_eq(h0_sorted[0].death, 1.0, 1e-6));
         assert!(h0_sorted[1].death.is_infinite());
-        // H1: empty
         assert_eq!(bc.intervals[1].len(), 0);
     }
 
-    /// 4 points forming a 4-cycle, no diagonal close enough to fill it.
-    /// d(1,0)=d(2,1)=d(3,2)=d(3,0)=1, diagonals d(2,0)=d(3,1)=10.
-    /// Threshold 1.5: 4-cycle alive, no triangles. Should give 1 essential H1.
     #[test]
     fn unfilled_4cycle_essential_h1() {
         let bc = run(
@@ -1025,7 +787,6 @@ mod tests {
             1,
         );
 
-        // H0: 4 components reduce to 1 → 3 finite [0,1) + 1 essential.
         assert_eq!(count_essential_h_d(&bc, 0), 1);
         let h0_finite_count = bc.intervals[0]
             .iter()
@@ -1033,19 +794,15 @@ mod tests {
             .count();
         assert_eq!(h0_finite_count, 3);
 
-        // H1: exactly 1 essential cycle (the unfilled 4-cycle).
         assert_eq!(count_essential_h_d(&bc, 1), 1);
-        // No finite H1 (no triangles fill anything in).
         assert_eq!(count_finite_h_d(&bc, 1), 0);
     }
 
     #[test]
     fn unit_square_h0_h1() {
         let s = std::f32::consts::SQRT_2;
-        // d(1,0)=1, d(2,0)=√2, d(2,1)=1, d(3,0)=1, d(3,1)=√2, d(3,2)=1
         let bc = run(&[1.0, s, 1.0, 1.0, s, 1.0], 4, f32::INFINITY, 2);
 
-        // H0: exactly 3 finite intervals [0, 1.0) and 1 essential.
         assert_eq!(count_essential_h_d(&bc, 0), 1, "H0 essentials");
         let h0_finite: Vec<_> = bc.intervals[0]
             .iter()
@@ -1057,7 +814,6 @@ mod tests {
             assert!(approx_eq(iv.death, 1.0, 1e-6));
         }
 
-        // H1: exactly 1 finite interval [1.0, √2), no essentials.
         assert_eq!(count_essential_h_d(&bc, 1), 0, "H1 essentials");
         assert_eq!(count_finite_h_d(&bc, 1), 1, "H1 finite intervals");
         let h1: &PersistenceInterval = bc.intervals[1]
@@ -1076,13 +832,9 @@ mod tests {
         );
     }
 
-    /// Two disconnected segments (4 points: 0-1 close, 2-3 close, far between).
     #[test]
     fn two_components_finite_threshold() {
-        // d(1,0)=1, d(2,0)=10, d(2,1)=9, d(3,0)=11, d(3,1)=10, d(3,2)=1
         let bc = run(&[1.0, 10.0, 9.0, 11.0, 10.0, 1.0], 4, 5.0, 1);
-        // With threshold 5, edges of length > 5 don't form. Components: {0,1} and {2,3}.
-        // H0: 2 finite [0,1), 2 essentials.
         assert_eq!(count_essential_h_d(&bc, 0), 2);
         let finite_count = bc.intervals[0]
             .iter()
@@ -1094,133 +846,19 @@ mod tests {
                 assert!(approx_eq(iv.death, 1.0, 1e-6));
             }
         }
-        // H1: empty (no cycles possible).
         assert_eq!(bc.intervals[1].len(), 0);
     }
 
-    /// PROPERTY: every recorded cocycle is genuinely a representative of its
-    /// interval. Over Z/2, the coboundary of the cocycle (XOR of all cofacets
-    /// of its simplices) must satisfy:
-    ///   * paired class: the youngest surviving cofacet IS the death simplex,
-    ///     and every survivor has diameter >= the death (the reduced column's
-    ///     pivot property);
-    ///   * essential class: no surviving cofacet at all (a true cocycle in
-    ///     the truncated complex).
-    ///
-    /// Also: birth/death simplex diameters equal the interval endpoints, and
-    /// representatives align 1:1 with emitted intervals.
-    #[test]
-    #[allow(clippy::needless_range_loop)] // dimensions index aligned result arrays
-    fn cocycle_representatives_are_valid() {
-        use std::collections::HashMap;
-
-        let mut s: u64 = 0x0c0c_5eed_1234_5678;
-        let mut rng = || {
-            s ^= s << 13;
-            s ^= s >> 7;
-            s ^= s << 17;
-            (s >> 40) as f32 / 16_777_216.0
-        };
-
-        // Random fixtures (enclosing-radius truncation: no essentials in
-        // dim >= 1) plus the unfilled 4-cycle at a user threshold (essential
-        // H1 exercises the empty-coboundary branch).
-        let mut cases: Vec<(usize, Vec<f32>, f32)> = Vec::new();
-        for &n in &[7usize, 9, 10] {
-            let m = n * (n - 1) / 2;
-            cases.push((n, (0..m).map(|_| 0.2 + rng()).collect(), f32::INFINITY));
-        }
-        cases.push((4, vec![1.0, 10.0, 1.0, 1.0, 10.0, 1.0], 1.5));
-
-        for (n, lt, threshold) in cases {
-            let sq = crate::preprocess::edgelist::square_from_lower_tri(n, &lt);
-            let edges =
-                crate::preprocess::edgelist::EdgeList::from_distance_matrix(&sq, n, threshold);
-            let bitcsr = BitCsrDistanceMatrix::from_edge_list(edges);
-            let max_dim = 2;
-            let (bc, reps) = compute_impl::<6, Simplex128, true>(&bitcsr, max_dim, false);
-            let plain = compute::<6, Simplex128>(&bitcsr, max_dim, false);
-
-            // Recording must not perturb the barcode, and reps align 1:1.
-            assert_eq!(bc.intervals.len(), plain.intervals.len());
-            for d in 0..=max_dim {
-                assert_eq!(bc.intervals[d].len(), plain.intervals[d].len());
-                assert_eq!(reps[d].len(), bc.intervals[d].len(), "dim {d}");
-            }
-
-            for dim in 1..=max_dim {
-                for (iv, rep) in bc.intervals[dim].iter().zip(&reps[dim]) {
-                    assert_eq!(rep.birth.filtration(), iv.birth);
-                    assert!(rep.cocycle.contains(&rep.birth));
-                    assert!(rep.cocycle.iter().all(|s| s.vertex_count() == dim + 1));
-
-                    // δ(cocycle) over Z/2.
-                    let mut parity: HashMap<Simplex128, bool> = HashMap::new();
-                    for &simplex in &rep.cocycle {
-                        for_each_cofacet(&bitcsr, simplex, true, |cofacet| {
-                            *parity.entry(cofacet).or_insert(false) ^= true;
-                            true
-                        });
-                    }
-                    let surviving: Vec<Simplex128> = parity
-                        .into_iter()
-                        .filter_map(|(c, odd)| odd.then_some(c))
-                        .collect();
-
-                    match rep.death {
-                        Some(tau) => {
-                            assert_eq!(tau.filtration(), iv.death);
-                            // Youngest survivor (max u128) is exactly τ.
-                            assert_eq!(surviving.iter().max(), Some(&tau));
-                            assert!(surviving.iter().all(|c| c.filtration() >= iv.death));
-                        }
-                        None => {
-                            assert!(iv.death.is_infinite());
-                            assert!(
-                                surviving.is_empty(),
-                                "essential class has a nonzero coboundary"
-                            );
-                        }
-                    }
-                }
-            }
-
-            // H0: pairs only — birth vertex, death edge, empty cocycle.
-            for (iv, rep) in bc.intervals[0].iter().zip(&reps[0]) {
-                assert_eq!(rep.birth.vertex_count(), 1);
-                assert!(rep.cocycle.is_empty());
-                match rep.death {
-                    Some(edge) => {
-                        assert_eq!(edge.vertex_count(), 2);
-                        assert_eq!(edge.filtration(), iv.death);
-                    }
-                    None => assert!(iv.death.is_infinite()),
-                }
-            }
-        }
-    }
-
-    /// Octahedron: 6 points forming an octahedron. Expected H1 = 0, H2 ≥ 1
-    /// (the octahedral surface is a 2-sphere).
     #[test]
     fn octahedron_h2() {
-        // Indices: 0=(+1,0,0), 1=(-1,0,0), 2=(0,+1,0), 3=(0,-1,0), 4=(0,0,+1), 5=(0,0,-1)
-        //   antipodal pairs (0,1), (2,3), (4,5) → 2.0; adjacent pairs → √2
         let s = std::f32::consts::SQRT_2;
         let bc = run(
-            &[
-                2.0, // (1,0)  antipodal
-                s, s, // (2,0), (2,1)  adjacent
-                s, s, 2.0, // (3,0), (3,1), (3,2)  — (3,2) antipodal
-                s, s, s, s, // (4,0..3) all adjacent
-                s, s, s, s, 2.0, // (5,0..3) adjacent, (5,4) antipodal
-            ],
+            &[2.0, s, s, s, s, 2.0, s, s, s, s, s, s, s, s, 2.0],
             6,
             f32::INFINITY,
             2,
         );
 
-        // H0: 1 essential, 5 finite (all dying at √2 when octahedron connects).
         assert_eq!(count_essential_h_d(&bc, 0), 1);
         let h0_finite = bc.intervals[0]
             .iter()
@@ -1228,14 +866,12 @@ mod tests {
             .count();
         assert_eq!(h0_finite, 5);
 
-        // H1: no essential classes.
         assert_eq!(
             count_essential_h_d(&bc, 1),
             0,
             "H1 should have no essential classes"
         );
 
-        // H2: at least one interval, born at √2 (the 2-sphere).
         let h2_count = bc.intervals[2].len();
         assert!(
             h2_count >= 1,

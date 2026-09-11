@@ -1,20 +1,5 @@
-//! Vietoris–Rips clique (simplex) counting up to a fixed size.
-//!
-//! [`count_cliques`] consumes a truncated weighted edge list and returns the
-//! number of cliques of size `1..=max_size`, where `max_size` counts vertices.
-//! Equivalently, this is the Vietoris–Rips filtration size truncated at that
-//! scale and dimension (a clique of size `k` is a `(k-1)`-simplex):
-//!
-//!   * `max_size = 1` → vertices only,
-//!   * `max_size = 2` → + edges,
-//!   * `max_size = 3` → + triangles, and so on.
-//!
-//! Method. Build, for every vertex `i`, the bitset of its lower-indexed neighbors
-//! `N-(i) = {j < i : (i, j) is an edge}`. Then enumerate cliques
-//! largest-vertex-first: each clique is rooted at its maximum vertex and grown
-//! downward by intersecting candidate sets, which keeps every clique canonical
-//! and counted once. The intersection trims trailing-zero words, scratch is
-//! reused by recursion depth, and the deepest level is counted by `popcount`.
+//! Count flag-complex simplices by intersecting lower-neighbour bitsets.
+//! Rooting each clique at its largest vertex counts it once.
 
 use crate::preprocess::edgelist::EdgeList;
 use rayon::prelude::*;
@@ -22,7 +7,6 @@ use rayon::prelude::*;
 const PARALLEL_CLIQUE_MIN_ROOTS: usize = 128;
 const PARALLEL_CLIQUE_MIN_EDGES: usize = 4096;
 
-/// Set bit `v` in a dynamically-sized bit vector, growing it if needed.
 #[inline]
 fn set_bit(bits: &mut Vec<u64>, v: usize) {
     let w = v >> 6;
@@ -32,8 +16,7 @@ fn set_bit(bits: &mut Vec<u64>, v: usize) {
     bits[w] |= 1u64 << (v & 63);
 }
 
-/// `dest = xs ∩ ys`. Iterates only the shorter operand and trims trailing-zero
-/// words; an empty intersection leaves `dest` empty (`len == 0`).
+/// Intersect into `dest` and trim trailing zero words.
 #[inline]
 fn intersect_into(xs: &[u64], ys: &[u64], dest: &mut Vec<u64>) {
     let (short, long) = if xs.len() <= ys.len() {
@@ -64,12 +47,7 @@ fn intersect_into(xs: &[u64], ys: &[u64], dest: &mut Vec<u64>) {
     }
 }
 
-/// Count every clique that extends the current stem by one vertex drawn from
-/// `cand`, recursing while the clique can still grow below `max_size`.
-///
-/// `cand` is the set of vertices adjacent to all stem members and smaller than
-/// the most recently added one; `stem_size` is the number of vertices already
-/// fixed. `scratch[d]` is the reusable candidate buffer for recursion depth `d`.
+/// Count extensions from candidates common to the current stem.
 fn extend(
     adj: &[Vec<u64>],
     cand: &[u64],
@@ -78,9 +56,7 @@ fn extend(
     scratch: &mut [Vec<u64>],
     count: &mut usize,
 ) {
-    // Adding one vertex from `cand` yields a clique of size `stem_size + 1`.
     if stem_size + 1 < max_size {
-        // Interior level: count each candidate and recurse to find larger cliques.
         let (head, tail) = scratch.split_at_mut(1);
         for (wi, &word0) in cand.iter().enumerate() {
             let mut word = word0;
@@ -96,21 +72,17 @@ fn extend(
             }
         }
     } else {
-        // Deepest level: cliques here cannot grow, so just tally the candidates.
         for &word in cand {
             *count += word.count_ones() as usize;
         }
     }
 }
 
-/// Number of cliques of size `1..=max_size` in a truncated weighted graph.
+/// Count cliques with at most `max_size` vertices.
 pub(crate) fn count_cliques(edge_list: EdgeList, max_size: usize, parallel: bool) -> usize {
     let EdgeList { n, edges, .. } = edge_list;
-    // No clique can exceed n vertices; clamp so absurd max_size neither
-    // over-allocates scratch nor over-grows the recursion.
     let max_size = max_size.min(n);
 
-    // Vertices are always present; sizes 0/1 ask for nothing more.
     if max_size <= 1 {
         return n;
     }
@@ -118,7 +90,6 @@ pub(crate) fn count_cliques(edge_list: EdgeList, max_size: usize, parallel: bool
         return n + edges.len();
     }
 
-    // Lower-neighbor adjacency: every edge is canonical with u > v.
     let edge_count = edges.len();
     let mut adj: Vec<Vec<u64>> = vec![Vec::new(); n];
     for edge in edges {
@@ -144,9 +115,7 @@ pub(crate) fn count_cliques(edge_list: EdgeList, max_size: usize, parallel: bool
             )
             .sum()
     } else {
-        // One reusable candidate buffer per interior recursion depth. A clique of
-        // size k is formed at depth k-2, and only sizes < max_size recurse, so the
-        // deepest interior level is k = max_size-1 → max_size-2 buffers.
+        // One candidate buffer per interior recursion depth.
         let mut scratch: Vec<Vec<u64>> = (0..max_size - 2).map(|_| Vec::new()).collect();
         let mut count = 0;
         for cand in &adj {
@@ -174,7 +143,6 @@ mod tests {
         }
     }
 
-    /// O(2ⁿ) reference: count every vertex subset of size ≤ max_size that is a clique.
     fn brute(n: usize, edges: &[Edge], max_size: usize) -> usize {
         let mut adjacency = vec![vec![false; n]; n];
         for edge in edges {
@@ -232,7 +200,6 @@ mod tests {
 
     #[test]
     fn matches_brute_force() {
-        // Deterministic xorshift over random graph topologies.
         let mut s: u64 = 0x9E37_79B9_7F4A_7C15;
         let mut rng = || {
             s ^= s << 13;
