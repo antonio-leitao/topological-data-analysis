@@ -21,6 +21,22 @@ pub(crate) struct Edge {
     pub(crate) distance: f32,
 }
 
+impl Edge {
+    /// Orient an unordered pair and fold `-0.0` into `+0.0`.
+    #[inline]
+    pub(crate) fn canonical(a: u32, b: u32, distance: f32) -> Self {
+        let (u, v) = if a > b { (a, b) } else { (b, a) };
+        let distance = if distance == 0.0 { 0.0 } else { distance };
+        Edge { u, v, distance }
+    }
+
+    /// `(distance, u, v)`; bit order is numeric order for non-negative distances.
+    #[inline]
+    pub(crate) fn sort_key(&self) -> (u32, u32, u32) {
+        (self.distance.to_bits(), self.u, self.v)
+    }
+}
+
 pub(crate) struct EdgeList {
     pub(crate) n: usize,
     pub(crate) edges: Vec<Edge>,
@@ -116,11 +132,7 @@ impl EdgeList {
             for j in 0..i {
                 let distance = mat[row_base + j];
                 if distance <= effective && distance < NO_EDGE {
-                    edges.push(Edge {
-                        u: i as u32,
-                        v: j as u32,
-                        distance,
-                    });
+                    edges.push(Edge::canonical(i as u32, j as u32, distance));
                 }
             }
         }
@@ -166,8 +178,7 @@ impl EdgeList {
             if r == c || distance.partial_cmp(&NO_EDGE) != Some(std::cmp::Ordering::Less) {
                 continue; // diagonal, absent (>= f32::MAX), or NaN
             }
-            let (u, v) = if r > c { (r, c) } else { (c, r) };
-            edges.push(Edge { u, v, distance });
+            edges.push(Edge::canonical(r, c, distance));
         }
         edges.sort_unstable_by_key(|edge| (edge.u, edge.v, edge.distance.to_bits()));
         edges.dedup_by_key(|edge| (edge.u, edge.v)); // keeps the first = smallest
@@ -200,6 +211,39 @@ impl EdgeList {
             center: center as u32,
             threshold: effective,
             sorted: false,
+        }
+    }
+
+    /// Sort into `Edge::sort_key` order unless already sorted.
+    pub(crate) fn sort(&mut self, parallel: bool) {
+        if self.sorted {
+            return;
+        }
+        if parallel {
+            self.edges.par_sort_unstable_by_key(Edge::sort_key);
+        } else {
+            self.edges.sort_unstable_by_key(Edge::sort_key);
+        }
+        self.sorted = true;
+    }
+
+    /// Check the invariants the optimisation passes assume.
+    pub(crate) fn assert_preconditions(&self) {
+        for e in &self.edges {
+            assert!(e.u > e.v && (e.u as usize) < self.n, "bad endpoints: {e:?}");
+            assert!(
+                e.distance.is_finite() && e.distance.is_sign_positive(),
+                "bad distance: {e:?}"
+            );
+        }
+        if self.sorted {
+            for w in self.edges.windows(2) {
+                assert!(
+                    w[0].sort_key() < w[1].sort_key(),
+                    "unsorted or duplicate: {:?}",
+                    w[0]
+                );
+            }
         }
     }
 }

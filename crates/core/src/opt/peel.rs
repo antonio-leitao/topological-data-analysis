@@ -7,7 +7,6 @@
 //! Block-sparse bitset rows keep neighbourhood storage proportional to edges.
 
 use crate::preprocess::edgelist::{Edge, EdgeList};
-use rayon::prelude::*;
 
 #[inline(always)]
 fn bit_set(bits: &[u64], i: usize) -> bool {
@@ -117,18 +116,7 @@ impl SparseRows {
 
 /// Tighten the cutoff and leave edges sorted at the certified radius.
 pub(crate) fn peel(edge_list: &mut EdgeList, parallel: bool) {
-    if !edge_list.sorted {
-        if parallel {
-            edge_list
-                .edges
-                .par_sort_unstable_by_key(|edge| (edge.distance.to_bits(), edge.u, edge.v));
-        } else {
-            edge_list
-                .edges
-                .sort_unstable_by_key(|edge| (edge.distance.to_bits(), edge.u, edge.v));
-        }
-        edge_list.sorted = true;
-    }
+    edge_list.sort(parallel);
 
     let n = edge_list.n;
     if n <= 1 {

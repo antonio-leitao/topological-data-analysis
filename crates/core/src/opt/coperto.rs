@@ -8,16 +8,8 @@ use std::collections::hash_map::Entry;
 
 use crate::preprocess::edgelist::{uf_find, Edge, EdgeList};
 use crate::utils::fxhash::FxHashMap;
-use rayon::prelude::*;
 
 type FxMap = FxHashMap<u32, u32>;
-
-/// Push a canonical edge; `a` and `b` must differ.
-#[inline(always)]
-fn push_edge(out: &mut Vec<Edge>, a: u32, b: u32, distance: f32) {
-    let (u, v) = if a > b { (a, b) } else { (b, a) };
-    out.push(Edge { u, v, distance });
-}
 
 /// Replace the edge set with the coned quotient skeleton.
 pub(crate) fn cone_in_place(edge_list: &mut EdgeList, parallel: bool) {
@@ -26,14 +18,8 @@ pub(crate) fn cone_in_place(edge_list: &mut EdgeList, parallel: bool) {
         return;
     }
 
-    let mut input = std::mem::take(&mut edge_list.edges);
-    if !edge_list.sorted {
-        if parallel {
-            input.par_sort_unstable_by_key(|edge| (edge.distance.to_bits(), edge.u, edge.v));
-        } else {
-            input.sort_unstable_by_key(|edge| (edge.distance.to_bits(), edge.u, edge.v));
-        }
-    }
+    edge_list.sort(parallel);
+    let input = std::mem::take(&mut edge_list.edges);
 
     let mut parent: Vec<u32> = (0..n as u32).collect();
     let mut size: Vec<u32> = vec![1u32; n];
@@ -60,7 +46,7 @@ pub(crate) fn cone_in_place(edge_list: &mut EdgeList, parallel: bool) {
         *nbr[bi].entry(a).or_insert(0) += 1;
 
         if count == 1 {
-            push_edge(&mut out, a, b, scale);
+            out.push(Edge::canonical(a, b, scale));
         }
 
         // Contract when every cross pair has appeared.
@@ -83,7 +69,7 @@ pub(crate) fn cone_in_place(edge_list: &mut EdgeList, parallel: bool) {
                     }
                     Entry::Vacant(slot) => {
                         slot.insert(cnt);
-                        push_edge(&mut out, w, nb, scale);
+                        out.push(Edge::canonical(w, nb, scale));
                     }
                 }
                 let nm = &mut nbr[nb as usize];
