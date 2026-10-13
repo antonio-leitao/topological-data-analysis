@@ -22,7 +22,7 @@ fn cfg(quotient: bool, peel: bool, collapse: bool, parallel: bool) -> Config {
     Config {
         quotient,
         peel,
-        collapse,
+        collapse: collapse.into(),
         parallel,
         ..Config::default()
     }

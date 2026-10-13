@@ -43,15 +43,17 @@ pub fn circular_with(data: &[f32], n: usize, config: &Config) -> Result<Circular
         });
     }
 
+    // Coordinates live on the Rips graph itself, which collapse would rewrite.
     let core_config = crate::Config {
         distance_matrix: config.distance_matrix,
         quotient: config.quotient,
+        collapse: crate::Collapse::Off,
         parallel: config.parallel,
         ..crate::Config::default()
     };
-    let edges = crate::build_edges(data, n, 1, &core_config)?;
+    let edges = crate::build_edges(data, n, 1, &core_config, crate::Ids::Keep)?;
     let threshold = edges.threshold;
-    let bitcsr = BitCsrDistanceMatrix::from_edge_list(edges);
+    let bitcsr = BitCsrDistanceMatrix::from_edge_list(edges)?;
     let h1 = h1_classes(&bitcsr, n, config.prime, config.parallel);
 
     let chosen = resolve_selection(&selection, &h1, threshold)?;
@@ -593,13 +595,14 @@ pub fn circular_map_with(data: &[f32], n: usize, config: &Config) -> Result<Circ
     validate_prime(config.prime)?;
 
     let core_config = crate::Config {
+        collapse: crate::Collapse::Off,
         parallel: config.parallel,
         ..crate::Config::default()
     };
-    let edges = crate::build_edges(data, n, 1, &core_config)?;
+    let edges = crate::build_edges(data, n, 1, &core_config, crate::Ids::Keep)?;
     let threshold = edges.threshold;
     let dim = data.len() / n;
-    let bitcsr = BitCsrDistanceMatrix::from_edge_list(edges);
+    let bitcsr = BitCsrDistanceMatrix::from_edge_list(edges)?;
     let h1 = h1_classes(&bitcsr, n, config.prime, config.parallel);
 
     let selection = selection_ranks(config);
@@ -965,9 +968,8 @@ mod tests {
             1.0, 0.0, 1.0, //
             1.0, 1.0, 0.0,
         ];
-        let bitcsr = BitCsrDistanceMatrix::from_edge_list(EdgeList::from_distance_matrix(
-            &distances, 3, 1.0,
-        ));
+        let edges = EdgeList::from_distance_matrix(&distances, 3, 1.0).unwrap();
+        let bitcsr = BitCsrDistanceMatrix::from_edge_list(edges).unwrap();
 
         let bad = HashMap::from([((2, 1), 1.0)]);
         let err = verify_integral_lift(&bitcsr, 1.0, &bad, 3).unwrap_err();

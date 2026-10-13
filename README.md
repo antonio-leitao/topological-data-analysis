@@ -111,6 +111,12 @@ graph = sp.coo_matrix(
 barcode = tda.persistent_homology(graph, max_dim=1)
 ```
 
+Arrays are read in place. C-contiguous `float32` or `float64` input and the
+`int32`/`int64` index and `float32`/`float64` value arrays of CSR, CSC, and COO
+matrices reach Rust without a copy; other layouts and sparse formats are copied
+once. The GIL is released while persistence runs. Coordinates must be finite
+and distances non-negative, otherwise a `ValueError` names the offending entry.
+
 ### Parameters
 
 `persistent_homology` and `filtration_size` share these options:
@@ -121,9 +127,14 @@ barcode = tda.persistent_homology(graph, max_dim=1)
 | `threshold`       | `None`  | Maximum filtration value. `None` uses the enclosing radius. |
 | `distance_matrix` | `False` | Interpret a dense input as a square distance matrix.        |
 | `peel`            | `True`  | Apply the exact dominated-vertex peeling step.              |
-| `collapse`        | `False` | Apply exact filtration edge collapse.[^collapse]            |
+| `collapse`        | `"auto"` | Exact filtration edge collapse: `True`, `False`, or `"auto"`.[^collapse] |
 | `quotient`        | `False` | Use the approximate quotient-cover filtration.[^quotient]   |
 | `parallel`        | `True`  | Parallelize preprocessing and assembly when useful.         |
+
+With `collapse="auto"`, collapse is skipped for `max_dim=0`, runs in full from
+`max_dim=2` up unless the longest edges show there is nothing to remove, and at
+`max_dim=1` stops once it costs more than it saves. The barcode is the same
+either way.
 
 The result is a list of length `max_dim + 1`. `barcode[d]` is an array of
 `[birth, death]` intervals; `inf` marks an essential feature.
@@ -144,6 +155,15 @@ the established dominated-vertex/strong-collapse idea; to our knowledge, this
 filtration-peeling implementation is currently specific to TDA. For much larger
 problems, quotient produces a near-linear skeleton and can still be combined
 with the exact steps. The canonical order is **peel → quotient → collapse**.
+
+Every exact step reads the whole graph below the truncation radius, which for
+a point cloud is most of its pairs, so exact persistence needs memory
+quadratic in the number of points. The quotient does not. With
+`quotient=True` and `peel=False`, a point cloud above about 26,700 points
+never stores its pairs: they are generated in distance bands and consumed in
+order, and the result is identical to building them. Memory then follows the
+skeleton, which is close to linear in the number of points. Peel needs the
+whole graph, so with `peel=True` the pairs are stored as before.
 
 ### Benchmark
 
@@ -267,9 +287,11 @@ fn main() -> Result<(), Error> {
 }
 ```
 
-Distance matrices, sparse COO distance graphs, thresholds, and preprocessing
-options are available through `Config` and the corresponding `_with` and
-`_sparse` functions. Invalid input returns `tda_core::Error`.
+Distance matrices, sparse COO and CSR/CSC distance graphs, thresholds, and
+preprocessing options are available through `Config` and the corresponding
+`_with`, `_sparse`, and `_csr` functions. Every entry point reads `f32` or
+`f64` values and `u32`, `u64`, `i32`, or `i64` indices in place. Invalid input
+returns `tda_core::Error`.
 
 ## References
 

@@ -7,6 +7,11 @@ impl<T: Copy + Ord + std::fmt::Debug> HeapKey for T {}
 
 const ARITY: usize = 8;
 const COMPACT_MIN_ENTRIES: usize = 16 * 1024;
+// Compact once popped slots pass 1/8 of the live entries. A long reduction can
+// pop less than it pushes for its whole life, so waiting for popped slots to
+// outnumber live ones never compacts it: a 2000-point circle at H1 peaked at
+// 7.4 GB instead of 4.5 GB.
+const COMPACT_DEAD_SHARE: usize = 8;
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 struct RunHead<S: HeapKey> {
@@ -131,7 +136,7 @@ impl<S: HeapKey> FastHeap<S> {
 
     fn maybe_compact(&mut self) {
         let dead = self.arena.len() - self.live_len;
-        if self.arena.len() < COMPACT_MIN_ENTRIES || dead <= self.live_len {
+        if self.arena.len() < COMPACT_MIN_ENTRIES || COMPACT_DEAD_SHARE * dead <= self.live_len {
             return;
         }
 
@@ -493,6 +498,26 @@ mod tests {
             assert_eq!(h.pop(), Some(s(expected)));
         }
         for expected in (0..5_000u128).rev() {
+            assert_eq!(h.pop(), Some(s(expected)));
+        }
+        assert!(h.is_empty());
+    }
+
+    #[test]
+    fn compaction_bounds_popped_slots() {
+        let mut h = FastHeap::new();
+        for value in 0..40_000u128 {
+            h.push(s(value));
+        }
+        h.heapify();
+
+        // Fewer pops than live entries throughout, as in a long reduction.
+        for expected in (30_000..40_000u128).rev() {
+            assert_eq!(h.pop(), Some(s(expected)));
+            let dead = h.arena.len() - h.live_len;
+            assert!(dead <= h.live_len / COMPACT_DEAD_SHARE);
+        }
+        for expected in (0..30_000u128).rev() {
             assert_eq!(h.pop(), Some(s(expected)));
         }
         assert!(h.is_empty());

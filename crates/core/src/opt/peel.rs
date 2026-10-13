@@ -15,24 +15,27 @@ fn bit_set(bits: &[u64], i: usize) -> bool {
 
 /// CSR-style closed neighbourhoods over nonzero 64-bit blocks.
 /// Bits are only cleared, so block positions remain stable.
+///
+/// Offsets are `usize`: `2m` passes `u32::MAX` on near-complete graphs of about
+/// 65k points, where peel still has to run.
 struct SparseRows {
-    row_ptr: Vec<u32>,
+    row_ptr: Vec<usize>,
     block_ids: Vec<u32>,
     words: Vec<u64>,
 }
 
 impl SparseRows {
     fn build(n: usize, edges: &[Edge], deg: &[u32]) -> Self {
-        let mut adj_ptr = vec![0u32; n + 1];
+        let mut adj_ptr = vec![0usize; n + 1];
         for v in 0..n {
-            adj_ptr[v + 1] = adj_ptr[v] + (deg[v] - 1);
+            adj_ptr[v + 1] = adj_ptr[v] + (deg[v] - 1) as usize;
         }
-        let mut adj = vec![0u32; adj_ptr[n] as usize];
-        let mut fill: Vec<u32> = adj_ptr.clone();
+        let mut adj = vec![0u32; adj_ptr[n]];
+        let mut fill: Vec<usize> = adj_ptr.clone();
         for edge in edges {
-            adj[fill[edge.u as usize] as usize] = edge.v;
+            adj[fill[edge.u as usize]] = edge.v;
             fill[edge.u as usize] += 1;
-            adj[fill[edge.v as usize] as usize] = edge.u;
+            adj[fill[edge.v as usize]] = edge.u;
             fill[edge.v as usize] += 1;
         }
 
@@ -41,17 +44,15 @@ impl SparseRows {
         let mut scratch = vec![0u64; nw];
         let mut touched: Vec<u32> = Vec::new();
         let mut row_ptr = Vec::with_capacity(n + 1);
-        row_ptr.push(0u32);
+        row_ptr.push(0);
         let mut block_ids: Vec<u32> = Vec::new();
         let mut words: Vec<u64> = Vec::new();
 
         for v in 0..n {
             touched.clear();
-            for id in std::iter::once(v as u32).chain(
-                adj[adj_ptr[v] as usize..adj_ptr[v + 1] as usize]
-                    .iter()
-                    .copied(),
-            ) {
+            for id in
+                std::iter::once(v as u32).chain(adj[adj_ptr[v]..adj_ptr[v + 1]].iter().copied())
+            {
                 let b = (id >> 6) as usize;
                 if scratch[b] == 0 {
                     touched.push(b as u32);
@@ -64,8 +65,7 @@ impl SparseRows {
                 words.push(scratch[b as usize]);
                 scratch[b as usize] = 0;
             }
-            debug_assert!(block_ids.len() <= u32::MAX as usize);
-            row_ptr.push(block_ids.len() as u32);
+            row_ptr.push(block_ids.len());
         }
 
         Self {
@@ -77,7 +77,7 @@ impl SparseRows {
 
     #[inline(always)]
     fn range(&self, v: usize) -> std::ops::Range<usize> {
-        self.row_ptr[v] as usize..self.row_ptr[v + 1] as usize
+        self.row_ptr[v]..self.row_ptr[v + 1]
     }
 
     /// Test `N[w]` containment in `N[z]`.
@@ -409,7 +409,7 @@ mod tests {
     fn peel_must_not_skip_cycle_inside_center_distance_gap() {
         let lower = [1.5, 1.05, 1.0, 1.05, 1.5, 1.0, 1.5, 1.1, 1.5, 1.0];
         let matrix = square_from_lower_tri(5, &lower);
-        let mut edge_list = EdgeList::from_distance_matrix(&matrix, 5, 1.5);
+        let mut edge_list = EdgeList::from_distance_matrix(&matrix, 5, 1.5).unwrap();
         let center = edge_list.center;
         peel(&mut edge_list, false);
 

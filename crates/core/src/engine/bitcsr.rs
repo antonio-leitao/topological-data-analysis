@@ -1,14 +1,23 @@
-// Each row is a tail-truncated adjacency bitset. Distances follow set bits in
-// descending bit order, so a popcount rank locates each value.
+// Each row is an adjacency bitset over the blocks its neighbours span.
+// Distances follow set bits in descending bit order, so a popcount rank locates
+// each value.
 
 use crate::preprocess::edgelist::EdgeList;
+use crate::{Error, Result};
 
-/// Row `v` occupies `words[word_ptr[v]..word_ptr[v + 1]]`; word index `b` in
-/// that row represents ids `64*b..64*b+63`. `val_ptr` maps each word to values
-/// ordered from high bit to low bit.
+/// Row `v` occupies `words[word_ptr[v]..word_ptr[v + 1]]` and covers blocks
+/// `lo[v]..` (ids `64*b..64*b+63` for block `b`), or blocks `0..` when `lo` is
+/// empty. `val_ptr` maps each word to values ordered from high bit to low bit.
 pub struct BitCsrDistanceMatrix {
     n: usize,
     word_ptr: Vec<u32>,
+    /// First stored block of each row, or empty when every row starts at block
+    /// 0. Rows start at their first neighbour only when that halves the words,
+    /// which needs ids that keep neighbours close; dense graphs keep the
+    /// tail-truncated layout, and the hot loops compiled for it never read a
+    /// lower bound. `words` opens with padding so that `word_ptr[v] - lo[v]`
+    /// is never negative.
+    lo: Vec<u32>,
     words: Vec<u64>,
     val_ptr: Vec<u32>,
     val: Vec<f32>,
@@ -16,30 +25,84 @@ pub struct BitCsrDistanceMatrix {
 
 impl BitCsrDistanceMatrix {
     /// Build symmetric rows from canonical half-edges.
-    pub(crate) fn from_edge_list(edge_list: EdgeList) -> Self {
+    ///
+    /// Offsets are 32-bit, which bounds both directed incidences (`2m`) and
+    /// bitset words. Words grow with the id range each row's neighbours span,
+    /// not with degree, so a sparse graph on several hundred thousand vertices
+    /// with scattered ids can exceed the limit on few edges; ids that keep
+    /// neighbours close keep rows short.
+    pub(crate) fn from_edge_list(edge_list: EdgeList) -> Result<Self> {
+        Self::build(edge_list, None)
+    }
+
+    /// `banded` overrides the layout choice; tests use it to run both.
+    fn build(edge_list: EdgeList, banded: Option<bool>) -> Result<Self> {
         let EdgeList { n, edges, .. } = edge_list;
 
-        let mut row_word_len = vec![0usize; n];
+        let incidences = 2 * edges.len();
+        if incidences > u32::MAX as usize {
+            return Err(Error::GraphTooLarge {
+                what: "the directed edge count (2m)",
+                got: incidences,
+                max: u32::MAX as usize,
+            });
+        }
+
+        let mut lo = vec![u32::MAX; n];
+        let mut hi = vec![0u32; n];
         for edge in &edges {
             let u = edge.u as usize;
             let v = edge.v as usize;
             debug_assert!(u < n && v < n && u > v);
-            row_word_len[u] = row_word_len[u].max((v >> 6) + 1);
-            row_word_len[v] = row_word_len[v].max((u >> 6) + 1);
+            for (row, block) in [(u, (v >> 6) as u32), (v, (u >> 6) as u32)] {
+                lo[row] = lo[row].min(block);
+                hi[row] = hi[row].max(block + 1);
+            }
+        }
+
+        let (mut tail, mut band) = (0usize, 0usize);
+        for (l, &h) in lo.iter_mut().zip(&hi) {
+            *l = (*l).min(h);
+            tail += h as usize;
+            band += (h - *l) as usize;
+        }
+        if !banded.unwrap_or(2 * band <= tail) {
+            lo = Vec::new();
+        }
+
+        // Pad the front so that `start - lo` is never negative.
+        let (mut word_count, mut pad) = (0usize, 0usize);
+        for (v, &h) in hi.iter().enumerate() {
+            let l = lo.get(v).map_or(0, |&l| l as usize);
+            pad = pad.max(l.saturating_sub(word_count));
+            word_count += h as usize - l;
+        }
+        word_count += pad;
+        if word_count > u32::MAX as usize {
+            return Err(Error::GraphTooLarge {
+                what: "the engine's adjacency bitset word count",
+                got: word_count,
+                max: u32::MAX as usize,
+            });
         }
 
         let mut word_ptr = Vec::with_capacity(n + 1);
-        word_ptr.push(0);
-        let mut word_count = 0usize;
-        for len in row_word_len {
-            word_count += len;
-            word_ptr.push(to_u32(word_count, "bitcsr word count"));
+        let mut start = pad;
+        word_ptr.push(start as u32);
+        for (v, &h) in hi.iter().enumerate() {
+            start += h as usize - lo.get(v).map_or(0, |&l| l as usize);
+            word_ptr.push(start as u32);
         }
+        drop(hi);
+        // Where block 0 of each row would sit.
+        let origin: Vec<usize> = (0..n)
+            .map(|v| word_ptr[v] as usize - lo.get(v).map_or(0, |&l| l as usize))
+            .collect();
 
         let mut words = vec![0u64; word_count];
         for edge in &edges {
-            set_neighbor_bit(&word_ptr, &mut words, edge.u as usize, edge.v as usize);
-            set_neighbor_bit(&word_ptr, &mut words, edge.v as usize, edge.u as usize);
+            set_neighbor_bit(&origin, &mut words, edge.u as usize, edge.v as usize);
+            set_neighbor_bit(&origin, &mut words, edge.v as usize, edge.u as usize);
         }
 
         let mut val_ptr = Vec::with_capacity(word_count + 1);
@@ -54,7 +117,7 @@ impl BitCsrDistanceMatrix {
         let mut val = vec![0.0f32; value_count];
         for edge in edges {
             set_edge_distance(
-                &word_ptr,
+                &origin,
                 &words,
                 &val_ptr,
                 &mut val,
@@ -63,7 +126,7 @@ impl BitCsrDistanceMatrix {
                 edge.distance,
             );
             set_edge_distance(
-                &word_ptr,
+                &origin,
                 &words,
                 &val_ptr,
                 &mut val,
@@ -73,33 +136,44 @@ impl BitCsrDistanceMatrix {
             );
         }
 
-        Self {
+        Ok(Self {
             n,
             word_ptr,
+            lo,
             words,
             val_ptr,
             val,
+        })
+    }
+}
+
+/// The BitCSR's arrays with the row layout fixed at compile time: `BANDED`
+/// must match whether rows carry lower bounds. The engine queries through
+/// this, so a computation tests the layout once, and every query reaches the
+/// arrays in one step, as it did through the matrix itself.
+#[derive(Clone, Copy)]
+pub(crate) struct View<'a, const BANDED: bool> {
+    n: usize,
+    word_ptr: &'a [u32],
+    lo: &'a [u32],
+    words: &'a [u64],
+    val_ptr: &'a [u32],
+    val: &'a [f32],
+}
+
+impl<const BANDED: bool> View<'_, BANDED> {
+    /// `(origin, lo, hi)` of row `v`: block `b` for `lo <= b < hi` is the word
+    /// at `origin + b`. `BANDED` must match the layout.
+    #[inline(always)]
+    fn row(&self, v: usize) -> (usize, usize, usize) {
+        let start = unsafe { *self.word_ptr.get_unchecked(v) as usize };
+        let len = unsafe { *self.word_ptr.get_unchecked(v + 1) as usize } - start;
+        if BANDED {
+            let lo = unsafe { *self.lo.get_unchecked(v) as usize };
+            (start - lo, lo, lo + len)
+        } else {
+            (start, 0, len)
         }
-    }
-
-    #[inline(always)]
-    pub(crate) fn n(&self) -> usize {
-        self.n
-    }
-
-    #[inline(always)]
-    fn row_start(&self, v: usize) -> usize {
-        unsafe { *self.word_ptr.get_unchecked(v) as usize }
-    }
-
-    #[inline(always)]
-    fn row_end(&self, v: usize) -> usize {
-        unsafe { *self.word_ptr.get_unchecked(v + 1) as usize }
-    }
-
-    #[inline(always)]
-    fn row_len(&self, v: usize) -> usize {
-        self.row_end(v) - self.row_start(v)
     }
 
     #[inline(always)]
@@ -113,15 +187,15 @@ impl BitCsrDistanceMatrix {
 
     /// `a` and `b` must be adjacent.
     #[inline(always)]
-    pub(crate) fn edge_dist(&self, a: u32, b: u32) -> f32 {
+    fn edge_dist(&self, a: u32, b: u32) -> f32 {
         let block = (b as usize) >> 6;
         let bit = (b as usize) & 63;
-        let row_start = self.row_start(a as usize);
+        let (origin, lo, hi) = self.row(a as usize);
         debug_assert!(
-            block < self.row_len(a as usize),
+            (lo..hi).contains(&block),
             "edge_dist on a missing edge ({a}, {b})"
         );
-        let flat = row_start + block;
+        let flat = origin + block;
         let word = unsafe { *self.words.get_unchecked(flat) };
         debug_assert!(
             (word & (1u64 << bit)) != 0,
@@ -130,15 +204,10 @@ impl BitCsrDistanceMatrix {
         self.word_distance_unchecked(flat, word, bit)
     }
 
+    /// Common neighbours above `floor` in descending id order, with the
+    /// largest incident distance.
     #[inline(always)]
-    pub(crate) fn edge_dist_bits(&self, a: u32, b: u32) -> u32 {
-        self.edge_dist(a, b).to_bits()
-    }
-
-    /// Enumerate common neighbours above `floor` in descending id order.
-    /// The callback also receives the largest incident distance.
-    #[inline]
-    pub(crate) fn for_each_common_neighbor<const K: usize>(
+    fn common_neighbors<const K: usize>(
         &self,
         verts: &[u32; K],
         vc: usize,
@@ -150,17 +219,23 @@ impl BitCsrDistanceMatrix {
         }
 
         let mut row_start = [0usize; K];
+        let mut start = 0usize;
         let mut limit = usize::MAX;
         for i in 0..vc {
-            let v = verts[i] as usize;
-            row_start[i] = self.row_start(v);
-            let len = self.row_len(v);
-            if len == 0 {
+            let (origin, lo, hi) = self.row(verts[i] as usize);
+            row_start[i] = origin;
+            if hi == lo {
                 return;
             }
-            if len < limit {
-                limit = len;
+            if hi < limit {
+                limit = hi;
             }
+            if BANDED {
+                start = start.max(lo);
+            }
+        }
+        if BANDED && start >= limit {
+            return;
         }
 
         let floor_block = if floor >= 0 {
@@ -173,8 +248,13 @@ impl BitCsrDistanceMatrix {
             0
         };
         let floor_bit = (floor as usize) & 63;
+        let first = if BANDED {
+            floor_block.max(start)
+        } else {
+            floor_block
+        };
 
-        for block in (floor_block..limit).rev() {
+        for block in (first..limit).rev() {
             let mut mask = self.intersection_word(&row_start, vc, block);
             if floor >= 0 && block == floor_block {
                 mask &= bits_above(floor_bit);
@@ -192,19 +272,20 @@ impl BitCsrDistanceMatrix {
         }
     }
 
-    /// Enumerate common neighbours as `(w, d(w,v0), d(w,v1))`.
-    #[inline]
-    pub(crate) fn for_each_common_neighbor_edges(
+    /// Common neighbours as `(w, d(w,v0), d(w,v1))`, descending.
+    #[inline(always)]
+    fn common_neighbor_edges(
         &self,
         v0: u32,
         v1: u32,
         floor: i32,
         mut f: impl FnMut(u32, f32, f32) -> bool,
     ) {
-        let s0 = self.row_start(v0 as usize);
-        let s1 = self.row_start(v1 as usize);
-        let limit = self.row_len(v0 as usize).min(self.row_len(v1 as usize));
-        if limit == 0 {
+        let (s0, lo0, hi0) = self.row(v0 as usize);
+        let (s1, lo1, hi1) = self.row(v1 as usize);
+        let limit = hi0.min(hi1);
+        let start = lo0.max(lo1);
+        if limit == 0 || (BANDED && start >= limit) {
             return;
         }
 
@@ -218,8 +299,13 @@ impl BitCsrDistanceMatrix {
             0
         };
         let floor_bit = (floor as usize) & 63;
+        let first = if BANDED {
+            floor_block.max(start)
+        } else {
+            floor_block
+        };
 
-        for block in (floor_block..limit).rev() {
+        for block in (first..limit).rev() {
             let f0 = s0 + block;
             let f1 = s1 + block;
             let word0 = unsafe { *self.words.get_unchecked(f0) };
@@ -242,20 +328,21 @@ impl BitCsrDistanceMatrix {
         }
     }
 
-    /// Enumerate neighbours above `v` in descending id order.
-    #[inline]
-    pub(crate) fn for_each_neighbor_above(&self, v: usize, mut f: impl FnMut(u32, f32) -> bool) {
-        let row_start = self.row_start(v);
-        let row_len = self.row_len(v);
-        if row_len == 0 {
-            return;
-        }
+    /// Neighbours above `v`, descending.
+    #[inline(always)]
+    fn neighbors_above(&self, v: usize, mut f: impl FnMut(u32, f32) -> bool) {
+        let (origin, lo, hi) = self.row(v);
         let floor_block = v >> 6;
-        if floor_block >= row_len {
+        if floor_block >= hi {
             return;
         }
-        for block in (floor_block..row_len).rev() {
-            let flat = row_start + block;
+        let first = if BANDED {
+            floor_block.max(lo)
+        } else {
+            floor_block
+        };
+        for block in (first..hi).rev() {
+            let flat = origin + block;
             let word = unsafe { *self.words.get_unchecked(flat) };
             let mut iter_word = word;
             if block == floor_block {
@@ -362,6 +449,193 @@ impl BitCsrDistanceMatrix {
     }
 }
 
+/// The adjacency queries the engine makes.
+///
+/// The BitCSR answers them for either row layout, which costs a layout test on
+/// every query; a [`View`] fixes the layout at compile time, so a computation
+/// tests it once. On small dense inputs the per-query test cost several
+/// percent of the whole run.
+pub(crate) trait Rows: Sync {
+    fn n(&self) -> usize;
+    /// `a` and `b` must be adjacent.
+    fn edge_dist(&self, a: u32, b: u32) -> f32;
+    fn edge_dist_bits(&self, a: u32, b: u32) -> u32;
+    /// Common neighbours above `floor`, descending, with the largest incident
+    /// distance.
+    fn for_each_common_neighbor<const K: usize>(
+        &self,
+        verts: &[u32; K],
+        vc: usize,
+        floor: i32,
+        f: impl FnMut(u32, f32) -> bool,
+    );
+    /// Common neighbours as `(w, d(w,v0), d(w,v1))`, descending.
+    fn for_each_common_neighbor_edges(
+        &self,
+        v0: u32,
+        v1: u32,
+        floor: i32,
+        f: impl FnMut(u32, f32, f32) -> bool,
+    );
+    /// Neighbours above `v`, descending.
+    fn for_each_neighbor_above(&self, v: usize, f: impl FnMut(u32, f32) -> bool);
+}
+
+impl BitCsrDistanceMatrix {
+    /// Whether rows start at their first neighbour rather than block 0.
+    #[inline]
+    pub(crate) fn banded(&self) -> bool {
+        !self.lo.is_empty()
+    }
+
+    /// This matrix seen through its layout; `BANDED` must equal
+    /// [`Self::banded`].
+    #[inline]
+    pub(crate) fn view<const BANDED: bool>(&self) -> View<'_, BANDED> {
+        debug_assert_eq!(BANDED, self.banded(), "view of the wrong row layout");
+        View {
+            n: self.n,
+            word_ptr: &self.word_ptr,
+            lo: &self.lo,
+            words: &self.words,
+            val_ptr: &self.val_ptr,
+            val: &self.val,
+        }
+    }
+
+    /// `a` and `b` must be adjacent.
+    #[inline]
+    pub(crate) fn edge_dist(&self, a: u32, b: u32) -> f32 {
+        if self.banded() {
+            self.view::<true>().edge_dist(a, b)
+        } else {
+            self.view::<false>().edge_dist(a, b)
+        }
+    }
+
+    /// Common neighbours above `floor` in descending id order, with the
+    /// largest incident distance.
+    #[inline]
+    pub(crate) fn for_each_common_neighbor<const K: usize>(
+        &self,
+        verts: &[u32; K],
+        vc: usize,
+        floor: i32,
+        f: impl FnMut(u32, f32) -> bool,
+    ) {
+        if self.banded() {
+            self.view::<true>().common_neighbors(verts, vc, floor, f)
+        } else {
+            self.view::<false>().common_neighbors(verts, vc, floor, f)
+        }
+    }
+
+    /// Common neighbours as `(w, d(w,v0), d(w,v1))`, descending.
+    #[inline]
+    pub(crate) fn for_each_common_neighbor_edges(
+        &self,
+        v0: u32,
+        v1: u32,
+        floor: i32,
+        f: impl FnMut(u32, f32, f32) -> bool,
+    ) {
+        if self.banded() {
+            self.view::<true>().common_neighbor_edges(v0, v1, floor, f)
+        } else {
+            self.view::<false>().common_neighbor_edges(v0, v1, floor, f)
+        }
+    }
+
+    /// Neighbours above `v` in descending id order.
+    #[inline]
+    pub(crate) fn for_each_neighbor_above(&self, v: usize, f: impl FnMut(u32, f32) -> bool) {
+        if self.banded() {
+            self.view::<true>().neighbors_above(v, f)
+        } else {
+            self.view::<false>().neighbors_above(v, f)
+        }
+    }
+}
+
+impl<const BANDED: bool> Rows for View<'_, BANDED> {
+    #[inline(always)]
+    fn n(&self) -> usize {
+        self.n
+    }
+    #[inline(always)]
+    fn edge_dist(&self, a: u32, b: u32) -> f32 {
+        View::edge_dist(self, a, b)
+    }
+    #[inline(always)]
+    fn edge_dist_bits(&self, a: u32, b: u32) -> u32 {
+        View::edge_dist(self, a, b).to_bits()
+    }
+    #[inline(always)]
+    fn for_each_common_neighbor<const K: usize>(
+        &self,
+        verts: &[u32; K],
+        vc: usize,
+        floor: i32,
+        f: impl FnMut(u32, f32) -> bool,
+    ) {
+        self.common_neighbors(verts, vc, floor, f)
+    }
+    #[inline(always)]
+    fn for_each_common_neighbor_edges(
+        &self,
+        v0: u32,
+        v1: u32,
+        floor: i32,
+        f: impl FnMut(u32, f32, f32) -> bool,
+    ) {
+        self.common_neighbor_edges(v0, v1, floor, f)
+    }
+    #[inline(always)]
+    fn for_each_neighbor_above(&self, v: usize, f: impl FnMut(u32, f32) -> bool) {
+        self.neighbors_above(v, f)
+    }
+}
+
+/// Per-query layout tests, for callers off the hot path.
+impl Rows for BitCsrDistanceMatrix {
+    #[inline]
+    fn n(&self) -> usize {
+        self.n
+    }
+    #[inline]
+    fn edge_dist(&self, a: u32, b: u32) -> f32 {
+        BitCsrDistanceMatrix::edge_dist(self, a, b)
+    }
+    #[inline]
+    fn edge_dist_bits(&self, a: u32, b: u32) -> u32 {
+        BitCsrDistanceMatrix::edge_dist(self, a, b).to_bits()
+    }
+    #[inline]
+    fn for_each_common_neighbor<const K: usize>(
+        &self,
+        verts: &[u32; K],
+        vc: usize,
+        floor: i32,
+        f: impl FnMut(u32, f32) -> bool,
+    ) {
+        BitCsrDistanceMatrix::for_each_common_neighbor(self, verts, vc, floor, f)
+    }
+    #[inline]
+    fn for_each_common_neighbor_edges(
+        &self,
+        v0: u32,
+        v1: u32,
+        floor: i32,
+        f: impl FnMut(u32, f32, f32) -> bool,
+    ) {
+        BitCsrDistanceMatrix::for_each_common_neighbor_edges(self, v0, v1, floor, f)
+    }
+    #[inline]
+    fn for_each_neighbor_above(&self, v: usize, f: impl FnMut(u32, f32) -> bool) {
+        BitCsrDistanceMatrix::for_each_neighbor_above(self, v, f)
+    }
+}
+
 #[inline(always)]
 fn to_u32(value: usize, what: &str) -> u32 {
     assert!(value <= u32::MAX as usize, "{what} exceeds u32::MAX");
@@ -384,14 +658,14 @@ pub(crate) fn bits_above(bit: usize) -> u64 {
 }
 
 #[inline(always)]
-fn set_neighbor_bit(word_ptr: &[u32], words: &mut [u64], row: usize, neighbor: usize) {
-    let flat = word_ptr[row] as usize + (neighbor >> 6);
+fn set_neighbor_bit(origin: &[usize], words: &mut [u64], row: usize, neighbor: usize) {
+    let flat = origin[row] + (neighbor >> 6);
     words[flat] |= 1u64 << (neighbor & 63);
 }
 
 #[inline(always)]
 fn set_edge_distance(
-    word_ptr: &[u32],
+    origin: &[usize],
     words: &[u64],
     val_ptr: &[u32],
     val: &mut [f32],
@@ -399,7 +673,7 @@ fn set_edge_distance(
     neighbor: usize,
     distance: f32,
 ) {
-    let flat = word_ptr[row] as usize + (neighbor >> 6);
+    let flat = origin[row] + (neighbor >> 6);
     let bit = neighbor & 63;
     let rank = (words[flat] & bits_above(bit)).count_ones() as usize;
     val[val_ptr[flat] as usize + rank] = distance;
@@ -411,7 +685,7 @@ mod tests {
     use crate::engine::algorithm::{compute, for_each_edge};
     use crate::engine::simplex::Simplex128;
     use crate::preprocess::edgelist::square_from_lower_tri;
-    use crate::preprocess::edgelist::EdgeList;
+    use crate::preprocess::edgelist::{Edge, EdgeList};
     use crate::types::BarcodeResult;
 
     fn barcodes_equal(a: &BarcodeResult, b: &BarcodeResult) -> bool {
@@ -441,9 +715,12 @@ mod tests {
 
     fn bitcsr_from_lower_tri(lt: &[f32], n: usize, threshold: f32) -> (BitCsrDistanceMatrix, f32) {
         let sq = square_from_lower_tri(n, lt);
-        let edges = EdgeList::from_distance_matrix(&sq, n, threshold);
+        let edges = EdgeList::from_distance_matrix(&sq, n, threshold).unwrap();
         let effective = edges.threshold;
-        (BitCsrDistanceMatrix::from_edge_list(edges), effective)
+        (
+            BitCsrDistanceMatrix::from_edge_list(edges).unwrap(),
+            effective,
+        )
     }
 
     fn seq_par_check(lt: &[f32], n: usize, threshold: f32, max_dim: usize) {
@@ -485,6 +762,118 @@ mod tests {
         assert_eq!(edges.len(), 1);
         assert_eq!(edges[0][0], 65);
         assert_eq!(edges[0][1], 50);
+    }
+
+    /// A row spans its smallest to largest neighbour, so 16 385 vertices each
+    /// adjacent to both the first and the last of 2^24 - 1 vertices need more
+    /// than 2^32 words. That used to panic.
+    #[test]
+    fn wide_rows_error_instead_of_panicking() {
+        let n = crate::MAX_POINTS;
+        let edges = (1..16_386u32)
+            .flat_map(|v| {
+                [
+                    Edge {
+                        u: (n - 1) as u32,
+                        v,
+                        distance: 1.0,
+                    },
+                    Edge {
+                        u: v,
+                        v: 0,
+                        distance: 1.0,
+                    },
+                ]
+            })
+            .collect();
+        let edge_list = EdgeList {
+            n,
+            edges,
+            center: 0,
+            threshold: 1.0,
+            sorted: false,
+        };
+        let err = BitCsrDistanceMatrix::from_edge_list(edge_list).err();
+        assert!(
+            matches!(err, Some(crate::Error::GraphTooLarge { .. })),
+            "{err:?}"
+        );
+    }
+
+    /// Edges into the last of 2^24 - 1 vertices cost a word per row, not a
+    /// row as wide as the id; the same edges used to need more than 2^32 words.
+    #[test]
+    fn far_ids_with_near_neighbours_stay_compact() {
+        let n = crate::MAX_POINTS;
+        let last = (n - 1) as u32;
+        let edges = (0..16_385u32)
+            .map(|v| Edge {
+                u: last,
+                v,
+                distance: 1.0 + v as f32,
+            })
+            .collect();
+        let edge_list = EdgeList {
+            n,
+            edges,
+            center: 0,
+            threshold: f32::INFINITY,
+            sorted: false,
+        };
+        let bitcsr = BitCsrDistanceMatrix::from_edge_list(edge_list).unwrap();
+        // One word per short row, 257 for the hub, and a front pad of at most
+        // n / 64 words.
+        let stored = 16_385 + 16_385usize.div_ceil(64);
+        assert!(!bitcsr.lo.is_empty());
+        assert!(bitcsr.words.len() <= stored + (n >> 6), "{}", bitcsr.words.len());
+        assert_eq!(bitcsr.edge_dist(last, 70), 71.0);
+        assert_eq!(bitcsr.edge_dist(70, last), 71.0);
+        let mut above = Vec::new();
+        bitcsr.for_each_neighbor_above(70, |w, d| {
+            above.push((w, d));
+            true
+        });
+        assert_eq!(above, vec![(last, 71.0)]);
+    }
+
+    /// Both row layouts give the same barcode, on graphs sparse enough that
+    /// rows start well past block 0 and on ones where they do not.
+    #[test]
+    fn banded_rows_match_tail_rows() {
+        for &(n, keep, seed) in &[(200usize, 6u64, 3u64), (300, 3, 11), (100, 30, 5), (70, 100, 9)] {
+            let mut rng = xorshift(seed);
+            let mut edges = Vec::new();
+            for u in 1..n as u32 {
+                for v in 0..u {
+                    // Mostly local edges plus a few long ones, with ties.
+                    let local = u - v < 70;
+                    if rng() % 100 < if local { keep } else { 1 } {
+                        let d = ((rng() % 50) as f32 + 1.0) * 0.25;
+                        edges.push(Edge { u, v, distance: d });
+                    }
+                }
+            }
+            // H3 on the denser graphs costs seconds and adds no coverage.
+            let top = if keep < 10 { 3 } else { 2 };
+            for max_dim in 1..=top {
+                let make = || EdgeList {
+                    n,
+                    edges: edges.clone(),
+                    center: 0,
+                    threshold: f32::INFINITY,
+                    sorted: false,
+                };
+                let banded = BitCsrDistanceMatrix::build(make(), Some(true)).unwrap();
+                let tail = BitCsrDistanceMatrix::build(make(), Some(false)).unwrap();
+                assert!(!banded.lo.is_empty() && tail.lo.is_empty());
+                assert!(banded.words.len() <= tail.words.len() + (n >> 6) + 1);
+                for parallel in [false, true] {
+                    let a = compute::<6, Simplex128>(&banded, max_dim, parallel);
+                    let b = compute::<6, Simplex128>(&tail, max_dim, parallel);
+                    assert!(barcodes_equal(&a, &b), "n={n} keep={keep} max_dim={max_dim}");
+                }
+            }
+        }
     }
 
     #[test]

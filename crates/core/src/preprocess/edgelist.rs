@@ -3,6 +3,9 @@
 
 use rayon::prelude::*;
 
+use crate::input::{Real, SparseIndex};
+use crate::{Error, Result};
+
 const MR: usize = 16;
 const NR: usize = 16;
 const MC: usize = 64;
@@ -80,20 +83,25 @@ impl EdgeList {
         }
     }
 
-    /// Read the strict lower triangle; values at least `f32::MAX` are absent.
-    pub(crate) fn from_distance_matrix(mat: &[f32], n: usize, threshold: f32) -> Self {
+    /// Read the strict lower triangle; values at least `f32::MAX` (or NaN) are
+    /// absent, and a negative value is an error.
+    pub(crate) fn from_distance_matrix<T: Real>(
+        mat: &[T],
+        n: usize,
+        threshold: f32,
+    ) -> Result<Self> {
         debug_assert_eq!(mat.len(), n * n);
         debug_assert!(n <= crate::MAX_POINTS);
         debug_assert!(threshold >= 0.0);
 
         if n < 2 {
-            return Self {
+            return Ok(Self {
                 n,
                 edges: Vec::new(),
                 center: 0,
                 threshold,
                 sorted: false,
-            };
+            });
         }
 
         // Track component membership, row maxima, and finite neighbour counts.
@@ -106,8 +114,16 @@ impl EdgeList {
             let mut row_max = max_dist[i];
             let mut row_finite = 0u32;
             for j in 0..i {
-                let distance = mat[row_base + j];
+                let distance = mat[row_base + j].to_f32();
                 if distance < NO_EDGE {
+                    // Negative bit patterns sort above every distance.
+                    if distance < 0.0 {
+                        return Err(Error::NegativeDistance {
+                            u: i,
+                            v: j,
+                            value: distance,
+                        });
+                    }
                     if distance > row_max {
                         row_max = distance;
                     }
@@ -130,35 +146,88 @@ impl EdgeList {
         for i in 1..n {
             let row_base = i * n;
             for j in 0..i {
-                let distance = mat[row_base + j];
+                let distance = mat[row_base + j].to_f32();
                 if distance <= effective && distance < NO_EDGE {
                     edges.push(Edge::canonical(i as u32, j as u32, distance));
                 }
             }
         }
 
-        Self {
+        Ok(Self {
             n,
             edges,
             center: center as u32,
             threshold: effective,
             sorted: false,
-        }
+        })
     }
 
     /// Build from an undirected COO graph. The minimum finite duplicate wins;
-    /// diagonal, NaN, and values at least `f32::MAX` are ignored.
+    /// diagonal, NaN, and values at least `f32::MAX` are ignored. Indices at
+    /// or above `n` and negative values are errors.
     ///
-    /// Indices must be `< n` (validated by the caller; debug-asserted here).
-    pub(crate) fn from_coo(
+    /// Row and column lengths must match (validated by the caller).
+    pub(crate) fn from_coo<I: SparseIndex, V: Real>(
         n: usize,
-        rows: &[u32],
-        cols: &[u32],
-        vals: &[f32],
+        rows: &[I],
+        cols: &[I],
+        vals: &[V],
         threshold: f32,
-    ) -> Self {
+    ) -> Result<Self> {
         debug_assert_eq!(rows.len(), cols.len());
         debug_assert_eq!(rows.len(), vals.len());
+
+        let mut edges: Vec<Edge> = Vec::with_capacity(vals.len());
+        for ((&r, &c), &distance) in rows.iter().zip(cols).zip(vals) {
+            push_entry(&mut edges, vertex(r, n)?, vertex(c, n)?, distance.to_f32())?;
+        }
+        Ok(Self::from_entries(n, edges, threshold))
+    }
+
+    /// Build from a compressed sparse graph: CSR rows or CSC columns, which
+    /// read the same because the graph is undirected. Entries follow the
+    /// [`from_coo`](Self::from_coo) rules, and `indptr` must hold `n + 1`
+    /// non-decreasing offsets into `indices`.
+    pub(crate) fn from_compressed<I: SparseIndex, V: Real>(
+        n: usize,
+        indptr: &[I],
+        indices: &[I],
+        vals: &[V],
+        threshold: f32,
+    ) -> Result<Self> {
+        if indptr.len() != n + 1 {
+            return Err(Error::InvalidCompressed("indptr must have n + 1 entries"));
+        }
+        if indices.len() != vals.len() {
+            return Err(Error::InvalidCompressed(
+                "indices and data have different lengths",
+            ));
+        }
+
+        let offset = |p: I| {
+            p.to_usize()
+                .filter(|&p| p <= indices.len())
+                .ok_or(Error::InvalidCompressed(
+                    "indptr offset is negative or beyond indices",
+                ))
+        };
+        let mut edges: Vec<Edge> = Vec::with_capacity(vals.len());
+        let mut start = offset(indptr[0])?;
+        for (r, &next) in indptr[1..].iter().enumerate() {
+            let end = offset(next)?;
+            if end < start {
+                return Err(Error::InvalidCompressed("indptr is not non-decreasing"));
+            }
+            for (&c, &distance) in indices[start..end].iter().zip(&vals[start..end]) {
+                push_entry(&mut edges, r as u32, vertex(c, n)?, distance.to_f32())?;
+            }
+            start = end;
+        }
+        Ok(Self::from_entries(n, edges, threshold))
+    }
+
+    /// Deduplicate raw sparse entries and apply the per-component cutoff.
+    fn from_entries(n: usize, mut edges: Vec<Edge>, threshold: f32) -> Self {
         debug_assert!(n <= crate::MAX_POINTS);
         debug_assert!(threshold >= 0.0);
 
@@ -172,14 +241,6 @@ impl EdgeList {
             };
         }
 
-        let mut edges: Vec<Edge> = Vec::with_capacity(vals.len());
-        for ((&r, &c), &distance) in rows.iter().zip(cols).zip(vals) {
-            debug_assert!((r as usize) < n && (c as usize) < n);
-            if r == c || distance.partial_cmp(&NO_EDGE) != Some(std::cmp::Ordering::Less) {
-                continue; // diagonal, absent (>= f32::MAX), or NaN
-            }
-            edges.push(Edge::canonical(r, c, distance));
-        }
         edges.sort_unstable_by_key(|edge| (edge.u, edge.v, edge.distance.to_bits()));
         edges.dedup_by_key(|edge| (edge.u, edge.v)); // keeps the first = smallest
 
@@ -204,6 +265,11 @@ impl EdgeList {
             per_component_minimax(&mut parent, &comp_size, &finite_count, &max_dist);
         let effective = threshold.min(r_cheb);
         edges.retain(|edge| edge.distance <= effective);
+        // Symmetric input names every pair twice. Dedup halves the length, and
+        // the spare half would otherwise ride along to the engine.
+        if edges.len() < edges.capacity() / 4 * 3 {
+            edges.shrink_to_fit();
+        }
 
         Self {
             n,
@@ -227,6 +293,33 @@ impl EdgeList {
         self.sorted = true;
     }
 
+    /// Words a bitset row per vertex needs when each row runs from id 0 to its
+    /// largest neighbour, the layout collapse and the engine fall back to.
+    pub(crate) fn tail_words(&self) -> usize {
+        let mut reach = vec![0u32; self.n];
+        for e in &self.edges {
+            reach[e.v as usize] = reach[e.v as usize].max((e.u >> 6) + 1);
+            reach[e.u as usize] = reach[e.u as usize].max((e.u >> 6) + 1);
+        }
+        reach.iter().map(|&r| r as usize).sum()
+    }
+
+    /// Renumber vertex `order[i]` as `i`. `order` is a permutation of `0..n`.
+    pub(crate) fn relabel(&mut self, order: &[u32]) {
+        debug_assert_eq!(order.len(), self.n);
+        let mut position = vec![0u32; self.n];
+        for (i, &v) in order.iter().enumerate() {
+            position[v as usize] = i as u32;
+        }
+        for e in &mut self.edges {
+            *e = Edge::canonical(position[e.u as usize], position[e.v as usize], e.distance);
+        }
+        if self.n > 0 {
+            self.center = position[self.center as usize];
+        }
+        self.sorted = false;
+    }
+
     /// Check the invariants the optimisation passes assume.
     pub(crate) fn assert_preconditions(&self) {
         for e in &self.edges {
@@ -246,6 +339,36 @@ impl EdgeList {
             }
         }
     }
+}
+
+/// A sparse index as a vertex id below `n`.
+#[inline]
+fn vertex<I: SparseIndex>(index: I, n: usize) -> Result<u32> {
+    match index.to_u32() {
+        Some(v) if (v as usize) < n => Ok(v),
+        _ => Err(Error::SparseIndexOutOfRange {
+            index: index.to_i128(),
+            n,
+        }),
+    }
+}
+
+/// Record one sparse entry, skipping the diagonal, absent (`>= f32::MAX`) and
+/// NaN values.
+#[inline]
+fn push_entry(edges: &mut Vec<Edge>, r: u32, c: u32, distance: f32) -> Result<()> {
+    if r == c || distance.partial_cmp(&NO_EDGE) != Some(std::cmp::Ordering::Less) {
+        return Ok(());
+    }
+    if distance < 0.0 {
+        return Err(Error::NegativeDistance {
+            u: r as usize,
+            v: c as usize,
+            value: distance,
+        });
+    }
+    edges.push(Edge::canonical(r, c, distance));
+    Ok(())
 }
 
 #[inline(always)]
@@ -679,6 +802,401 @@ fn points_single_pass_parallel(
     finalize_points(n, edges, center, threshold, staging, r_cheb)
 }
 
+// ---------------------------------------------------------------------------
+// Streamed point passes
+// ---------------------------------------------------------------------------
+//
+// A point cloud's edge list under the enclosing radius is most of its pairs.
+// A consumer that reads edges once in `Edge::sort_key` order, such as the
+// quotient, can take them in distance bands instead: one full pass learns the
+// cutoff and a histogram of distances, then each band is generated, sorted and
+// handed over on its own. Distances come from the same kernel as `from_points`,
+// so every edge is bit-identical to the one it would have stored.
+
+/// Distance bins of a [`PointScan`].
+pub(crate) const STREAM_BINS: usize = 1 << 16;
+
+/// What one full pass over the pairs tells a streamed build: the cutoff and
+/// centre `from_points` would choose, and how many pairs fall in each bin.
+pub(crate) struct PointScan {
+    pub(crate) center: u32,
+    /// The truncation radius: `min(threshold, certified radius)`.
+    pub(crate) threshold: f32,
+    scale: f32,
+    /// Pairs per bin, counting every pair up to the staging cutoff.
+    pub(crate) bins: Vec<u64>,
+}
+
+impl PointScan {
+    /// Bin of a distance. Monotone, so bins split pairs in distance order and
+    /// never separate two equal distances.
+    #[inline(always)]
+    pub(crate) fn bin(&self, distance: f32) -> usize {
+        ((distance * self.scale) as usize).min(STREAM_BINS - 1)
+    }
+}
+
+/// One full pass: the cutoff and centre [`EdgeList::from_points`] would pick,
+/// and a histogram of the distances up to its staging cutoff.
+pub(crate) fn scan_points(
+    data: &[f32],
+    n: usize,
+    d: usize,
+    threshold: f32,
+    parallel: bool,
+) -> PointScan {
+    if n < 2 {
+        return PointScan {
+            center: 0,
+            threshold: 0.0,
+            scale: 0.0,
+            bins: vec![0; STREAM_BINS],
+        };
+    }
+    let staging = staging_cutoff(data, n, d, threshold);
+    let scale = if staging > 0.0 {
+        STREAM_BINS as f32 / staging
+    } else {
+        0.0
+    };
+    let mut scan = PointScan {
+        center: 0,
+        threshold,
+        scale,
+        bins: vec![0; STREAM_BINS],
+    };
+
+    let tile_scan = |tile: &[[f32; NR]; MR],
+                     i_min: usize,
+                     j_min: usize,
+                     mr: usize,
+                     nr: usize,
+                     full: bool,
+                     max_dist: &mut [f32],
+                     bins: &mut [u64]| {
+        for m in 0..mr {
+            let i = i_min + m;
+            let mut row_max = max_dist[i];
+            for nn in 0..nr {
+                let j = j_min + nn;
+                if full || i > j {
+                    let distance = tile_dist(tile, m, nn);
+                    if distance > row_max {
+                        row_max = distance;
+                    }
+                    if distance > max_dist[j] {
+                        max_dist[j] = distance;
+                    }
+                    if distance <= staging {
+                        bins[((distance * scale) as usize).min(STREAM_BINS - 1)] += 1;
+                    }
+                }
+            }
+            max_dist[i] = row_max;
+        }
+    };
+
+    let max_dist = if parallel && n * (n - 1) / 2 >= PARALLEL_POINT_MIN_PAIRS {
+        let (max_dist, bins) = macro_tiles(n)
+            .par_iter()
+            .fold(
+                || (alloc_panels(d), vec![0.0f32; n], vec![0u64; STREAM_BINS]),
+                |(mut panels, mut max_dist, mut bins), &(jc, ic)| {
+                    for_each_micro_tile(data, n, d, jc, ic, &mut panels, |t, i, j, mr, nr, full| {
+                        tile_scan(t, i, j, mr, nr, full, &mut max_dist, &mut bins)
+                    });
+                    (panels, max_dist, bins)
+                },
+            )
+            .map(|(_, max_dist, bins)| (max_dist, bins))
+            .reduce(
+                || (vec![0.0f32; n], vec![0u64; STREAM_BINS]),
+                |(mut a, mut ab), (b, bb)| {
+                    for (x, y) in a.iter_mut().zip(b) {
+                        *x = x.max(y);
+                    }
+                    for (x, y) in ab.iter_mut().zip(bb) {
+                        *x += y;
+                    }
+                    (a, ab)
+                },
+            );
+        scan.bins = bins;
+        max_dist
+    } else {
+        let (mut a_packed, mut b_packed) = alloc_panels(d);
+        let mut max_dist = vec![0.0f32; n];
+        let bins = &mut scan.bins;
+        tiled_pass(data, n, d, &mut a_packed, &mut b_packed, |t, i, j, mr, nr, full| {
+            tile_scan(t, i, j, mr, nr, full, &mut max_dist, bins)
+        });
+        max_dist
+    };
+
+    let (center, r_cheb) = reduce_minimax(&max_dist);
+    let effective = threshold.min(r_cheb);
+    assert!(
+        effective <= staging,
+        "staging cutoff {staging} fell below the certified radius {r_cheb}"
+    );
+    scan.center = center as u32;
+    scan.threshold = effective;
+    scan
+}
+
+/// The points reordered so that every run of 16 is spatially compact, with
+/// a bounding box per run of 16, 64 and 256: the row and column groups of a
+/// micro tile and of a macro tile. A band pass skips every tile whose boxes
+/// put all of its distances outside the band.
+pub(crate) struct SpatialPoints {
+    n: usize,
+    d: usize,
+    data: Vec<f32>,
+    /// Original id of each reordered point.
+    ids: Vec<u32>,
+    /// `[min_0.., max_0..]` per group, for groups of `MR`, `MC` and `NC`.
+    boxes: [Vec<f32>; 3],
+}
+
+impl SpatialPoints {
+    /// k-d order: split each range at a multiple of 16 points along its widest
+    /// axis, so every aligned run of 16, 64 or 256 sits in one cell.
+    pub(crate) fn new(data: &[f32], n: usize, d: usize) -> Self {
+        const { assert!(MC.is_multiple_of(MR) && NC.is_multiple_of(NR) && NC.is_multiple_of(MC)) };
+        let mut ids: Vec<u32> = (0..n as u32).collect();
+        let mut stack = vec![(0usize, n)];
+        while let Some((lo, hi)) = stack.pop() {
+            if hi - lo <= MR {
+                continue;
+            }
+            let (min, max) = bounds(data, d, &ids[lo..hi]);
+            let axis = (0..d)
+                .max_by(|&a, &b| (max[a] - min[a]).total_cmp(&(max[b] - min[b])))
+                .unwrap_or(0);
+            let half = ((hi - lo) / 2).next_multiple_of(MR);
+            ids[lo..hi].select_nth_unstable_by(half, |&a, &b| {
+                data[a as usize * d + axis].total_cmp(&data[b as usize * d + axis])
+            });
+            stack.push((lo, lo + half));
+            stack.push((lo + half, hi));
+        }
+
+        let mut ordered = Vec::with_capacity(n * d);
+        for &id in &ids {
+            ordered.extend_from_slice(&data[id as usize * d..(id as usize + 1) * d]);
+        }
+        let boxes = [MR, MC, NC].map(|size| {
+            let mut out = Vec::with_capacity(n.div_ceil(size) * 2 * d);
+            for start in (0..n).step_by(size) {
+                let end = (start + size).min(n);
+                let run: Vec<u32> = (start as u32..end as u32).collect();
+                let (min, max) = bounds(&ordered, d, &run);
+                out.extend(min);
+                out.extend(max);
+            }
+            out
+        });
+        Self {
+            n,
+            d,
+            data: ordered,
+            ids,
+            boxes,
+        }
+    }
+
+    /// Bounds on the distances between the point groups `a` and `b` of size
+    /// `sizes.0` and `sizes.1` (indices into the box tables), as squared
+    /// distances in `f64`.
+    #[inline]
+    fn reach(&self, level_a: usize, a: usize, level_b: usize, b: usize) -> (f64, f64) {
+        let d = self.d;
+        let ba = &self.boxes[level_a][a * 2 * d..(a + 1) * 2 * d];
+        let bb = &self.boxes[level_b][b * 2 * d..(b + 1) * 2 * d];
+        let (mut near, mut far) = (0.0f64, 0.0f64);
+        for k in 0..d {
+            let (alo, ahi) = (ba[k] as f64, ba[d + k] as f64);
+            let (blo, bhi) = (bb[k] as f64, bb[d + k] as f64);
+            let gap = (alo - bhi).max(blo - ahi).max(0.0);
+            let span = (ahi - blo).max(bhi - alo);
+            near += gap * gap;
+            far += span * span;
+        }
+        (near, far)
+    }
+}
+
+fn bounds(data: &[f32], d: usize, ids: &[u32]) -> (Vec<f32>, Vec<f32>) {
+    let mut min = vec![f32::INFINITY; d];
+    let mut max = vec![f32::NEG_INFINITY; d];
+    for &id in ids {
+        for k in 0..d {
+            let x = data[id as usize * d + k];
+            min[k] = min[k].min(x);
+            max[k] = max[k].max(x);
+        }
+    }
+    (min, max)
+}
+
+/// Every pair whose bin is in `bins` and whose distance is within the scan's
+/// cutoff, as canonical edges on the original ids, in no particular order.
+pub(crate) fn band_edges(
+    points: &SpatialPoints,
+    scan: &PointScan,
+    bins: std::ops::Range<usize>,
+    parallel: bool,
+) -> Vec<Edge> {
+    let SpatialPoints { n, d, .. } = *points;
+    let cap = scan.threshold;
+    // Distances that can land in these bins, widened for the rounding of
+    // `distance * scale`, compared squared against the box bounds. A computed
+    // distance is within `(d + 2) / 2 + 1` ulps of the true one, so the box
+    // test is widened by more than that.
+    let slack = (d as f64 + 4.0) * f64::from(f32::EPSILON);
+    let (near_limit, far_limit) = if scan.scale > 0.0 {
+        let scale = scan.scale as f64;
+        let lo = bins.start as f64 / scale * (1.0 - 4.0 * f64::from(f32::EPSILON));
+        let hi = (bins.end as f64 / scale).min(cap as f64) * (1.0 + 4.0 * f64::from(f32::EPSILON));
+        ((hi * (1.0 + slack)).powi(2), (lo * (1.0 - slack)).max(0.0).powi(2))
+    } else {
+        ((cap as f64 * (1.0 + slack)).powi(2), 0.0)
+    };
+    // A tile can hold a band pair unless all of it is too far or too near.
+    let may_hit = |near: f64, far: f64| near <= near_limit && far >= far_limit;
+
+    let tile_band = |tile: &[[f32; NR]; MR],
+                     i_min: usize,
+                     j_min: usize,
+                     mr: usize,
+                     nr: usize,
+                     full: bool,
+                     out: &mut Vec<Edge>| {
+        for m in 0..mr {
+            let i = i_min + m;
+            for nn in 0..nr {
+                let j = j_min + nn;
+                if full || i > j {
+                    let distance = tile_dist(tile, m, nn);
+                    if distance <= cap && bins.contains(&scan.bin(distance)) {
+                        out.push(Edge::canonical(points.ids[i], points.ids[j], distance));
+                    }
+                }
+            }
+        }
+    };
+    let macro_tile = |(jc, ic): (usize, usize), panels: &mut (Vec<f32>, Vec<f32>), out: &mut Vec<Edge>| {
+        let (near, far) = points.reach(1, ic / MC, 2, jc / NC);
+        if !may_hit(near, far) {
+            return;
+        }
+        let (a_packed, b_packed) = panels;
+        let nc = (n - jc).min(NC);
+        let mc = (n - ic).min(MC);
+        pack_panel(&points.data, d, jc, nc, NR, b_packed);
+        pack_panel(&points.data, d, ic, mc, MR, a_packed);
+        let mut ir = 0;
+        while ir < mc {
+            let mr_eff = (mc - ir).min(MR);
+            let a_off = (ir / MR) * MR * d;
+            let mut jr = 0;
+            while jr < nc {
+                let nr_eff = (nc - jr).min(NR);
+                let b_off = (jr / NR) * NR * d;
+                let i_min = ic + ir;
+                let i_max = i_min + mr_eff - 1;
+                let j_min = jc + jr;
+                let j_max = j_min + nr_eff - 1;
+                if i_max > j_min {
+                    let (near, far) = points.reach(0, i_min / MR, 0, j_min / NR);
+                    if may_hit(near, far) {
+                        let tile = micro_kernel(&a_packed[a_off..], &b_packed[b_off..], d);
+                        tile_band(&tile, i_min, j_min, mr_eff, nr_eff, i_min > j_max, out);
+                    }
+                }
+                jr += NR;
+            }
+            ir += MR;
+        }
+    };
+
+    let tiles = macro_tiles(n);
+    if parallel && tiles.len() > 1 {
+        let parts: Vec<Vec<Edge>> = tiles
+            .par_iter()
+            .fold(
+                || (alloc_panels(d), Vec::new()),
+                |(mut panels, mut out), &tile| {
+                    macro_tile(tile, &mut panels, &mut out);
+                    (panels, out)
+                },
+            )
+            .map(|(_, out)| out)
+            .collect();
+        let mut out = Vec::with_capacity(parts.iter().map(Vec::len).sum());
+        for part in parts {
+            out.extend(part);
+        }
+        out
+    } else {
+        let mut panels = alloc_panels(d);
+        let mut out = Vec::new();
+        for tile in tiles {
+            macro_tile(tile, &mut panels, &mut out);
+        }
+        out
+    }
+}
+
+/// `(jc, ic)` of every macro tile that holds a pair `i > j`.
+fn macro_tiles(n: usize) -> Vec<(usize, usize)> {
+    let mut tiles = Vec::new();
+    for jc in (0..n).step_by(NC) {
+        for ic in (jc..n).step_by(MC) {
+            tiles.push((jc, ic));
+        }
+    }
+    tiles
+}
+
+/// The micro tiles of one macro tile, as `tiled_pass` visits them.
+#[allow(clippy::type_complexity)]
+fn for_each_micro_tile(
+    data: &[f32],
+    n: usize,
+    d: usize,
+    jc: usize,
+    ic: usize,
+    panels: &mut (Vec<f32>, Vec<f32>),
+    mut on_tile: impl FnMut(&[[f32; NR]; MR], usize, usize, usize, usize, bool),
+) {
+    let (a_packed, b_packed) = panels;
+    let nc = (n - jc).min(NC);
+    let mc = (n - ic).min(MC);
+    pack_panel(data, d, jc, nc, NR, b_packed);
+    pack_panel(data, d, ic, mc, MR, a_packed);
+    let mut ir = 0;
+    while ir < mc {
+        let mr_eff = (mc - ir).min(MR);
+        let a_off = (ir / MR) * MR * d;
+        let mut jr = 0;
+        while jr < nc {
+            let nr_eff = (nc - jr).min(NR);
+            let b_off = (jr / NR) * NR * d;
+            let i_min = ic + ir;
+            let i_max = i_min + mr_eff - 1;
+            let j_min = jc + jr;
+            let j_max = j_min + nr_eff - 1;
+            if i_max > j_min {
+                let tile = micro_kernel(&a_packed[a_off..], &b_packed[b_off..], d);
+                on_tile(&tile, i_min, j_min, mr_eff, nr_eff, i_min > j_max);
+            }
+            jr += NR;
+        }
+        ir += MR;
+    }
+}
+
 /// For query `q`,
 /// `cols/dists[offsets[q]..offsets[q + 1]]` are the train points within
 /// `radius` (strict), ascending train index.
@@ -829,7 +1347,7 @@ mod tests {
         set_sym(&mut d, n, 1, 3, 2.0);
         set_sym(&mut d, n, 4, 5, 1.0);
 
-        let e = EdgeList::from_distance_matrix(&d, n, f32::INFINITY);
+        let e = EdgeList::from_distance_matrix(&d, n, f32::INFINITY).unwrap();
         assert_eq!(e.threshold, 2.0, "cutoff must be max over components");
         assert_eq!(e.edges.len(), 7, "4 sides + 2 diagonals + 1 pair");
         assert!(e.center < 4, "apex must lie in the winning component");
@@ -846,7 +1364,7 @@ mod tests {
         set_sym(&mut d, n, 0, 2, 1.0);
         set_sym(&mut d, n, 1, 2, 1.0);
 
-        let e = EdgeList::from_distance_matrix(&d, n, f32::INFINITY);
+        let e = EdgeList::from_distance_matrix(&d, n, f32::INFINITY).unwrap();
         assert_eq!(e.threshold, 1.0);
         assert_eq!(e.edges.len(), 3);
     }
@@ -863,7 +1381,7 @@ mod tests {
         set_sym(&mut d, n, 2, 3, 1.0);
         set_sym(&mut d, n, 0, 3, 1.0);
 
-        let e = EdgeList::from_distance_matrix(&d, n, f32::INFINITY);
+        let e = EdgeList::from_distance_matrix(&d, n, f32::INFINITY).unwrap();
         assert_eq!(e.threshold, f32::INFINITY);
         assert_eq!(e.edges.len(), 4);
     }
@@ -964,7 +1482,7 @@ mod tests {
         let rows = [0u32, 1, 1, 2, 2];
         let cols = [1u32, 0, 2, 1, 2]; // (2, 2) is a diagonal entry: ignored
         let vals = [3.0f32, 1.0, 5.0, 5.0, 9.0];
-        let e = EdgeList::from_coo(3, &rows, &cols, &vals, f32::INFINITY);
+        let e = EdgeList::from_coo(3, &rows, &cols, &vals, f32::INFINITY).unwrap();
 
         assert_eq!(sorted_edges(&e).len(), 2);
         assert!(e.edges.iter().all(|edge| edge.u > edge.v));
@@ -1006,8 +1524,8 @@ mod tests {
             }
         }
 
-        let dense = EdgeList::from_distance_matrix(&d, n, f32::INFINITY);
-        let sparse = EdgeList::from_coo(n, &rows, &cols, &vals, f32::INFINITY);
+        let dense = EdgeList::from_distance_matrix(&d, n, f32::INFINITY).unwrap();
+        let sparse = EdgeList::from_coo(n, &rows, &cols, &vals, f32::INFINITY).unwrap();
         assert_eq!(sparse.n, dense.n);
         assert_eq!(sparse.center, dense.center);
         assert_eq!(sparse.threshold.to_bits(), dense.threshold.to_bits());

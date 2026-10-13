@@ -2,6 +2,7 @@
 pub mod coords;
 mod engine;
 mod error;
+mod input;
 mod opt;
 mod preprocess;
 mod types;
@@ -10,6 +11,8 @@ mod utils;
 use preprocess::edgelist::EdgeList;
 
 pub use error::{Error, Result};
+pub use input::{Real, SparseIndex};
+pub use opt::collapse::Collapse;
 pub use types::{BarcodeResult, PersistenceInterval};
 
 /// Maximum point count allowed by the 24-bit simplex vertex slots.
@@ -23,7 +26,8 @@ const S128_MAX_DIM: usize = 4;
 /// Optional knobs for [`persistent_homology_with`] and [`filtration_size_with`].
 ///
 /// The default uses point-cloud input, the certified cutoff, exact peeling,
-/// and parallel preprocessing. Quotient coning and edge collapse are disabled.
+/// automatic edge collapse, and parallel preprocessing. Quotient coning is
+/// disabled.
 ///
 /// ```
 /// use tda_core::Config;
@@ -48,8 +52,9 @@ pub struct Config {
     pub peel: bool,
     /// Use a log(3)-interleaved quotient-cover filtration. Default `false`.
     pub quotient: bool,
-    /// Remove filtration-dominated edges without changing the barcode. Default `false`.
-    pub collapse: bool,
+    /// Remove filtration-dominated edges without changing the barcode.
+    /// Default [`Collapse::Auto`], which decides per dimension and per dataset.
+    pub collapse: Collapse,
     /// Enable rayon in sufficiently large point preprocessing, edge sorts, and
     /// engine candidate assembly. Default `true`.
     pub parallel: bool,
@@ -62,7 +67,7 @@ impl Default for Config {
             threshold: None,
             peel: true,
             quotient: false,
-            collapse: false,
+            collapse: Collapse::Auto,
             parallel: true,
         }
     }
@@ -71,38 +76,41 @@ impl Default for Config {
 /// Vietoris–Rips persistent homology of a point cloud, with the default
 /// [`Config`].
 ///
-/// `data` is a row-major `&[f32]` point cloud of length `n * d`; `d` is
+/// `data` is a row-major `f32` or `f64` point cloud of length `n * d`; `d` is
 /// inferred as `data.len() / n`. For distance-matrix input, a threshold, or
 /// any other option, use [`persistent_homology_with`].
-pub fn persistent_homology(data: &[f32], n: usize, max_dim: usize) -> Result<BarcodeResult> {
+pub fn persistent_homology<T: Real>(data: &[T], n: usize, max_dim: usize) -> Result<BarcodeResult> {
     persistent_homology_with(data, n, max_dim, &Config::default())
 }
 
 /// Vietoris–Rips persistent homology with explicit configuration.
 ///
-/// `data` is row-major. With `distance_matrix`, it has length `n * n` and only
-/// the strict lower triangle is read. Otherwise it has length `n * d` and the
-/// ambient dimension is inferred. Infinite distances represent missing edges.
+/// `data` is row-major `f32` or `f64`; distances are computed and stored in
+/// `f32`. With `distance_matrix`, it has length `n * n` and only the strict
+/// lower triangle is read, in place, so `f64` input is never copied. Negative
+/// entries there are an error, and infinite ones represent missing edges.
+/// Otherwise it has length `n * d`, the ambient dimension is inferred, and
+/// every coordinate must be finite.
 ///
 /// Square data is ambiguous, so `config.distance_matrix` must be set correctly.
 ///
 /// Optional transforms run in the order peel, quotient, collapse.
-pub fn persistent_homology_with(
-    data: &[f32],
+pub fn persistent_homology_with<T: Real>(
+    data: &[T],
     n: usize,
     max_dim: usize,
     config: &Config,
 ) -> Result<BarcodeResult> {
-    let edges = build_edges(data, n, max_dim, config)?;
-    Ok(compute_barcode(edges, max_dim, config.parallel))
+    let edges = build_edges(data, n, max_dim, config, Ids::Free)?;
+    compute_barcode(edges, max_dim, config.parallel)
 }
 
 /// Vietoris–Rips persistent homology of a sparse distance graph in COO form,
 /// with the default [`Config`]. See [`persistent_homology_sparse_with`].
-pub fn persistent_homology_sparse(
-    rows: &[u32],
-    cols: &[u32],
-    vals: &[f32],
+pub fn persistent_homology_sparse<I: SparseIndex, V: Real>(
+    rows: &[I],
+    cols: &[I],
+    vals: &[V],
     n: usize,
     max_dim: usize,
 ) -> Result<BarcodeResult> {
@@ -117,28 +125,63 @@ pub fn persistent_homology_sparse(
 /// diagonal entries are ignored. A pair with no finite entry is never
 /// connected (infinite distance), and truncation uses the same per-component
 /// certificate as the dense distance-matrix path, so disconnected inputs are
-/// handled soundly. Values `>= f32::MAX` (or NaN) count as absent.
+/// handled soundly. Values `>= f32::MAX` (or NaN) count as absent; negative
+/// values and indices outside `0..n` are errors.
+///
+/// Indices may be `u32`, `u64`, `i32`, or `i64` and values `f32` or `f64`; all
+/// are read in place.
 ///
 /// `config.distance_matrix` is meaningless for this entry point and ignored;
 /// the other fields behave as in [`persistent_homology_with`].
-pub fn persistent_homology_sparse_with(
-    rows: &[u32],
-    cols: &[u32],
-    vals: &[f32],
+pub fn persistent_homology_sparse_with<I: SparseIndex, V: Real>(
+    rows: &[I],
+    cols: &[I],
+    vals: &[V],
     n: usize,
     max_dim: usize,
     config: &Config,
 ) -> Result<BarcodeResult> {
     let edges = build_sparse_edges(rows, cols, vals, n, max_dim, config)?;
-    Ok(compute_barcode(edges, max_dim, config.parallel))
+    compute_barcode(edges, max_dim, config.parallel)
+}
+
+/// Vietoris–Rips persistent homology of a compressed sparse distance graph,
+/// with the default [`Config`]. See [`persistent_homology_csr_with`].
+pub fn persistent_homology_csr<I: SparseIndex, V: Real>(
+    indptr: &[I],
+    indices: &[I],
+    vals: &[V],
+    n: usize,
+    max_dim: usize,
+) -> Result<BarcodeResult> {
+    persistent_homology_csr_with(indptr, indices, vals, n, max_dim, &Config::default())
+}
+
+/// Vietoris–Rips persistent homology of a compressed sparse distance graph.
+///
+/// Row `r` holds `d(r, indices[k]) = vals[k]` for `k` in
+/// `indptr[r]..indptr[r + 1]`, so `indptr` has `n + 1` non-decreasing offsets.
+/// The graph is undirected, so CSC input (offsets over columns) gives the same
+/// result. Entries follow the [`persistent_homology_sparse_with`] rules, and
+/// the arrays are read in place.
+pub fn persistent_homology_csr_with<I: SparseIndex, V: Real>(
+    indptr: &[I],
+    indices: &[I],
+    vals: &[V],
+    n: usize,
+    max_dim: usize,
+    config: &Config,
+) -> Result<BarcodeResult> {
+    let edges = build_csr_edges(indptr, indices, vals, n, max_dim, config)?;
+    compute_barcode(edges, max_dim, config.parallel)
 }
 
 /// Truncated filtration size of a sparse COO distance graph, with the default
 /// [`Config`]. See [`persistent_homology_sparse_with`] for the input contract.
-pub fn filtration_size_sparse(
-    rows: &[u32],
-    cols: &[u32],
-    vals: &[f32],
+pub fn filtration_size_sparse<I: SparseIndex, V: Real>(
+    rows: &[I],
+    cols: &[I],
+    vals: &[V],
     n: usize,
     max_dim: usize,
 ) -> Result<usize> {
@@ -147,15 +190,45 @@ pub fn filtration_size_sparse(
 
 /// Truncated filtration size of a sparse COO distance graph. See
 /// [`persistent_homology_sparse_with`] for the input contract.
-pub fn filtration_size_sparse_with(
-    rows: &[u32],
-    cols: &[u32],
-    vals: &[f32],
+pub fn filtration_size_sparse_with<I: SparseIndex, V: Real>(
+    rows: &[I],
+    cols: &[I],
+    vals: &[V],
     n: usize,
     max_dim: usize,
     config: &Config,
 ) -> Result<usize> {
     let edges = build_sparse_edges(rows, cols, vals, n, max_dim, config)?;
+    Ok(utils::cliques::count_cliques(
+        edges,
+        max_dim + 1,
+        config.parallel,
+    ))
+}
+
+/// Truncated filtration size of a compressed sparse distance graph, with the
+/// default [`Config`]. See [`persistent_homology_csr_with`].
+pub fn filtration_size_csr<I: SparseIndex, V: Real>(
+    indptr: &[I],
+    indices: &[I],
+    vals: &[V],
+    n: usize,
+    max_dim: usize,
+) -> Result<usize> {
+    filtration_size_csr_with(indptr, indices, vals, n, max_dim, &Config::default())
+}
+
+/// Truncated filtration size of a compressed sparse distance graph. See
+/// [`persistent_homology_csr_with`] for the input contract.
+pub fn filtration_size_csr_with<I: SparseIndex, V: Real>(
+    indptr: &[I],
+    indices: &[I],
+    vals: &[V],
+    n: usize,
+    max_dim: usize,
+    config: &Config,
+) -> Result<usize> {
+    let edges = build_csr_edges(indptr, indices, vals, n, max_dim, config)?;
     Ok(utils::cliques::count_cliques(
         edges,
         max_dim + 1,
@@ -166,20 +239,20 @@ pub fn filtration_size_sparse_with(
 /// Truncated Vietoris–Rips filtration size (simplices of dimension ≤
 /// `max_dim`) of a point cloud, with the default [`Config`]. See
 /// [`filtration_size_with`].
-pub fn filtration_size(data: &[f32], n: usize, max_dim: usize) -> Result<usize> {
+pub fn filtration_size<T: Real>(data: &[T], n: usize, max_dim: usize) -> Result<usize> {
     filtration_size_with(data, n, max_dim, &Config::default())
 }
 
 /// Truncated Vietoris–Rips filtration size (simplices of dimension ≤
 /// `max_dim`). See [`persistent_homology_with`] for the `data` layout contract
 /// and the meaning of the [`Config`] fields.
-pub fn filtration_size_with(
-    data: &[f32],
+pub fn filtration_size_with<T: Real>(
+    data: &[T],
     n: usize,
     max_dim: usize,
     config: &Config,
 ) -> Result<usize> {
-    let edges = build_edges(data, n, max_dim, config)?;
+    let edges = build_edges(data, n, max_dim, config, Ids::Free)?;
     Ok(utils::cliques::count_cliques(
         edges,
         max_dim + 1,
@@ -187,42 +260,72 @@ pub fn filtration_size_with(
     ))
 }
 
+/// Whether the transforms may renumber vertices. Barcodes and filtration sizes
+/// do not depend on vertex ids; coordinates are indexed by them.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Ids {
+    Keep,
+    Free,
+}
+
 /// Build and transform the truncated edge list.
-fn build_edges(data: &[f32], n: usize, max_dim: usize, config: &Config) -> Result<EdgeList> {
+pub(crate) fn build_edges<T: Real>(
+    data: &[T],
+    n: usize,
+    max_dim: usize,
+    config: &Config,
+    ids: Ids,
+) -> Result<EdgeList> {
     validate_params(n, max_dim, config.threshold)?;
     let t = config.threshold.unwrap_or(f32::INFINITY);
 
+    let mut coned = None;
     let mut edges = if config.distance_matrix {
-        validate_distance_shape(data, n)?;
-        EdgeList::from_distance_matrix(data, n, t)
+        validate_distance_shape(data.len(), n)?;
+        EdgeList::from_distance_matrix(data, n, t)?
     } else {
-        let d = infer_dimension(data, n)?;
-        EdgeList::from_points(data, n, d, t, config.parallel)
+        let d = infer_dimension(data.len(), n)?;
+        // The tiled kernel packs `f32` panels; `n * d` is small next to the
+        // `n^2` pairs, so converting `f64` points here costs little.
+        let points = T::as_f32_slice(data);
+        validate_points(&points, d)?;
+        if streams_quotient(n, config) {
+            let (edges, order) = opt::coperto::cone_points(&points, n, d, t, config.parallel);
+            coned = Some(order);
+            edges
+        } else {
+            EdgeList::from_points(&points, n, d, t, config.parallel)
+        }
     };
 
-    apply_optimizations(&mut edges, config);
+    apply_optimizations(&mut edges, max_dim, config, ids, coned)?;
     Ok(edges)
 }
 
-fn build_sparse_edges(
-    rows: &[u32],
-    cols: &[u32],
-    vals: &[f32],
+/// Stored edges a point cloud may need before the quotient streams them
+/// instead (see [`opt::coperto::cone_points`]). The bound is every pair, so
+/// about 26 700 points. Streaming costs about one extra pass over the pairs:
+/// on the Stanford dragon it ties the single-pass build at 25 000-27 000
+/// points, is faster from 30 000, and peaks at a fifth of its memory.
+const STREAM_MIN_BYTES: usize = 1 << 32;
+
+/// Peel needs the whole graph, so only a quotient without it can stream.
+fn streams_quotient(n: usize, config: &Config) -> bool {
+    let pairs = n * n.saturating_sub(1) / 2;
+    config.quotient
+        && !config.peel
+        && pairs.saturating_mul(std::mem::size_of::<preprocess::edgelist::Edge>()) > STREAM_MIN_BYTES
+}
+
+fn build_sparse_edges<I: SparseIndex, V: Real>(
+    rows: &[I],
+    cols: &[I],
+    vals: &[V],
     n: usize,
     max_dim: usize,
     config: &Config,
 ) -> Result<EdgeList> {
     validate_params(n, max_dim, config.threshold)?;
-    validate_sparse(rows, cols, vals, n)?;
-    let t = config.threshold.unwrap_or(f32::INFINITY);
-
-    let mut edges = EdgeList::from_coo(n, rows, cols, vals, t);
-    apply_optimizations(&mut edges, config);
-    Ok(edges)
-}
-
-#[inline]
-fn validate_sparse(rows: &[u32], cols: &[u32], vals: &[f32], n: usize) -> Result<()> {
     if rows.len() != cols.len() || rows.len() != vals.len() {
         return Err(Error::SparseLengthMismatch {
             rows: rows.len(),
@@ -230,44 +333,99 @@ fn validate_sparse(rows: &[u32], cols: &[u32], vals: &[f32], n: usize) -> Result
             vals: vals.len(),
         });
     }
-    let bound = n as u32;
-    for (&r, &c) in rows.iter().zip(cols) {
-        if r >= bound || c >= bound {
-            return Err(Error::SparseIndexOutOfRange { u: r, v: c, n });
-        }
-    }
-    Ok(())
+    let t = config.threshold.unwrap_or(f32::INFINITY);
+
+    let mut edges = EdgeList::from_coo(n, rows, cols, vals, t)?;
+    apply_optimizations(&mut edges, max_dim, config, Ids::Free, None)?;
+    Ok(edges)
 }
 
-/// Quotient construction needs the uncollapsed graph, so collapse runs last.
+fn build_csr_edges<I: SparseIndex, V: Real>(
+    indptr: &[I],
+    indices: &[I],
+    vals: &[V],
+    n: usize,
+    max_dim: usize,
+    config: &Config,
+) -> Result<EdgeList> {
+    validate_params(n, max_dim, config.threshold)?;
+    let t = config.threshold.unwrap_or(f32::INFINITY);
+
+    let mut edges = EdgeList::from_compressed(n, indptr, indices, vals, t)?;
+    apply_optimizations(&mut edges, max_dim, config, Ids::Free, None)?;
+    Ok(edges)
+}
+
+/// A NaN coordinate makes every distance from its point NaN, which silently
+/// zeroes the enclosing radius, so it is rejected up front.
 #[inline]
-fn apply_optimizations(edges: &mut EdgeList, config: &Config) {
-    if config.peel {
-        opt::peel::peel(edges, config.parallel);
+fn validate_points(points: &[f32], d: usize) -> Result<()> {
+    match points.iter().position(|x| !x.is_finite()) {
+        None => Ok(()),
+        Some(i) => Err(Error::NonFiniteCoordinate {
+            point: i / d,
+            value: points[i],
+        }),
     }
-    if config.quotient {
-        opt::coperto::cone_in_place(edges, config.parallel);
+}
+
+/// Rows of tail-truncated bitsets above which a free-id quotient skeleton is
+/// renumbered. Below it rows cost little, and keeping ids leaves results that
+/// depend on them, such as which edges collapse trims, as they were.
+const RELABEL_MIN_WORDS: usize = 1 << 20;
+
+/// Quotient construction needs the uncollapsed graph, so collapse runs last.
+///
+/// The quotient's skeleton is sparse but its vertex ids are scattered, and
+/// collapse and the engine size each row by the id range of its neighbours.
+/// Where ids are free and rows would be long, the skeleton is renumbered in
+/// merge order, which keeps those ranges short (see
+/// [`opt::coperto::Cone::finish`]).
+///
+/// `coned` carries the merge order when the quotient was already built while
+/// streaming the edges.
+#[inline]
+fn apply_optimizations(
+    edges: &mut EdgeList,
+    max_dim: usize,
+    config: &Config,
+    ids: Ids,
+    coned: Option<Vec<u32>>,
+) -> Result<()> {
+    let order = match coned {
+        Some(order) => Some(order),
+        None => {
+            if config.peel {
+                opt::peel::peel(edges, config.parallel);
+            }
+            config
+                .quotient
+                .then(|| opt::coperto::cone_in_place(edges, config.parallel))
+        }
+    };
+    if let Some(order) = order {
+        if ids == Ids::Free && edges.tail_words() > RELABEL_MIN_WORDS {
+            edges.relabel(&order);
+        }
     }
-    if config.collapse {
-        opt::collapse::collapse_in_place(edges, config.parallel);
-    }
+    config.collapse.apply(edges, max_dim, config.parallel)?;
+    Ok(())
 }
 
 /// Select the narrow packing when both its point and dimension limits fit.
 #[inline]
-fn compute_barcode(edges: EdgeList, max_dim: usize, parallel: bool) -> BarcodeResult {
+fn compute_barcode(edges: EdgeList, max_dim: usize, parallel: bool) -> Result<BarcodeResult> {
     let use_s128 = edges.n <= S128_MAX_POINTS && max_dim <= S128_MAX_DIM;
-    let bitcsr = engine::BitCsrDistanceMatrix::from_edge_list(edges);
-    if use_s128 {
+    let bitcsr = engine::BitCsrDistanceMatrix::from_edge_list(edges)?;
+    Ok(if use_s128 {
         engine::algorithm::compute::<6, engine::simplex::Simplex128>(&bitcsr, max_dim, parallel)
     } else {
         engine::algorithm::compute::<9, engine::simplex::Simplex256>(&bitcsr, max_dim, parallel)
-    }
+    })
 }
 
 #[inline]
-fn infer_dimension(points: &[f32], n: usize) -> Result<usize> {
-    let len = points.len();
+fn infer_dimension(len: usize, n: usize) -> Result<usize> {
     if len == 0 {
         return Err(Error::EmptyDimension);
     }
@@ -282,11 +440,11 @@ fn infer_dimension(points: &[f32], n: usize) -> Result<usize> {
 }
 
 #[inline]
-fn validate_distance_shape(distances: &[f32], n: usize) -> Result<()> {
-    if distances.len() != n * n {
+fn validate_distance_shape(len: usize, n: usize) -> Result<()> {
+    if len != n * n {
         return Err(Error::ShapeMismatch {
             n,
-            got: distances.len(),
+            got: len,
             mode: "distance matrix (expected n*n)",
         });
     }
@@ -326,7 +484,7 @@ mod pipeline_tests {
         Config {
             peel,
             quotient,
-            collapse,
+            collapse: collapse.into(),
             parallel,
             ..Config::default()
         }
@@ -546,6 +704,81 @@ mod pipeline_tests {
         }
     }
 
+    /// `Auto` may skip, abort after its probe, stop partway, or finish; every
+    /// outcome must leave the barcode untouched.
+    #[test]
+    fn auto_collapse_preserves_barcode() {
+        let mut s: u64 = 0x0a07_0c01_1a95_e000;
+        let mut rng = || {
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
+            (s >> 40) as f32 / 16_777_216.0
+        };
+        let square: Vec<f32> = (0..60 * 2).map(|_| rng()).collect();
+        let circle: Vec<f32> = (0..60)
+            .flat_map(|_| {
+                let a = rng() * std::f32::consts::TAU;
+                [a.cos(), a.sin()]
+            })
+            .collect();
+        for points in [&square, &circle] {
+            let n = points.len() / 2;
+            for max_dim in 0..=2 {
+                let plain = persistent_homology_with(
+                    points,
+                    n,
+                    max_dim,
+                    &config(true, false, false, false),
+                )
+                .unwrap();
+                let auto = persistent_homology_with(
+                    points,
+                    n,
+                    max_dim,
+                    &Config {
+                        collapse: Collapse::Auto,
+                        ..config(true, false, false, false)
+                    },
+                )
+                .unwrap();
+                assert_same_barcode(&plain, &auto);
+            }
+        }
+    }
+
+    /// `Auto` relies on any prefix of the backward pass being exact.
+    #[test]
+    fn collapse_prefix_preserves_barcode() {
+        let mut s: u64 = 0x9e37_79b9_7f4a_7c15;
+        let mut rng = || {
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
+            (s >> 40) as f32 / 16_777_216.0
+        };
+        let (n, d) = (40usize, 3usize);
+        let points: Vec<f32> = (0..n * d).map(|_| rng()).collect();
+        let base = EdgeList::from_points(&points, n, d, f32::INFINITY, false);
+        let m = base.edges.len();
+        for max_dim in 1..=2 {
+            let plain = compute_barcode(
+                EdgeList::from_points(&points, n, d, f32::INFINITY, false),
+                max_dim,
+                false,
+            )
+            .unwrap();
+            for stop in [0, 1, m / 4, m / 2, m] {
+                let mut edges = EdgeList::from_points(&points, n, d, f32::INFINITY, false);
+                let progress =
+                    opt::collapse::collapse_with(&mut edges, false, |p| p.processed < stop);
+                assert!(progress.processed <= stop.max(1));
+                let bc = compute_barcode(edges, max_dim, false).unwrap();
+                assert_same_barcode(&plain, &bc);
+            }
+        }
+    }
+
     #[test]
     fn collapse_preserves_quotient_barcode() {
         let (points, _) = ring_distances();
@@ -554,6 +787,33 @@ mod pipeline_tests {
         let quot_collapsed =
             persistent_homology_with(&points, 4, 1, &config(true, true, true, false)).unwrap();
         assert_same_barcode(&quot, &quot_collapsed);
+    }
+
+    /// Renumbering a quotient skeleton in merge order changes vertex ids only,
+    /// so the barcode is unchanged with and without collapse.
+    #[test]
+    fn merge_order_relabel_preserves_barcode() {
+        let n = 150;
+        let points: Vec<f32> = (0..n * 3)
+            .map(|i| ((i as f32) * 0.7548).sin() + ((i * i) as f32 * 0.0137).cos())
+            .collect();
+        let barcode = |relabel: bool, collapse: Collapse, max_dim: usize| {
+            let mut edges = EdgeList::from_points(&points, n, 3, f32::INFINITY, false);
+            let order = opt::coperto::cone_in_place(&mut edges, false);
+            if relabel {
+                edges.relabel(&order);
+            }
+            collapse.apply(&mut edges, max_dim, false).unwrap();
+            compute_barcode(edges, max_dim, false).unwrap()
+        };
+        for collapse in [Collapse::Off, Collapse::On, Collapse::Auto] {
+            for max_dim in 1..=3 {
+                assert_same_barcode(
+                    &barcode(false, collapse, max_dim),
+                    &barcode(true, collapse, max_dim),
+                );
+            }
+        }
     }
 
     #[test]
@@ -873,5 +1133,182 @@ mod pipeline_tests {
         let points: [f32; 0] = [];
         let err = filtration_size(&points, 2, 1).unwrap_err();
         assert!(matches!(err, Error::EmptyDimension));
+    }
+
+    /// A NaN point used to zero the enclosing radius and return every vertex
+    /// as an essential H0 class.
+    #[test]
+    fn non_finite_coordinates_error() {
+        for bad in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            let (mut points, _) = ring_distances();
+            points[5] = bad; // point 2, coordinate 1
+            let err = persistent_homology(&points, 4, 1).unwrap_err();
+            assert!(
+                matches!(err, Error::NonFiniteCoordinate { point: 2, .. }),
+                "{bad}: {err:?}"
+            );
+        }
+        let mut wide: Vec<f64> = ring_distances().0.iter().map(|&x| x as f64).collect();
+        wide[0] = 1e300; // finite in f64, infinite once read as f32
+        let err = persistent_homology(&wide, 4, 1).unwrap_err();
+        assert!(matches!(err, Error::NonFiniteCoordinate { point: 0, .. }));
+    }
+
+    /// Negative distances sort above every other value by bit pattern, which
+    /// used to add a spurious H1 bar.
+    #[test]
+    fn negative_distances_error() {
+        let (_, mut distances) = ring_distances();
+        distances[3 * 4 + 1] = -1e-7; // strict lower triangle: d(3, 1)
+        let cfg = Config {
+            distance_matrix: true,
+            ..Config::default()
+        };
+        let err = persistent_homology_with(&distances, 4, 1, &cfg).unwrap_err();
+        assert!(
+            matches!(err, Error::NegativeDistance { u: 3, v: 1, .. }),
+            "{err:?}"
+        );
+
+        // -0.0 is zero, not negative.
+        let (_, mut zeroed) = ring_distances();
+        let (_, mut signed) = ring_distances();
+        zeroed[2 * 4 + 1] = 0.0;
+        signed[2 * 4 + 1] = -0.0;
+        assert_same_barcode(
+            &persistent_homology_with(&zeroed, 4, 1, &cfg).unwrap(),
+            &persistent_homology_with(&signed, 4, 1, &cfg).unwrap(),
+        );
+
+        let err =
+            persistent_homology_sparse(&[0u32, 1], &[1u32, 2], &[1.0f32, -0.5], 3, 1).unwrap_err();
+        assert!(matches!(err, Error::NegativeDistance { u: 1, v: 2, .. }));
+        let err = persistent_homology_csr(&[0u32, 1, 2, 2], &[1u32, 2], &[1.0f32, -0.5], 3, 1)
+            .unwrap_err();
+        assert!(matches!(err, Error::NegativeDistance { u: 1, v: 2, .. }));
+    }
+
+    #[test]
+    fn f64_input_matches_f32() {
+        let (points, distances) = ring_distances();
+        let points64: Vec<f64> = points.iter().map(|&x| x as f64).collect();
+        let distances64: Vec<f64> = distances.iter().map(|&x| x as f64).collect();
+        let matrix = Config {
+            distance_matrix: true,
+            ..Config::default()
+        };
+        assert_same_barcode(
+            &persistent_homology(&points, 4, 1).unwrap(),
+            &persistent_homology(&points64, 4, 1).unwrap(),
+        );
+        assert_same_barcode(
+            &persistent_homology_with(&distances, 4, 1, &matrix).unwrap(),
+            &persistent_homology_with(&distances64, 4, 1, &matrix).unwrap(),
+        );
+        assert_eq!(
+            filtration_size_with(&distances, 4, 1, &matrix).unwrap(),
+            filtration_size_with(&distances64, 4, 1, &matrix).unwrap()
+        );
+    }
+
+    /// CSR and CSC read the same undirected graph as COO and the dense path,
+    /// for every index and value width, with duplicates and unsorted rows.
+    #[test]
+    fn compressed_matches_coo_and_dense() {
+        let n = 16;
+        let coord = |i: usize| ((i / 4) as f32, (i % 4) as f32);
+        let mut distances = vec![0f32; n * n];
+        let mut rows: Vec<Vec<(i64, f32)>> = vec![Vec::new(); n];
+        for i in 0..n {
+            for j in 0..n {
+                let ((xi, yi), (xj, yj)) = (coord(i), coord(j));
+                let d = ((xi - xj).powi(2) + (yi - yj).powi(2)).sqrt();
+                distances[i * n + j] = d;
+                rows[i].push((j as i64, d));
+            }
+            rows[i].reverse(); // unsorted columns
+            rows[i].push(((i + 1) as i64 % n as i64, 99.0)); // duplicate; the minimum wins
+        }
+        let mut indptr = vec![0i64];
+        let (mut indices, mut vals) = (Vec::new(), Vec::new());
+        let (mut coo_r, mut coo_c) = (Vec::new(), Vec::new());
+        for (r, row) in rows.iter().enumerate() {
+            for &(c, d) in row {
+                indices.push(c);
+                vals.push(d as f64);
+                coo_r.push(r as i64);
+                coo_c.push(c);
+            }
+            indptr.push(indices.len() as i64);
+        }
+        let indptr32: Vec<i32> = indptr.iter().map(|&x| x as i32).collect();
+        let indices32: Vec<i32> = indices.iter().map(|&x| x as i32).collect();
+        let vals32: Vec<f32> = vals.iter().map(|&x| x as f32).collect();
+
+        let dense_cfg = Config {
+            distance_matrix: true,
+            ..Config::default()
+        };
+        for max_dim in 1..=2 {
+            let dense = persistent_homology_with(&distances, n, max_dim, &dense_cfg).unwrap();
+            let size = filtration_size_with(&distances, n, max_dim, &dense_cfg).unwrap();
+            let cfg = Config::default();
+            for bc in [
+                persistent_homology_csr_with(&indptr, &indices, &vals, n, max_dim, &cfg).unwrap(),
+                persistent_homology_csr_with(&indptr32, &indices32, &vals32, n, max_dim, &cfg)
+                    .unwrap(),
+                persistent_homology_csr(&indptr32, &indices32, &vals, n, max_dim).unwrap(),
+                persistent_homology_sparse_with(&coo_r, &coo_c, &vals, n, max_dim, &cfg).unwrap(),
+            ] {
+                assert_same_barcode(&dense, &bc);
+            }
+            assert_eq!(
+                size,
+                filtration_size_csr_with(&indptr, &indices, &vals32, n, max_dim, &cfg).unwrap()
+            );
+            assert_eq!(
+                size,
+                filtration_size_csr(&indptr32, &indices32, &vals32, n, max_dim).unwrap()
+            );
+        }
+    }
+
+    #[test]
+    fn malformed_compressed_input_errors() {
+        let vals = [1.0f32, 1.0];
+        let cases: [(&[i32], &[i32]); 4] = [
+            (&[0, 1, 2], &[1, 0]),     // indptr too short for n = 3
+            (&[0, 2, 1, 2], &[1, 0]),  // decreasing
+            (&[0, 1, 2, 3], &[1, 0]),  // past the end of indices
+            (&[0, 1, -1, 2], &[1, 0]), // negative offset
+        ];
+        for (indptr, indices) in cases {
+            let err = persistent_homology_csr(indptr, indices, &vals, 3, 1).unwrap_err();
+            assert!(
+                matches!(err, Error::InvalidCompressed(_)),
+                "{indptr:?}: {err:?}"
+            );
+        }
+        let err =
+            persistent_homology_csr(&[0i32, 1, 2, 2], &[1i32, 0], &[1.0f32], 3, 1).unwrap_err();
+        assert!(matches!(err, Error::InvalidCompressed(_)));
+        let err = persistent_homology_csr(&[0i32, 1, 2, 2], &[1i32, 3], &vals, 3, 1).unwrap_err();
+        assert!(matches!(
+            err,
+            Error::SparseIndexOutOfRange { index: 3, n: 3 }
+        ));
+    }
+
+    #[test]
+    fn negative_sparse_index_errors() {
+        let err =
+            persistent_homology_sparse(&[0i32, -1], &[1i32, 0], &[1.0f32, 2.0], 4, 1).unwrap_err();
+        assert!(
+            matches!(err, Error::SparseIndexOutOfRange { index: -1, n: 4 }),
+            "{err:?}"
+        );
+        let err = persistent_homology_sparse(&[0i64, 1], &[1i64, 1 << 40], &[1.0f64, 2.0], 4, 1)
+            .unwrap_err();
+        assert!(matches!(err, Error::SparseIndexOutOfRange { .. }));
     }
 }

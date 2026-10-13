@@ -160,7 +160,7 @@ pub fn run_once(
     let config = Config {
         quotient: variant.quotient,
         peel: variant.peel,
-        collapse: variant.collapse,
+        collapse: variant.collapse.into(),
         parallel: false, // benches should not be parallel
         ..Config::default()
     };

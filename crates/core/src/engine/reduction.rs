@@ -1,5 +1,5 @@
 use crate::engine::algorithm::{for_each_cofacet, zero_apparent_facet};
-use crate::engine::bitcsr::BitCsrDistanceMatrix;
+use crate::engine::bitcsr::Rows;
 use crate::engine::heap::FastHeap;
 use crate::engine::simplex::PackedSimplex;
 use crate::types::PersistenceInterval;
@@ -60,9 +60,9 @@ impl<S: Copy> CompressedSparseMatrix<S> {
 }
 
 #[inline]
-fn add_simplex_coboundary<const K: usize, S: PackedSimplex<K>>(
+fn add_simplex_coboundary<const K: usize, S: PackedSimplex<K>, D: Rows>(
     simplex: S,
-    dist: &BitCsrDistanceMatrix,
+    dist: &D,
     working_v: &mut Vec<S>,
     working_coboundary: &mut FastHeap<S>,
 ) {
@@ -74,11 +74,11 @@ fn add_simplex_coboundary<const K: usize, S: PackedSimplex<K>>(
 }
 
 #[inline]
-fn add_coboundary<const K: usize, S: PackedSimplex<K>>(
+fn add_coboundary<const K: usize, S: PackedSimplex<K>, D: Rows>(
     v_matrix: &CompressedSparseMatrix<S>,
     columns: &[S],
     column_index: usize,
-    dist: &BitCsrDistanceMatrix,
+    dist: &D,
     working_v: &mut Vec<S>,
     working_coboundary: &mut FastHeap<S>,
 ) {
@@ -89,9 +89,9 @@ fn add_coboundary<const K: usize, S: PackedSimplex<K>>(
     }
 }
 
-fn init_coboundary_and_get_pivot<const K: usize, S: PackedSimplex<K>>(
+fn init_coboundary_and_get_pivot<const K: usize, S: PackedSimplex<K>, D: Rows>(
     sigma: S,
-    dist: &BitCsrDistanceMatrix,
+    dist: &D,
     pivot_column_index: &FxHashMap<S, usize>,
     working_coboundary: &mut FastHeap<S>,
 ) -> Option<S> {
@@ -124,9 +124,9 @@ fn init_coboundary_and_get_pivot<const K: usize, S: PackedSimplex<K>>(
 
 /// Reduce `columns`, appending intervals to `dim_intervals`. Returns the
 /// pivot-to-column map, whose keys are the next dimension's clearing set.
-pub(crate) fn compute_pairs<const K: usize, S: PackedSimplex<K>>(
+pub(crate) fn compute_pairs<const K: usize, S: PackedSimplex<K>, D: Rows>(
     columns: &[S],
-    dist: &BitCsrDistanceMatrix,
+    dist: &D,
     dim_intervals: &mut Vec<PersistenceInterval>,
 ) -> FxHashMap<S, usize> {
     let mut pivot_column_index: FxHashMap<S, usize> =

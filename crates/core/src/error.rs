@@ -2,9 +2,9 @@ use thiserror::Error;
 
 /// Errors returned by the core and coordinate APIs.
 ///
-/// Dense distance matrices must be symmetric and non-negative with a zero
-/// diagonal. The crate does not scan them to enforce these preconditions.
-/// Infinite entries represent disconnected pairs.
+/// Only the strict lower triangle of a dense distance matrix is read, so
+/// symmetry and the diagonal are not checked. Negative entries in that triangle
+/// are rejected. Infinite entries represent disconnected pairs.
 #[derive(Debug, Clone, Error)]
 pub enum Error {
     #[error("need at least 2 points, got {got}")]
@@ -45,8 +45,30 @@ pub enum Error {
         vals: usize,
     },
 
-    #[error("sparse entry ({u}, {v}) is out of range for n={n}")]
-    SparseIndexOutOfRange { u: u32, v: u32, n: usize },
+    #[error("sparse index {index} is out of range for n={n}")]
+    SparseIndexOutOfRange { index: i128, n: usize },
+
+    #[error("compressed sparse input is malformed: {0}")]
+    InvalidCompressed(&'static str),
+
+    #[error(
+        "point {point} has a non-finite coordinate ({value}); remove or impute it \
+         before computing persistence"
+    )]
+    NonFiniteCoordinate { point: usize, value: f32 },
+
+    #[error(
+        "distances must be non-negative, got d({u}, {v}) = {value}; clip rounding \
+         noise to zero (e.g. np.clip(d, 0, None)) before computing persistence"
+    )]
+    NegativeDistance { u: usize, v: usize, value: f32 },
+
+    #[error("graph too large: {what} is {got}, above the 32-bit limit of {max}")]
+    GraphTooLarge {
+        what: &'static str,
+        got: usize,
+        max: usize,
+    },
 
     #[error("coordinates: requested class {requested} but only {available} H1 classes exist")]
     NotEnoughClasses { requested: usize, available: usize },

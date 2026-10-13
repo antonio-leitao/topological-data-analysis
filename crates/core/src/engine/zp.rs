@@ -160,7 +160,7 @@ pub(crate) fn h1_cocycles<const K: usize, S: PackedSimplex<K>>(
     parallel: bool,
 ) -> DimCocycles<S> {
     let mut h0 = Vec::new();
-    let (_edges, columns) = compute_h0::<K, S>(dist, &mut h0, parallel);
+    let (_edges, columns) = compute_h0::<K, S, _>(dist, &mut h0, parallel);
     reduce_columns(&columns, dist, p)
 }
 
@@ -391,7 +391,8 @@ mod tests {
         let m = n * (n - 1) / 2;
         let lt: Vec<f32> = (0..m).map(|_| 0.2 + rng()).collect();
         let sq = square_from_lower_tri(n, &lt);
-        BitCsrDistanceMatrix::from_edge_list(EdgeList::from_distance_matrix(&sq, n, threshold))
+        let edges = EdgeList::from_distance_matrix(&sq, n, threshold).unwrap();
+        BitCsrDistanceMatrix::from_edge_list(edges).unwrap()
     }
 
     fn interval_key(iv: &PersistenceInterval) -> (u32, u32) {
@@ -429,9 +430,8 @@ mod tests {
             vec![fixture(9, 5, f32::INFINITY), fixture(12, 99, f32::INFINITY)];
         let lower = [1.0f32, 10.0, 1.0, 1.0, 10.0, 1.0];
         let sq = square_from_lower_tri(4, &lower);
-        cases.push(BitCsrDistanceMatrix::from_edge_list(
-            EdgeList::from_distance_matrix(&sq, 4, 1.5),
-        ));
+        let edges = EdgeList::from_distance_matrix(&sq, 4, 1.5).unwrap();
+        cases.push(BitCsrDistanceMatrix::from_edge_list(edges).unwrap());
 
         for bitcsr in &cases {
             let zp = h1_cocycles::<6, Simplex128>(bitcsr, p, false);

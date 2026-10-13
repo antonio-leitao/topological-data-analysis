@@ -1,15 +1,44 @@
 //! Python bindings for persistence, filtration size, and coordinates.
 //!
-//! Dense input is float32 or float64. Sparse COO-like input is an undirected
-//! distance graph. Square dense input is treated as points unless
-//! `distance_matrix=True`, with a warning for the ambiguous case.
+//! Arrays are read in place: a C-contiguous float32 or float64 array, and the
+//! int32/int64 index and float32/float64 value arrays of a scipy sparse matrix,
+//! reach the core without a copy. Only strided views are copied, in logical
+//! order. The GIL is released while the core runs.
+//!
+//! Sparse input is an undirected distance graph. Square dense input is treated
+//! as points unless `distance_matrix=True`, with a warning for the ambiguous
+//! case.
 
-use numpy::{IntoPyArray, PyArray2, PyArrayMethods, PyReadonlyArray1, PyReadonlyArray2};
+use std::borrow::Cow;
+
+use numpy::ndarray::Dimension;
+use numpy::{
+    Element, IntoPyArray, PyArray2, PyArrayMethods, PyReadonlyArray, PyReadonlyArray1,
+    PyReadonlyArray2, PyUntypedArrayMethods,
+};
 use pyo3::exceptions::{PyTypeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
+use tda_core::{Real, SparseIndex};
 
-type CooInput = (Vec<u32>, Vec<u32>, Vec<f32>, usize);
+/// `collapse`: `True`, `False`, or `"auto"`.
+#[derive(FromPyObject)]
+enum CollapseArg {
+    Flag(bool),
+    Name(String),
+}
+
+impl CollapseArg {
+    fn resolve(self) -> PyResult<tda_core::Collapse> {
+        match self {
+            CollapseArg::Flag(on) => Ok(on.into()),
+            CollapseArg::Name(name) if name == "auto" => Ok(tda_core::Collapse::Auto),
+            CollapseArg::Name(name) => Err(PyValueError::new_err(format!(
+                "collapse must be a bool or \"auto\", got {name:?}"
+            ))),
+        }
+    }
+}
 type CircularCoordinateResult<'py> = (
     Bound<'py, PyArray2<f32>>,
     Bound<'py, PyArray2<f32>>,
@@ -17,74 +46,329 @@ type CircularCoordinateResult<'py> = (
     Vec<usize>,
 );
 
-/// Flatten a 2-D float array in logical row-major order.
-fn flatten_any(data: &Bound<'_, PyAny>) -> PyResult<(Vec<f32>, usize, usize)> {
-    if let Ok(arr) = data.extract::<PyReadonlyArray2<f32>>() {
-        let arr = arr.as_array();
-        let (rows, cols) = (arr.shape()[0], arr.shape()[1]);
-        return Ok((arr.iter().copied().collect(), rows, cols));
+/// Borrow an array's buffer when it is C-contiguous, or copy a strided view in
+/// logical order. `as_slice` alone also accepts Fortran order, whose buffer is
+/// column-major, so C order is checked first.
+fn row_major<'a, T: Element + Copy, D: Dimension>(
+    arr: &'a PyReadonlyArray<'_, T, D>,
+) -> Cow<'a, [T]> {
+    if arr.is_c_contiguous() {
+        if let Ok(slice) = arr.as_slice() {
+            return Cow::Borrowed(slice);
+        }
     }
-    if let Ok(arr) = data.extract::<PyReadonlyArray2<f64>>() {
-        let arr = arr.as_array();
-        let (rows, cols) = (arr.shape()[0], arr.shape()[1]);
-        return Ok((arr.iter().map(|&x| x as f32).collect(), rows, cols));
-    }
-    Err(PyTypeError::new_err(
-        "expected a 2-D numpy array of float32 or float64 — an (n, d) point \
-         cloud or an (n, n) distance matrix — or a scipy.sparse distance \
-         matrix; for other dtypes convert with np.asarray(data, dtype=np.float32)",
-    ))
+    Cow::Owned(arr.as_array().iter().copied().collect())
 }
 
-/// Extract an object exposing `.tocoo()`, or return `None` for dense input.
-fn extract_coo(data: &Bound<'_, PyAny>) -> PyResult<Option<CooInput>> {
-    if !data.hasattr("tocoo")? {
-        return Ok(None);
-    }
-    let coo = data.call_method0("tocoo")?;
-    let (rows_n, cols_n): (usize, usize) = coo.getattr("shape")?.extract()?;
-    if rows_n != cols_n {
-        return Err(PyValueError::new_err(format!(
-            "sparse input must be a square (n, n) distance matrix, got ({rows_n}, {cols_n})"
-        )));
-    }
-    let rows = extract_indices(&coo.getattr("row")?)?;
-    let cols = extract_indices(&coo.getattr("col")?)?;
-    let vals = extract_values(&coo.getattr("data")?)?;
-    Ok(Some((rows, cols, vals, rows_n)))
+/// A 2-D point cloud or distance matrix, borrowed from numpy.
+enum DenseArray<'py> {
+    F32(PyReadonlyArray2<'py, f32>),
+    F64(PyReadonlyArray2<'py, f64>),
 }
 
-fn extract_indices(obj: &Bound<'_, PyAny>) -> PyResult<Vec<u32>> {
-    fn convert<T: TryInto<u32> + Copy>(values: impl Iterator<Item = T>) -> PyResult<Vec<u32>> {
-        values
-            .map(|x| {
-                x.try_into().map_err(|_| {
-                    PyValueError::new_err("sparse indices must be non-negative 32-bit integers")
-                })
-            })
-            .collect()
+impl<'py> DenseArray<'py> {
+    fn extract(data: &Bound<'py, PyAny>) -> PyResult<Self> {
+        if let Ok(arr) = data.extract::<PyReadonlyArray2<f32>>() {
+            return Ok(Self::F32(arr));
+        }
+        if let Ok(arr) = data.extract::<PyReadonlyArray2<f64>>() {
+            return Ok(Self::F64(arr));
+        }
+        Err(PyTypeError::new_err(
+            "expected a 2-D numpy array of float32 or float64 — an (n, d) point \
+             cloud or an (n, n) distance matrix — or a scipy.sparse distance \
+             matrix; for other dtypes convert with np.asarray(data, dtype=np.float32)",
+        ))
     }
-    if let Ok(arr) = obj.extract::<PyReadonlyArray1<i32>>() {
-        return convert(arr.as_array().iter().copied());
+
+    fn shape(&self) -> (usize, usize) {
+        let shape = match self {
+            Self::F32(arr) => arr.shape(),
+            Self::F64(arr) => arr.shape(),
+        };
+        (shape[0], shape[1])
     }
-    if let Ok(arr) = obj.extract::<PyReadonlyArray1<i64>>() {
-        return convert(arr.as_array().iter().copied());
+
+    /// Row-major `f32` values, for the coordinate APIs, which take `f32` only.
+    /// float64 input is converted in one pass.
+    fn to_f32(&self) -> Cow<'_, [f32]> {
+        match self {
+            Self::F32(arr) => row_major(arr),
+            Self::F64(arr) => Cow::Owned(arr.as_array().iter().map(|&x| x as f32).collect()),
+        }
     }
-    Err(PyTypeError::new_err(
-        "sparse index arrays must be int32 or int64",
-    ))
 }
 
-fn extract_values(obj: &Bound<'_, PyAny>) -> PyResult<Vec<f32>> {
-    if let Ok(arr) = obj.extract::<PyReadonlyArray1<f32>>() {
-        return Ok(arr.as_array().iter().copied().collect());
+/// One sparse index array. scipy gives a matrix's index arrays one dtype.
+enum IndexArray<'py> {
+    I32(PyReadonlyArray1<'py, i32>),
+    I64(PyReadonlyArray1<'py, i64>),
+}
+
+impl<'py> IndexArray<'py> {
+    fn extract(obj: &Bound<'py, PyAny>) -> PyResult<Self> {
+        if let Ok(arr) = obj.extract::<PyReadonlyArray1<i32>>() {
+            return Ok(Self::I32(arr));
+        }
+        if let Ok(arr) = obj.extract::<PyReadonlyArray1<i64>>() {
+            return Ok(Self::I64(arr));
+        }
+        Err(PyTypeError::new_err(
+            "sparse index arrays must be int32 or int64",
+        ))
     }
-    if let Ok(arr) = obj.extract::<PyReadonlyArray1<f64>>() {
-        return Ok(arr.as_array().iter().map(|&x| x as f32).collect());
+
+    /// As `i64`, for the rare pair of index arrays with different dtypes.
+    fn widened(&self) -> Cow<'_, [i64]> {
+        match self {
+            Self::I32(arr) => Cow::Owned(arr.as_array().iter().map(|&x| x as i64).collect()),
+            Self::I64(arr) => row_major(arr),
+        }
     }
-    Err(PyTypeError::new_err(
-        "sparse value arrays must be float32 or float64",
-    ))
+}
+
+enum ValueArray<'py> {
+    F32(PyReadonlyArray1<'py, f32>),
+    F64(PyReadonlyArray1<'py, f64>),
+}
+
+impl<'py> ValueArray<'py> {
+    fn extract(obj: &Bound<'py, PyAny>) -> PyResult<Self> {
+        if let Ok(arr) = obj.extract::<PyReadonlyArray1<f32>>() {
+            return Ok(Self::F32(arr));
+        }
+        if let Ok(arr) = obj.extract::<PyReadonlyArray1<f64>>() {
+            return Ok(Self::F64(arr));
+        }
+        Err(PyTypeError::new_err(
+            "sparse value arrays must be float32 or float64",
+        ))
+    }
+}
+
+/// A scipy sparse distance graph: CSR/CSC `(indptr, indices, data)` read as
+/// stored, or `(row, col, data)` from `tocoo()` for every other format.
+struct SparseInput<'py> {
+    compressed: bool,
+    outer: IndexArray<'py>,
+    inner: IndexArray<'py>,
+    values: ValueArray<'py>,
+    n: usize,
+}
+
+impl<'py> SparseInput<'py> {
+    /// `None` for input without `tocoo()`, which is dense.
+    fn extract(data: &Bound<'py, PyAny>) -> PyResult<Option<Self>> {
+        if !data.hasattr("tocoo")? {
+            return Ok(None);
+        }
+        let (rows, cols): (usize, usize) = data.getattr("shape")?.extract()?;
+        if rows != cols {
+            return Err(PyValueError::new_err(format!(
+                "sparse input must be a square (n, n) distance matrix, got ({rows}, {cols})"
+            )));
+        }
+        let format = data
+            .getattr("format")
+            .and_then(|f| f.extract::<String>())
+            .ok();
+        // CSC is CSR of the transpose, and the graph is undirected.
+        let compressed = matches!(format.as_deref(), Some("csr" | "csc"));
+        let (outer, inner, values) = if compressed {
+            (
+                data.getattr("indptr")?,
+                data.getattr("indices")?,
+                data.getattr("data")?,
+            )
+        } else {
+            let coo = data.call_method0("tocoo")?;
+            (
+                coo.getattr("row")?,
+                coo.getattr("col")?,
+                coo.getattr("data")?,
+            )
+        };
+        Ok(Some(Self {
+            compressed,
+            outer: IndexArray::extract(&outer)?,
+            inner: IndexArray::extract(&inner)?,
+            values: ValueArray::extract(&values)?,
+            n: rows,
+        }))
+    }
+
+    fn run<J: Job>(&self, py: Python<'_>, job: &J) -> PyResult<J::Out> {
+        match &self.values {
+            ValueArray::F32(vals) => self.with_indices(py, &row_major(vals), job),
+            ValueArray::F64(vals) => self.with_indices(py, &row_major(vals), job),
+        }
+    }
+
+    fn with_indices<V: Real, J: Job>(
+        &self,
+        py: Python<'_>,
+        vals: &[V],
+        job: &J,
+    ) -> PyResult<J::Out> {
+        match (&self.outer, &self.inner) {
+            (IndexArray::I32(a), IndexArray::I32(b)) => {
+                self.detached(py, &row_major(a), &row_major(b), vals, job)
+            }
+            (IndexArray::I64(a), IndexArray::I64(b)) => {
+                self.detached(py, &row_major(a), &row_major(b), vals, job)
+            }
+            (a, b) => self.detached(py, &a.widened(), &b.widened(), vals, job),
+        }
+    }
+
+    fn detached<I: SparseIndex, V: Real, J: Job>(
+        &self,
+        py: Python<'_>,
+        outer: &[I],
+        inner: &[I],
+        vals: &[V],
+        job: &J,
+    ) -> PyResult<J::Out> {
+        let (compressed, n) = (self.compressed, self.n);
+        py.detach(|| {
+            if compressed {
+                job.compressed(outer, inner, vals, n)
+            } else {
+                job.coo(outer, inner, vals, n)
+            }
+        })
+        .map_err(to_py_err)
+    }
+}
+
+/// A core computation, generic over the element types it reads in place.
+trait Job: Sync {
+    type Out: Send;
+
+    fn dense<T: Real>(&self, data: &[T], n: usize) -> tda_core::Result<Self::Out>;
+
+    fn coo<I: SparseIndex, V: Real>(
+        &self,
+        rows: &[I],
+        cols: &[I],
+        vals: &[V],
+        n: usize,
+    ) -> tda_core::Result<Self::Out>;
+
+    fn compressed<I: SparseIndex, V: Real>(
+        &self,
+        indptr: &[I],
+        indices: &[I],
+        vals: &[V],
+        n: usize,
+    ) -> tda_core::Result<Self::Out>;
+}
+
+struct Barcode<'a> {
+    max_dim: usize,
+    config: &'a tda_core::Config,
+}
+
+impl Job for Barcode<'_> {
+    type Out = tda_core::BarcodeResult;
+
+    fn dense<T: Real>(&self, data: &[T], n: usize) -> tda_core::Result<Self::Out> {
+        tda_core::persistent_homology_with(data, n, self.max_dim, self.config)
+    }
+
+    fn coo<I: SparseIndex, V: Real>(
+        &self,
+        rows: &[I],
+        cols: &[I],
+        vals: &[V],
+        n: usize,
+    ) -> tda_core::Result<Self::Out> {
+        tda_core::persistent_homology_sparse_with(rows, cols, vals, n, self.max_dim, self.config)
+    }
+
+    fn compressed<I: SparseIndex, V: Real>(
+        &self,
+        indptr: &[I],
+        indices: &[I],
+        vals: &[V],
+        n: usize,
+    ) -> tda_core::Result<Self::Out> {
+        tda_core::persistent_homology_csr_with(indptr, indices, vals, n, self.max_dim, self.config)
+    }
+}
+
+struct FiltrationSize<'a> {
+    max_dim: usize,
+    config: &'a tda_core::Config,
+}
+
+impl Job for FiltrationSize<'_> {
+    type Out = usize;
+
+    fn dense<T: Real>(&self, data: &[T], n: usize) -> tda_core::Result<usize> {
+        tda_core::filtration_size_with(data, n, self.max_dim, self.config)
+    }
+
+    fn coo<I: SparseIndex, V: Real>(
+        &self,
+        rows: &[I],
+        cols: &[I],
+        vals: &[V],
+        n: usize,
+    ) -> tda_core::Result<usize> {
+        tda_core::filtration_size_sparse_with(rows, cols, vals, n, self.max_dim, self.config)
+    }
+
+    fn compressed<I: SparseIndex, V: Real>(
+        &self,
+        indptr: &[I],
+        indices: &[I],
+        vals: &[V],
+        n: usize,
+    ) -> tda_core::Result<usize> {
+        tda_core::filtration_size_csr_with(indptr, indices, vals, n, self.max_dim, self.config)
+    }
+}
+
+/// Read `data` in place and run `job` without the GIL.
+///
+/// Another Python thread writing to the same array during the call would race
+/// with the read, as with any extension that releases the GIL over a buffer.
+fn run<J: Job>(
+    py: Python<'_>,
+    data: &Bound<'_, PyAny>,
+    distance_matrix: bool,
+    job: &J,
+) -> PyResult<J::Out> {
+    // Sparse input always represents a distance graph.
+    if let Some(sparse) = SparseInput::extract(data)? {
+        return sparse.run(py, job);
+    }
+
+    let dense = DenseArray::extract(data)?;
+    let (rows, cols) = dense.shape();
+    check_input(py, rows, cols, distance_matrix)?;
+    match &dense {
+        DenseArray::F32(arr) => {
+            let data = row_major(arr);
+            py.detach(|| job.dense(&data, rows))
+        }
+        DenseArray::F64(arr) => {
+            let data = row_major(arr);
+            py.detach(|| job.dense(&data, rows))
+        }
+    }
+    .map_err(to_py_err)
+}
+
+/// Coordinates take dense input only.
+fn reject_sparse(data: &Bound<'_, PyAny>) -> PyResult<()> {
+    if data.hasattr("tocoo")? {
+        return Err(PyTypeError::new_err(
+            "tda.coords does not support sparse input",
+        ));
+    }
+    Ok(())
 }
 
 #[inline]
@@ -145,7 +429,7 @@ fn check_input(py: Python<'_>, rows: usize, cols: usize, distance_matrix: bool) 
 
 /// Vietoris–Rips persistent homology.
 #[pyfunction]
-#[pyo3(signature = (data, max_dim=1, threshold=None, distance_matrix=false, quotient=false, peel=true, collapse=false, parallel=true))]
+#[pyo3(signature = (data, max_dim=1, threshold=None, distance_matrix=false, quotient=false, peel=true, collapse=CollapseArg::Name("auto".into()), parallel=true))]
 #[allow(clippy::too_many_arguments)]
 fn persistent_homology<'py>(
     py: Python<'py>,
@@ -155,7 +439,7 @@ fn persistent_homology<'py>(
     distance_matrix: bool,
     quotient: bool,
     peel: bool,
-    collapse: bool,
+    collapse: CollapseArg,
     parallel: bool,
 ) -> PyResult<Vec<Bound<'py, PyArray2<f32>>>> {
     let config = tda_core::Config {
@@ -163,24 +447,14 @@ fn persistent_homology<'py>(
         threshold,
         peel,
         quotient,
-        collapse,
+        collapse: collapse.resolve()?,
         parallel,
     };
-
-    // Sparse input always represents a distance graph.
-    if let Some((rows, cols, vals, n)) = extract_coo(data)? {
-        let barcode =
-            tda_core::persistent_homology_sparse_with(&rows, &cols, &vals, n, max_dim, &config)
-                .map_err(to_py_err)?;
-        return barcode_to_py(py, barcode);
-    }
-
-    let (flat, rows, cols) = flatten_any(data)?;
-    check_input(py, rows, cols, distance_matrix)?;
-
-    let barcode =
-        tda_core::persistent_homology_with(&flat, rows, max_dim, &config).map_err(to_py_err)?;
-
+    let job = Barcode {
+        max_dim,
+        config: &config,
+    };
+    let barcode = run(py, data, distance_matrix, &job)?;
     barcode_to_py(py, barcode)
 }
 
@@ -199,13 +473,11 @@ fn circular_coordinates<'py>(
     prime: u32,
     parallel: bool,
 ) -> PyResult<CircularCoordinateResult<'py>> {
-    if data.hasattr("tocoo")? {
-        return Err(PyTypeError::new_err(
-            "tda.coords does not support sparse input",
-        ));
-    }
-    let (flat, rows, cols) = flatten_any(data)?;
+    reject_sparse(data)?;
+    let dense = DenseArray::extract(data)?;
+    let (rows, cols) = dense.shape();
     check_input(py, rows, cols, distance_matrix)?;
+    let flat = dense.to_f32();
 
     let config = tda_core::coords::Config {
         distance_matrix,
@@ -216,7 +488,9 @@ fn circular_coordinates<'py>(
         prime,
         parallel,
     };
-    let cc = tda_core::coords::circular_with(&flat, rows, &config).map_err(to_py_err)?;
+    let cc = py
+        .detach(|| tda_core::coords::circular_with(&flat, rows, &config))
+        .map_err(to_py_err)?;
 
     let k = cc.k;
     let coordinates = cc
@@ -298,12 +572,9 @@ impl PyCircularMap {
         py: Python<'py>,
         data: &Bound<'py, PyAny>,
     ) -> PyResult<Bound<'py, PyArray2<f32>>> {
-        if data.hasattr("tocoo")? {
-            return Err(PyTypeError::new_err(
-                "tda.coords does not support sparse input",
-            ));
-        }
-        let (flat, rows, cols) = flatten_any(data)?;
+        reject_sparse(data)?;
+        let dense = DenseArray::extract(data)?;
+        let (rows, cols) = dense.shape();
         if cols != self.inner.ambient_dim() {
             return Err(PyValueError::new_err(format!(
                 "transform expects {} columns (the fitted ambient dimension), got {}",
@@ -311,7 +582,11 @@ impl PyCircularMap {
                 cols
             )));
         }
-        let values = self.inner.transform(&flat, rows).map_err(to_py_err)?;
+        let flat = dense.to_f32();
+        let inner = &self.inner;
+        let values = py
+            .detach(|| inner.transform(&flat, rows))
+            .map_err(to_py_err)?;
         values
             .into_pyarray(py)
             .reshape((rows, self.inner.k))
@@ -331,13 +606,11 @@ fn circular_map<'py>(
     prime: u32,
     parallel: bool,
 ) -> PyResult<PyCircularMap> {
-    if data.hasattr("tocoo")? {
-        return Err(PyTypeError::new_err(
-            "tda.coords does not support sparse input",
-        ));
-    }
-    let (flat, rows, cols) = flatten_any(data)?;
+    reject_sparse(data)?;
+    let dense = DenseArray::extract(data)?;
+    let (rows, cols) = dense.shape();
     check_input(py, rows, cols, false)?;
+    let flat = dense.to_f32();
 
     let config = tda_core::coords::Config {
         n_classes,
@@ -347,13 +620,15 @@ fn circular_map<'py>(
         parallel,
         ..tda_core::coords::Config::default()
     };
-    let inner = tda_core::coords::circular_map_with(&flat, rows, &config).map_err(to_py_err)?;
+    let inner = py
+        .detach(|| tda_core::coords::circular_map_with(&flat, rows, &config))
+        .map_err(to_py_err)?;
     Ok(PyCircularMap { inner })
 }
 
 /// Number of simplices through `max_dim` in the truncated filtration.
 #[pyfunction]
-#[pyo3(signature = (data, max_dim=1, threshold=None, distance_matrix=false, quotient=false, peel=true, collapse=false, parallel=true))]
+#[pyo3(signature = (data, max_dim=1, threshold=None, distance_matrix=false, quotient=false, peel=true, collapse=CollapseArg::Name("auto".into()), parallel=true))]
 #[allow(clippy::too_many_arguments)]
 fn filtration_size<'py>(
     py: Python<'py>,
@@ -363,7 +638,7 @@ fn filtration_size<'py>(
     distance_matrix: bool,
     quotient: bool,
     peel: bool,
-    collapse: bool,
+    collapse: CollapseArg,
     parallel: bool,
 ) -> PyResult<usize> {
     let config = tda_core::Config {
@@ -371,19 +646,14 @@ fn filtration_size<'py>(
         threshold,
         peel,
         quotient,
-        collapse,
+        collapse: collapse.resolve()?,
         parallel,
     };
-
-    if let Some((rows, cols, vals, n)) = extract_coo(data)? {
-        return tda_core::filtration_size_sparse_with(&rows, &cols, &vals, n, max_dim, &config)
-            .map_err(to_py_err);
-    }
-
-    let (flat, rows, cols) = flatten_any(data)?;
-    check_input(py, rows, cols, distance_matrix)?;
-
-    tda_core::filtration_size_with(&flat, rows, max_dim, &config).map_err(to_py_err)
+    let job = FiltrationSize {
+        max_dim,
+        config: &config,
+    };
+    run(py, data, distance_matrix, &job)
 }
 
 #[pymodule]

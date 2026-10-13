@@ -12,6 +12,7 @@ crates/core/examples/*
 !crates/core/examples/summary.rs
 # Build artifacts / project-specific
 /tests
+bench/data/
 notebooks/
 external/
 

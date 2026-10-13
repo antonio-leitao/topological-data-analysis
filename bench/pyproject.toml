@@ -2,14 +2,12 @@
 name = "tda-bench"
 version = "0.1.0"
 description = "Figure 2 benchmark for the TDA crate. Not part of the published library."
-# giotto-ph 0.2.4 has no CPython 3.13 wheel or source distribution.
-requires-python = ">=3.11,<3.13"
+requires-python = ">=3.11"
 dependencies = [
     "tda",
     "numpy>=2.0",
     "psutil>=6.0",
     "gudhi>=3.12",
-    "giotto-ph>=0.2.4",
     "scikit-learn>=1.6",
     "matplotlib>=3.9",
 ]

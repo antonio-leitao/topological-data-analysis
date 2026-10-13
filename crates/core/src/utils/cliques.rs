@@ -7,34 +7,32 @@ use rayon::prelude::*;
 const PARALLEL_CLIQUE_MIN_ROOTS: usize = 128;
 const PARALLEL_CLIQUE_MIN_EDGES: usize = 4096;
 
-#[inline]
-fn set_bit(bits: &mut Vec<u64>, v: usize) {
-    let w = v >> 6;
-    if w >= bits.len() {
-        bits.resize(w + 1, 0);
-    }
-    bits[w] |= 1u64 << (v & 63);
+/// Lower neighbours of one vertex as bitset words from block `lo`, so a row
+/// spans its own neighbours rather than every id below them.
+#[derive(Default)]
+struct Row {
+    lo: usize,
+    bits: Vec<u64>,
 }
 
-/// Intersect into `dest` and trim trailing zero words.
+/// Intersect `xs` (from block `xlo`) with `ys` (from `ylo`) into `dest`, which
+/// starts at the returned block, and trim trailing zero words.
 #[inline]
-fn intersect_into(xs: &[u64], ys: &[u64], dest: &mut Vec<u64>) {
-    let (short, long) = if xs.len() <= ys.len() {
-        (xs, ys)
-    } else {
-        (ys, xs)
-    };
+fn intersect_into(xs: &[u64], xlo: usize, ys: &[u64], ylo: usize, dest: &mut Vec<u64>) -> usize {
+    let lo = xlo.max(ylo);
+    let hi = (xlo + xs.len()).min(ylo + ys.len());
     dest.clear();
-    if short.is_empty() {
-        return;
+    if lo >= hi {
+        return lo;
     }
-    dest.resize(short.len(), 0);
+    let (xs, ys) = (&xs[lo - xlo..hi - xlo], &ys[lo - ylo..hi - ylo]);
+    dest.resize(hi - lo, 0);
 
     let mut last_nz = 0;
     let mut any = false;
-    for i in 0..short.len() {
-        let w = short[i] & long[i];
-        dest[i] = w;
+    for (i, ((d, &x), &y)) in dest.iter_mut().zip(xs).zip(ys).enumerate() {
+        let w = x & y;
+        *d = w;
         if w != 0 {
             last_nz = i;
             any = true;
@@ -45,12 +43,14 @@ fn intersect_into(xs: &[u64], ys: &[u64], dest: &mut Vec<u64>) {
     } else {
         dest.clear();
     }
+    lo
 }
 
 /// Count extensions from candidates common to the current stem.
 fn extend(
-    adj: &[Vec<u64>],
+    adj: &[Row],
     cand: &[u64],
+    cand_lo: usize,
     stem_size: usize,
     max_size: usize,
     scratch: &mut [Vec<u64>],
@@ -61,13 +61,14 @@ fn extend(
         for (wi, &word0) in cand.iter().enumerate() {
             let mut word = word0;
             while word != 0 {
-                let v = (wi << 6) | word.trailing_zeros() as usize;
+                let v = ((cand_lo + wi) << 6) | word.trailing_zeros() as usize;
                 word &= word - 1;
 
                 *count += 1; // clique {stem ∪ v}
-                intersect_into(cand, &adj[v], &mut head[0]);
+                let row = &adj[v];
+                let lo = intersect_into(cand, cand_lo, &row.bits, row.lo, &mut head[0]);
                 if !head[0].is_empty() {
-                    extend(adj, &head[0], stem_size + 1, max_size, tail, count);
+                    extend(adj, &head[0], lo, stem_size + 1, max_size, tail, count);
                 }
             }
         }
@@ -91,12 +92,26 @@ pub(crate) fn count_cliques(edge_list: EdgeList, max_size: usize, parallel: bool
     }
 
     let edge_count = edges.len();
-    let mut adj: Vec<Vec<u64>> = vec![Vec::new(); n];
+    let mut span = vec![(usize::MAX, 0usize); n];
+    for edge in &edges {
+        let (u, b) = (edge.u as usize, edge.v as usize >> 6);
+        debug_assert!(u < n && edge.u > edge.v);
+        span[u] = (span[u].0.min(b), span[u].1.max(b + 1));
+    }
+    let mut adj: Vec<Row> = span
+        .into_iter()
+        .map(|(lo, hi)| match hi {
+            0 => Row::default(),
+            _ => Row {
+                lo,
+                bits: vec![0; hi - lo],
+            },
+        })
+        .collect();
     for edge in edges {
-        let u = edge.u as usize;
+        let row = &mut adj[edge.u as usize];
         let v = edge.v as usize;
-        debug_assert!(u < n && u > v);
-        set_bit(&mut adj[u], v);
+        row.bits[(v >> 6) - row.lo] |= 1u64 << (v & 63);
     }
 
     let use_parallel =
@@ -105,10 +120,10 @@ pub(crate) fn count_cliques(edge_list: EdgeList, max_size: usize, parallel: bool
         adj.par_iter()
             .map_init(
                 || (0..max_size - 2).map(|_| Vec::new()).collect::<Vec<_>>(),
-                |scratch, cand| {
+                |scratch, row| {
                     let mut count = 0;
-                    if !cand.is_empty() {
-                        extend(&adj, cand, 1, max_size, scratch, &mut count);
+                    if !row.bits.is_empty() {
+                        extend(&adj, &row.bits, row.lo, 1, max_size, scratch, &mut count);
                     }
                     count
                 },
@@ -118,9 +133,9 @@ pub(crate) fn count_cliques(edge_list: EdgeList, max_size: usize, parallel: bool
         // One candidate buffer per interior recursion depth.
         let mut scratch: Vec<Vec<u64>> = (0..max_size - 2).map(|_| Vec::new()).collect();
         let mut count = 0;
-        for cand in &adj {
-            if !cand.is_empty() {
-                extend(&adj, cand, 1, max_size, &mut scratch, &mut count);
+        for row in &adj {
+            if !row.bits.is_empty() {
+                extend(&adj, &row.bits, row.lo, 1, max_size, &mut scratch, &mut count);
             }
         }
         count
@@ -232,6 +247,28 @@ mod tests {
                     }
                 }
             }
+        }
+    }
+
+    /// Rows span their own neighbours: cliques far up the id range count the
+    /// same as the same cliques near 0.
+    #[test]
+    fn far_ids_count_like_near_ones() {
+        let shift = 1u32 << 20;
+        let near: Vec<Edge> = [(1, 0), (2, 0), (2, 1), (3, 2), (70, 3), (70, 2), (130, 70)]
+            .iter()
+            .map(|&(u, v)| Edge { u, v, distance: 1.0 })
+            .collect();
+        let far: Vec<Edge> = near
+            .iter()
+            .map(|e| Edge { u: e.u + shift, v: e.v + shift, distance: 1.0 })
+            .collect();
+        for max_size in 1..=4 {
+            assert_eq!(
+                count_cliques(edge_list(131, near.clone()), max_size, false),
+                count_cliques(edge_list((shift + 131) as usize, far.clone()), max_size, false)
+                    - shift as usize
+            );
         }
     }
 

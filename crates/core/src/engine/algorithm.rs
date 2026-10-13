@@ -1,4 +1,4 @@
-use crate::engine::bitcsr::BitCsrDistanceMatrix;
+use crate::engine::bitcsr::{BitCsrDistanceMatrix, Rows};
 use crate::engine::reduction::compute_pairs;
 use crate::engine::simplex::{encode_filtration, CofacetBuilder, PackedSimplex};
 use crate::types::{BarcodeResult, PersistenceInterval};
@@ -47,8 +47,8 @@ impl UnionFind {
 }
 
 /// Enumerate stored edges once, with the larger endpoint first.
-pub(crate) fn for_each_edge<const K: usize, S: PackedSimplex<K>>(
-    dist: &BitCsrDistanceMatrix,
+pub(crate) fn for_each_edge<const K: usize, S: PackedSimplex<K>, D: Rows>(
+    dist: &D,
     mut f: impl FnMut(S) -> bool,
 ) {
     for v in 0..dist.n() {
@@ -71,8 +71,8 @@ pub(crate) fn for_each_edge<const K: usize, S: PackedSimplex<K>>(
 /// Unless `all_cofacets`, emit only insertions above the largest base vertex so
 /// each simplex is assembled once.
 #[inline]
-pub(crate) fn for_each_cofacet<const K: usize, S: PackedSimplex<K>>(
-    dist: &BitCsrDistanceMatrix,
+pub(crate) fn for_each_cofacet<const K: usize, S: PackedSimplex<K>, D: Rows>(
+    dist: &D,
     sigma: S,
     all_cofacets: bool,
     mut f: impl FnMut(S) -> bool,
@@ -112,8 +112,8 @@ pub(crate) fn for_each_cofacet<const K: usize, S: PackedSimplex<K>>(
 
 /// Youngest common neighbour within `max_extra`.
 #[inline]
-fn first_common_neighbor_le<const K: usize>(
-    dist: &BitCsrDistanceMatrix,
+fn first_common_neighbor_le<const K: usize, D: Rows>(
+    dist: &D,
     verts: &[u32; K],
     vc: usize,
     max_extra: f32,
@@ -131,8 +131,8 @@ fn first_common_neighbor_le<const K: usize>(
 }
 
 #[inline]
-fn facet_diameter<const K: usize>(
-    dist: &BitCsrDistanceMatrix,
+fn facet_diameter<const K: usize, D: Rows>(
+    dist: &D,
     verts: &[u32; K],
     vc: usize,
     skip: usize,
@@ -157,8 +157,8 @@ fn facet_diameter<const K: usize>(
 
 /// Mask of edges whose encoded distance equals `diam_bits`.
 #[inline]
-fn diameter_edge_mask<const K: usize>(
-    dist: &BitCsrDistanceMatrix,
+fn diameter_edge_mask<const K: usize, D: Rows>(
+    dist: &D,
     verts: &[u32; K],
     vc: usize,
     diam_bits: u32,
@@ -175,8 +175,8 @@ fn diameter_edge_mask<const K: usize>(
 }
 
 #[inline]
-fn zero_pivot_facet<const K: usize, S: PackedSimplex<K>>(
-    dist: &BitCsrDistanceMatrix,
+fn zero_pivot_facet<const K: usize, S: PackedSimplex<K>, D: Rows>(
+    dist: &D,
     tau: S,
 ) -> Option<S> {
     let target = tau.filtration_encoded();
@@ -201,8 +201,8 @@ fn zero_pivot_facet<const K: usize, S: PackedSimplex<K>>(
 }
 
 #[inline]
-fn zero_pivot_cofacet<const K: usize, S: PackedSimplex<K>>(
-    dist: &BitCsrDistanceMatrix,
+fn zero_pivot_cofacet<const K: usize, S: PackedSimplex<K>, D: Rows>(
+    dist: &D,
     sigma: S,
 ) -> Option<S> {
     let same_diam = sigma.filtration();
@@ -217,8 +217,8 @@ fn zero_pivot_cofacet<const K: usize, S: PackedSimplex<K>>(
 
 /// Return `tau`'s apparent facet partner.
 #[inline]
-pub(crate) fn zero_apparent_facet<const K: usize, S: PackedSimplex<K>>(
-    dist: &BitCsrDistanceMatrix,
+pub(crate) fn zero_apparent_facet<const K: usize, S: PackedSimplex<K>, D: Rows>(
+    dist: &D,
     tau: S,
 ) -> Option<S> {
     let phi = zero_pivot_facet(dist, tau)?;
@@ -232,8 +232,8 @@ pub(crate) fn zero_apparent_facet<const K: usize, S: PackedSimplex<K>>(
 
 /// Return `sigma`'s apparent cofacet partner.
 #[inline]
-fn zero_apparent_cofacet<const K: usize, S: PackedSimplex<K>>(
-    dist: &BitCsrDistanceMatrix,
+fn zero_apparent_cofacet<const K: usize, S: PackedSimplex<K>, D: Rows>(
+    dist: &D,
     sigma: S,
 ) -> Option<S> {
     let tau = zero_pivot_cofacet(dist, sigma)?;
@@ -245,8 +245,8 @@ fn zero_apparent_cofacet<const K: usize, S: PackedSimplex<K>>(
     }
 }
 
-pub(crate) fn compute_h0<const K: usize, S: PackedSimplex<K>>(
-    dist: &BitCsrDistanceMatrix,
+pub(crate) fn compute_h0<const K: usize, S: PackedSimplex<K>, D: Rows>(
+    dist: &D,
     intervals: &mut Vec<PersistenceInterval>,
     parallel: bool,
 ) -> (Vec<S>, Vec<S>) {
@@ -305,8 +305,8 @@ pub(crate) fn compute_h0<const K: usize, S: PackedSimplex<K>>(
 /// Assemble the next dimension after clearing and apparent-pair filtering.
 ///
 /// Parallel workers use private buffers; sorting removes merge-order dependence.
-pub(crate) fn assemble_candidates<const K: usize, S: PackedSimplex<K>>(
-    dist: &BitCsrDistanceMatrix,
+pub(crate) fn assemble_candidates<const K: usize, S: PackedSimplex<K>, D: Rows>(
+    dist: &D,
     simplices: &mut Vec<S>,
     cleared_pivots: &FxHashMap<S, usize>,
     build_pool: bool,
@@ -382,8 +382,8 @@ pub(crate) fn assemble_candidates<const K: usize, S: PackedSimplex<K>>(
 }
 
 #[inline]
-fn assemble_one<const K: usize, S: PackedSimplex<K>>(
-    dist: &BitCsrDistanceMatrix,
+fn assemble_one<const K: usize, S: PackedSimplex<K>, D: Rows>(
+    dist: &D,
     sigma: S,
     cleared_pivots: &FxHashMap<S, usize>,
     build_pool: bool,
@@ -412,8 +412,8 @@ fn assemble_one<const K: usize, S: PackedSimplex<K>>(
 }
 
 #[inline]
-fn assemble_edge_candidates<const K: usize, S: PackedSimplex<K>>(
-    dist: &BitCsrDistanceMatrix,
+fn assemble_edge_candidates<const K: usize, S: PackedSimplex<K>, D: Rows>(
+    dist: &D,
     sigma: S,
     cleared_pivots: &FxHashMap<S, usize>,
     build_pool: bool,
@@ -460,8 +460,8 @@ fn assemble_edge_candidates<const K: usize, S: PackedSimplex<K>>(
 }
 
 #[inline]
-fn assemble_generic_candidates<const K: usize, S: PackedSimplex<K>>(
-    dist: &BitCsrDistanceMatrix,
+fn assemble_generic_candidates<const K: usize, S: PackedSimplex<K>, D: Rows>(
+    dist: &D,
     sigma: S,
     cleared_pivots: &FxHashMap<S, usize>,
     build_pool: bool,
@@ -486,8 +486,8 @@ fn assemble_generic_candidates<const K: usize, S: PackedSimplex<K>>(
 
 /// Reject either side of an apparent pair.
 #[inline]
-fn keep_fused_candidate<const K: usize, S: PackedSimplex<K>>(
-    dist: &BitCsrDistanceMatrix,
+fn keep_fused_candidate<const K: usize, S: PackedSimplex<K>, D: Rows>(
+    dist: &D,
     tau: S,
     tau_verts: &[u32; K],
     vc: usize,
@@ -498,8 +498,8 @@ fn keep_fused_candidate<const K: usize, S: PackedSimplex<K>>(
 }
 
 #[inline]
-fn is_zero_apparent_cofacet_side<const K: usize, S: PackedSimplex<K>>(
-    dist: &BitCsrDistanceMatrix,
+fn is_zero_apparent_cofacet_side<const K: usize, S: PackedSimplex<K>, D: Rows>(
+    dist: &D,
     tau: S,
     tau_verts: &[u32; K],
     vc: usize,
@@ -522,8 +522,8 @@ fn is_zero_apparent_cofacet_side<const K: usize, S: PackedSimplex<K>>(
 }
 
 #[inline]
-fn is_zero_apparent_facet_side<const K: usize, S: PackedSimplex<K>>(
-    dist: &BitCsrDistanceMatrix,
+fn is_zero_apparent_facet_side<const K: usize, S: PackedSimplex<K>, D: Rows>(
+    dist: &D,
     tau: S,
     tau_verts: &[u32; K],
     vc: usize,
@@ -623,10 +623,23 @@ pub fn compute<const K: usize, S: PackedSimplex<K>>(
     max_dim: usize,
     parallel: bool,
 ) -> BarcodeResult {
+    // Test the row layout once here rather than on every query.
+    if dist.banded() {
+        compute_rows::<K, S, _>(&dist.view::<true>(), max_dim, parallel)
+    } else {
+        compute_rows::<K, S, _>(&dist.view::<false>(), max_dim, parallel)
+    }
+}
+
+fn compute_rows<const K: usize, S: PackedSimplex<K>, D: Rows>(
+    dist: &D,
+    max_dim: usize,
+    parallel: bool,
+) -> BarcodeResult {
     let mut intervals: Vec<Vec<PersistenceInterval>> = Vec::with_capacity(max_dim + 1);
 
     let mut h0 = Vec::new();
-    let (mut simplices, mut columns_to_reduce) = compute_h0::<K, S>(dist, &mut h0, parallel);
+    let (mut simplices, mut columns_to_reduce) = compute_h0::<K, S, _>(dist, &mut h0, parallel);
     intervals.push(h0);
 
     if max_dim <= 1 {
@@ -637,7 +650,7 @@ pub fn compute<const K: usize, S: PackedSimplex<K>>(
         let mut dim_intervals = Vec::new();
 
         // This dimension's pivots clear the next dimension.
-        let pivots = compute_pairs::<K, S>(&columns_to_reduce, dist, &mut dim_intervals);
+        let pivots = compute_pairs::<K, S, _>(&columns_to_reduce, dist, &mut dim_intervals);
         intervals.push(dim_intervals);
 
         if dim < max_dim {
@@ -699,8 +712,8 @@ mod tests {
 
             for &thr in &[0.4f32, 0.8, f32::INFINITY] {
                 for max_dim in 1..=3 {
-                    let edges = EdgeList::from_distance_matrix(&sq, n, thr);
-                    let bitcsr = BitCsrDistanceMatrix::from_edge_list(edges);
+                    let edges = EdgeList::from_distance_matrix(&sq, n, thr).unwrap();
+                    let bitcsr = BitCsrDistanceMatrix::from_edge_list(edges).unwrap();
 
                     let narrow = compute::<6, Simplex128>(&bitcsr, max_dim, false);
                     let wide = compute::<9, Simplex256>(&bitcsr, max_dim, false);
@@ -725,8 +738,8 @@ mod tests {
             s, s, s, s, 2.0, // (5,0..4)
         ];
         let sq = square_from_lower_tri(6, &lt);
-        let edges = EdgeList::from_distance_matrix(&sq, 6, f32::INFINITY);
-        let bitcsr = BitCsrDistanceMatrix::from_edge_list(edges);
+        let edges = EdgeList::from_distance_matrix(&sq, 6, f32::INFINITY).unwrap();
+        let bitcsr = BitCsrDistanceMatrix::from_edge_list(edges).unwrap();
         let bc = compute::<9, Simplex256>(&bitcsr, 5, false);
 
         assert_eq!(bc.intervals.len(), 6);
@@ -738,8 +751,8 @@ mod tests {
 
     fn run(lt: &[f32], n: usize, threshold: f32, max_dim: usize) -> BarcodeResult {
         let sq = square_from_lower_tri(n, lt);
-        let edges = EdgeList::from_distance_matrix(&sq, n, threshold);
-        let bitcsr = BitCsrDistanceMatrix::from_edge_list(edges);
+        let edges = EdgeList::from_distance_matrix(&sq, n, threshold).unwrap();
+        let bitcsr = BitCsrDistanceMatrix::from_edge_list(edges).unwrap();
         compute::<6, Simplex128>(&bitcsr, max_dim, true)
     }
 
