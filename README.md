@@ -168,33 +168,22 @@ whole graph, so with `peel=True` the pairs are stored as before.
 ### Benchmark
 
 <p align="center">
-  <picture>
-    <source
-      media="(prefers-color-scheme: dark)"
-      srcset="https://raw.githubusercontent.com/antonio-leitao/topological-data-analysis/master/bench/results/scaling_size_dark.png"
-    >
-    <img
-      src="https://raw.githubusercontent.com/antonio-leitao/topological-data-analysis/master/bench/results/scaling_size.png"
-      width="53%"
-      alt="Simplices up to dimension 2 for each dataset, without and with the quotient"
-    >
-  </picture>
-  <picture>
-    <source
-      media="(prefers-color-scheme: dark)"
-      srcset="https://raw.githubusercontent.com/antonio-leitao/topological-data-analysis/master/bench/results/scaling_dim_dark.png"
-    >
-    <img
-      src="https://raw.githubusercontent.com/antonio-leitao/topological-data-analysis/master/bench/results/scaling_dim.png"
-      width="45%"
-      alt="Time against homology dimension for GUDHI, TDA exact, and TDA quotient"
-    >
-  </picture>
+  <img
+    src="https://raw.githubusercontent.com/antonio-leitao/topological-data-analysis/master/bench/results/scaling_sample.png"
+    width="49%"
+    alt="Time against sample size on the Stanford dragon for GUDHI, TDA exact, and TDA quotient"
+  >
+  <img
+    src="https://raw.githubusercontent.com/antonio-leitao/topological-data-analysis/master/bench/results/scaling_dim.png"
+    width="49%"
+    alt="Time against homology dimension for GUDHI, TDA exact, and TDA quotient"
+  >
 </p>
 
-Left: filtration size up to dimension 2, without and with the quotient. Right:
-time to compute persistence up to H_d on 500 points sampled from the d-sphere,
-on one thread. The setup and raw results are in [`bench/`](bench/README.md).
+Left: time to compute persistence up to H_2 on samples of the Stanford dragon,
+up to the full 435,545-point scan. Right: time to compute persistence up to H_d
+on 500 points sampled from the d-sphere. Both run on one thread. The setup and
+raw results are in [`bench/`](bench/README.md).
 
 One run of the [`summary` example](crates/core/examples/summary.rs) with
 `max_dim=2` and `parallel=false`:
