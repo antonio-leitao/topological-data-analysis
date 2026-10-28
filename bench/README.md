@@ -1,12 +1,12 @@
-# Figure 2 benchmark
+# Scaling benchmark
 
 Run the benchmark on a dedicated machine, not in CI.
 
 ```sh
 cd bench
 uv sync
-uv run figure2.py
-uv run plot_figure2.py
+uv run scaling.py
+uv run plot_scaling.py
 ```
 
 `uv sync` builds `tda` from `../crates/python` in this environment. Rebuild
@@ -19,16 +19,27 @@ uv sync --reinstall-package tda
 Name panels to split a run; `bc` still means `b c`:
 
 ```sh
-uv run figure2.py a
-uv run figure2.py b2 b c
-uv run figure2.py b1
+uv run scaling.py a
+uv run scaling.py b2 b c
+uv run scaling.py b1
 ```
 
 A full run takes the short panels first: b2, b and c, then a and b1, which
 take longest. The runner writes `results/<panel>.csv` and rewrites only the
-selected panels. The plotter reads the available CSVs and writes light and dark
-SVG and PNG figures: `figure2` for panels a, b and c, and `figure2-b1` and
-`figure2-b2`.
+selected panels. The plotter reads the available CSVs and writes one figure per
+panel as PNG and PDF, light and dark (`_dark`):
+
+| Panel | Figure | Shows |
+|---|---|---|
+| a | `scaling_sample` | time against sample size |
+| b | `scaling_dim` | time against homology dimension |
+| c | `scaling_error` | quotient error against exact |
+| c | `scaling_error_bounds` | the same, with a log √3 reference line added |
+| b1 | `scaling_reach` | largest sample the quotient finishes |
+| b2 | `scaling_size` | filtration size without and with the quotient |
+
+Failed cases stay in the CSVs but not in the plots: a curve ends at the
+engine's last size where every repetition finished.
 
 Record the machine and software environment with published results.
 
@@ -38,7 +49,7 @@ Panel a uses the Stanford dragon. `dragon.py` downloads `dragon_recon.tar.gz`
 from the Stanford 3D Scanning Repository into `data/`, checks its SHA-256, and
 caches the full-resolution scan as `data/dragon.npy`. The scan has 437,645
 vertices; 2,100 repeat an earlier vertex exactly, so the cloud keeps 435,545
-points in file order. `data/` is not tracked. `figure2.py a` fetches the data
+points in file order. `data/` is not tracked. `scaling.py a` fetches the data
 on first use, or run it ahead of time:
 
 ```sh
@@ -53,14 +64,14 @@ prefix of every larger one.
 
 ## Configuration
 
-Constants at the top of `figure2.py` define the budget and panel inputs.
+Constants at the top of `scaling.py` define the budget and panel inputs.
 
 | Panel | Sweeps | Fixed inputs |
 |---|---|---|
 | a | `A_SIZES` | `A_DIM`, `A_MAX_DIM` |
 | b | `B_DIMS` | `B_N` |
 | b1 | `B1_DIMS`, sizes from `B1_START` to `B1_MAX` | `B1_TIMEOUT`, `MEM_CAP_GB` |
-| b2 | `B2_PIPELINES` on `../data/datasets.txt` | `B2_MAX_DIM` |
+| b2 | `B2_PIPELINES` on `../data/datasets.txt` and `B2_EXTRA` | `B2_MAX_DIM` |
 | c | `C_DIMS` | `C_N`, `C_SEEDS` |
 
 `REPS`, `TIMEOUT`, and `MEM_CAP_GB` bound timing panels. A case that runs
@@ -101,7 +112,9 @@ and dimensions stopped by memory fail fast, so at the default one hour the
 panel takes about half a day.
 
 Panel b2 counts simplices up to H2 with `filtration_size` for each dataset in
-`../data/datasets.txt`, without and with the quotient. Neither pipeline peels
+`../data/datasets.txt` and `B2_EXTRA`, without and with the quotient.
+`B2_EXTRA` adds the O(3) samples `o3_1024` and `o3_2048` (3x3 orthogonal
+matrices in R^9), which the Rust benches and correctness tests do not read. Neither pipeline peels
 or collapses, so the difference is the quotient's alone. It takes seconds.
 
 Panel c measures bottleneck distance between exact and quotient barcodes after

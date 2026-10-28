@@ -1,4 +1,4 @@
-"""Run the Figure 2 panels: timing (a, b), the quotient's reach (b1), its
+"""Run the scaling benchmarks: timing (a, b), the quotient's reach (b1), its
 filtration size (b2) and its error (c)."""
 
 import csv
@@ -51,9 +51,12 @@ B1_START = 64
 B1_MAX = 4_000_000
 
 # Panel b2: filtration size, simplices up to H2, without and with the quotient
-# on the datasets listed in ../data/datasets.txt. Neither pipeline peels or
-# collapses, so the difference is the quotient's alone. Counts only.
+# on the datasets listed in ../data/datasets.txt plus B2_EXTRA. Neither pipeline
+# peels or collapses, so the difference is the quotient's alone. Counts only.
 B2_DATA = Path(__file__).parent.parent / "data"
+# The Rust benches and correctness tests also read datasets.txt, so datasets
+# only this panel uses are listed here: samples of O(3) as 3x3 matrices in R^9.
+B2_EXTRA = ("o3_1024.txt", "o3_2048.txt")
 B2_MAX_DIM = 2
 B2_PIPELINES = {
     "vanilla": dict(peel=False, collapse=False, quotient=False),
@@ -298,7 +301,7 @@ def frontier(path):
 def filtration_sizes(path):
     """Simplices up to H2 under each pipeline, per dataset."""
     names = [line.strip() for line in (B2_DATA / "datasets.txt").read_text().splitlines()
-             if line.strip() and not line.startswith("#")]
+             if line.strip() and not line.startswith("#")] + list(B2_EXTRA)
     with path.open("w", newline="") as handle:
         writer = csv.DictWriter(
             handle,

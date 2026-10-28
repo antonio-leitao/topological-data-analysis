@@ -1,7 +1,7 @@
 [project]
 name = "tda-bench"
 version = "0.1.0"
-description = "Figure 2 benchmark for the TDA crate. Not part of the published library."
+description = "Scaling benchmark for the TDA crate. Not part of the published library."
 requires-python = ">=3.11"
 dependencies = [
     "tda",
